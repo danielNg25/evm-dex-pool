@@ -1,0 +1,887 @@
+[
+    { "inputs": [], "stateMutability": "nonpayable", "type": "constructor" },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "delegationSize",
+                "type": "uint256"
+            }
+        ],
+        "name": "AdminStakeLessThanDelegationSize",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "singularity",
+                "type": "uint256"
+            }
+        ],
+        "name": "CannotUnstakeBeforeSingularity",
+        "type": "error"
+    },
+    { "inputs": [], "name": "CannotUnstakeZeroIP", "type": "error" },
+    { "inputs": [], "name": "EnforcedPause", "type": "error" },
+    { "inputs": [], "name": "ExpectedPause", "type": "error" },
+    { "inputs": [], "name": "InvalidDelegationSize", "type": "error" },
+    { "inputs": [], "name": "InvalidInitialization", "type": "error" },
+    { "inputs": [], "name": "InvalidMaxStake", "type": "error" },
+    { "inputs": [], "name": "InvalidMaxStakeIterations", "type": "error" },
+    { "inputs": [], "name": "InvalidMinStake", "type": "error" },
+    { "inputs": [], "name": "InvalidSingularity", "type": "error" },
+    { "inputs": [], "name": "InvalidVersion", "type": "error" },
+    { "inputs": [], "name": "InvalidVersion", "type": "error" },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "maxBurnFeeBps",
+                "type": "uint256"
+            }
+        ],
+        "name": "MaxBurnFeeExceeded",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "maxMintFeeBps",
+                "type": "uint256"
+            }
+        ],
+        "name": "MaxMintFeeExceeded",
+        "type": "error"
+    },
+    { "inputs": [], "name": "NotInitializing", "type": "error" },
+    {
+        "inputs": [
+            { "internalType": "address", "name": "admin", "type": "address" }
+        ],
+        "name": "OnlyAdmin",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "delegator",
+                "type": "address"
+            }
+        ],
+        "name": "OnlyDelegator",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            { "internalType": "address", "name": "selector", "type": "address" }
+        ],
+        "name": "OnlySelector",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "address",
+                "name": "stakePool",
+                "type": "address"
+            }
+        ],
+        "name": "OnlyStakePool",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            { "internalType": "address", "name": "owner", "type": "address" }
+        ],
+        "name": "OwnableInvalidOwner",
+        "type": "error"
+    },
+    {
+        "inputs": [
+            { "internalType": "address", "name": "account", "type": "address" }
+        ],
+        "name": "OwnableUnauthorizedAccount",
+        "type": "error"
+    },
+    { "inputs": [], "name": "ReentrancyGuardReentrantCall", "type": "error" },
+    {
+        "inputs": [
+            { "internalType": "uint256", "name": "minStake", "type": "uint256" }
+        ],
+        "name": "StakeLessThanMinimum",
+        "type": "error"
+    },
+    { "inputs": [], "name": "StakeNotGweiMultiple", "type": "error" },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "admin",
+                "type": "address"
+            }
+        ],
+        "name": "AdminUpdated",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "uint64",
+                "name": "version",
+                "type": "uint64"
+            }
+        ],
+        "name": "Initialized",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "previousOwner",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "newOwner",
+                "type": "address"
+            }
+        ],
+        "name": "OwnershipTransferStarted",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "previousOwner",
+                "type": "address"
+            },
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "newOwner",
+                "type": "address"
+            }
+        ],
+        "name": "OwnershipTransferred",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "Paused",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "amount",
+                "type": "uint256"
+            }
+        ],
+        "name": "RewardReceived",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "address",
+                "name": "selector",
+                "type": "address"
+            }
+        ],
+        "name": "SelectorUpdated",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "components": [
+                    {
+                        "internalType": "uint256",
+                        "name": "singularity",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "minStake",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "maxStakeIterations",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "maxStake",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "delegationSize",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "unbondingPeriod",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "mintFeeBps",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "burnFeeBps",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "pendingUnstake",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "excessUnstake",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "bool",
+                        "name": "mintFeeEnabled",
+                        "type": "bool"
+                    },
+                    {
+                        "internalType": "bool",
+                        "name": "burnFeeEnabled",
+                        "type": "bool"
+                    }
+                ],
+                "indexed": false,
+                "internalType": "struct IStakePool.StakePoolState",
+                "name": "stakePoolState",
+                "type": "tuple"
+            }
+        ],
+        "name": "StakePoolStateUpdated",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "address",
+                "name": "staker",
+                "type": "address"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "amount",
+                "type": "uint256"
+            }
+        ],
+        "name": "Staked",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "address",
+                "name": "account",
+                "type": "address"
+            }
+        ],
+        "name": "Unpaused",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": false,
+                "internalType": "address",
+                "name": "staker",
+                "type": "address"
+            },
+            {
+                "indexed": false,
+                "internalType": "uint256",
+                "name": "amount",
+                "type": "uint256"
+            }
+        ],
+        "name": "Unstaked",
+        "type": "event"
+    },
+    {
+        "anonymous": false,
+        "inputs": [
+            {
+                "indexed": true,
+                "internalType": "string",
+                "name": "version",
+                "type": "string"
+            }
+        ],
+        "name": "VersionUpdated",
+        "type": "event"
+    },
+    {
+        "inputs": [],
+        "name": "MAX_BURN_FEE_BPS",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "MAX_MINT_FEE_BPS",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "acceptOwnership",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            { "internalType": "bytes", "name": "_validator", "type": "bytes" },
+            {
+                "internalType": "enum IIPTokenStaking.StakingPeriod",
+                "name": "_maturity",
+                "type": "uint8"
+            }
+        ],
+        "name": "adminStake",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_vIPAmount",
+                "type": "uint256"
+            }
+        ],
+        "name": "calculateIPWithdrawal",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_ipAmount",
+                "type": "uint256"
+            }
+        ],
+        "name": "calculateVIPMint",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "evaluateStakePool",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "fund",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getAdmin",
+        "outputs": [
+            { "internalType": "address", "name": "", "type": "address" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getBurnFeeBps",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getBurnFeeEnabled",
+        "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getDelegationSize",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getMaxStake",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getMaxStakeIterations",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getMinStake",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getMintFeeBps",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getMintFeeEnabled",
+        "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getPendingUnstake",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getSelector",
+        "outputs": [
+            {
+                "internalType": "contract IComponentSelector",
+                "name": "",
+                "type": "address"
+            }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getStakePoolAmount",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getTotalStake",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getUnbondingPeriod",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getUnstaked",
+        "outputs": [
+            { "internalType": "uint256", "name": "", "type": "uint256" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "getVersion",
+        "outputs": [{ "internalType": "string", "name": "", "type": "string" }],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "components": [
+                    {
+                        "internalType": "uint256",
+                        "name": "singularity",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "minStake",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "maxStakeIterations",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "maxStake",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "delegationSize",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "unbondingPeriod",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "mintFeeBps",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "uint256",
+                        "name": "burnFeeBps",
+                        "type": "uint256"
+                    },
+                    {
+                        "internalType": "bool",
+                        "name": "mintFeeEnabled",
+                        "type": "bool"
+                    },
+                    {
+                        "internalType": "bool",
+                        "name": "burnFeeEnabled",
+                        "type": "bool"
+                    }
+                ],
+                "internalType": "struct IStakePool.StakePoolConfig",
+                "name": "_config",
+                "type": "tuple"
+            }
+        ],
+        "name": "initialize",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "owner",
+        "outputs": [
+            { "internalType": "address", "name": "", "type": "address" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "pause",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "paused",
+        "outputs": [{ "internalType": "bool", "name": "", "type": "bool" }],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "pendingOwner",
+        "outputs": [
+            { "internalType": "address", "name": "", "type": "address" }
+        ],
+        "stateMutability": "view",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "renounceOwnership",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "restake",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            { "internalType": "address", "name": "_admin", "type": "address" }
+        ],
+        "name": "setAdmin",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_burnFeeBps",
+                "type": "uint256"
+            }
+        ],
+        "name": "setBurnFeeBps",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bool",
+                "name": "_burnFeeEnabled",
+                "type": "bool"
+            }
+        ],
+        "name": "setBurnFeeEnabled",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_delegationSize",
+                "type": "uint256"
+            }
+        ],
+        "name": "setDelegationSize",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_maxStake",
+                "type": "uint256"
+            }
+        ],
+        "name": "setMaxStake",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_maxStakeIterations",
+                "type": "uint256"
+            }
+        ],
+        "name": "setMaxStakeIterations",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_minStake",
+                "type": "uint256"
+            }
+        ],
+        "name": "setMinStake",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_mintFeeBps",
+                "type": "uint256"
+            }
+        ],
+        "name": "setMintFeeBps",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "bool",
+                "name": "_mintFeeEnabled",
+                "type": "bool"
+            }
+        ],
+        "name": "setMintFeeEnabled",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "contract IComponentSelector",
+                "name": "_componentSelector",
+                "type": "address"
+            }
+        ],
+        "name": "setSelector",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_unbondingPeriod",
+                "type": "uint256"
+            }
+        ],
+        "name": "setUnbondingPeriod",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "string",
+                "name": "_nextVersion",
+                "type": "string"
+            }
+        ],
+        "name": "setVersion",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            { "internalType": "bool", "name": "_evaluate", "type": "bool" }
+        ],
+        "name": "stake",
+        "outputs": [],
+        "stateMutability": "payable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            { "internalType": "address", "name": "newOwner", "type": "address" }
+        ],
+        "name": "transferOwnership",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [],
+        "name": "unpause",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [
+            {
+                "internalType": "uint256",
+                "name": "_vIPAmount",
+                "type": "uint256"
+            }
+        ],
+        "name": "unstake",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    { "stateMutability": "payable", "type": "receive" }
+]
