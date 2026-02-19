@@ -23,3 +23,10 @@ pub use v3::{UniswapV3Pool, V3PoolType, Tick, TickMap};
 
 // ERC4626
 pub use erc4626::{ERC4626Pool, ERC4626Standard, VerioIP};
+
+// Registry (optional feature)
+#[cfg(feature = "registry")]
+pub mod registry;
+
+#[cfg(feature = "registry")]
+pub use registry::PoolRegistry;
