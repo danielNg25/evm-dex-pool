@@ -1,6 +1,6 @@
 [package]
 name = "evm-dex-pool"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["danielNg25 <ndtr2000@gmail.com>"]
 license = "MIT"
@@ -10,6 +10,7 @@ description = "Reusable EVM DEX pool implementations (UniswapV2, UniswapV3, ERC4
 default = []
 rpc = ["alloy/providers", "alloy/contract", "tokio"]
 registry = ["dashmap", "tokio"]
+collector = ["registry", "rpc", "async-trait", "futures-util", "alloy/transport-ws", "alloy/pubsub"]
 
 [dependencies]
 alloy = { version = "1.0.30", features = ["sol-types", "rpc-types", "serde", "eips"] }
@@ -20,10 +21,14 @@ chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
 
 # Only needed when rpc or registry feature is enabled
-tokio = { version = "1", features = ["sync"], optional = true }
+tokio = { version = "1", features = ["sync", "time", "rt"], optional = true }
 
 # Only needed when registry feature is enabled
 dashmap = { version = "6.1.0", optional = true }
+
+# Only needed when collector feature is enabled
+async-trait = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [dev-dependencies]
 uniswap_v3_math = "0.6.0"

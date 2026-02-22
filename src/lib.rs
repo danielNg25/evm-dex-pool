@@ -30,3 +30,7 @@ pub mod registry;
 
 #[cfg(feature = "registry")]
 pub use registry::PoolRegistry;
+
+// Collector (optional feature)
+#[cfg(feature = "collector")]
+pub mod collector;
