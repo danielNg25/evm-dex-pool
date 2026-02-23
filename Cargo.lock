@@ -1517,7 +1517,9 @@ dependencies = [
  "num-traits",
  "serde",
  "tokio",
+ "tower",
  "uniswap_v3_math",
+ "url",
 ]
 
 [[package]]

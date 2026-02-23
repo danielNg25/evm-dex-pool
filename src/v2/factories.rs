@@ -14,6 +14,15 @@ pub mod factories {
         pub const AERO_FACTORIES: &[&str] = &[];
     }
 
+    pub mod base {
+        pub const CHAIN_ID: u64 = 8453;
+        pub const V2_FACTORIES: &[(&str, u32)] = &[
+            // Uniswap V2 - 0.3% fee
+            ("0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6", 3000),
+        ];
+        pub const AERO_FACTORIES: &[&str] = &[];
+    }
+
     pub mod story {
         pub const CHAIN_ID: u64 = 1514;
         pub const V2_FACTORIES: &[(&str, u32)] = &[

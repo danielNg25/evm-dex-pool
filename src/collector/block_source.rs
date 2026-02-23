@@ -55,7 +55,10 @@ enum PendingPhase {
     /// Need to fetch latest block number from RPC
     PollBlockNumber,
     /// Processing confirmed block batches
-    ConfirmedBatches { current_block: u64, latest_block: u64 },
+    ConfirmedBatches {
+        current_block: u64,
+        latest_block: u64,
+    },
     /// Fetch and process pending block
     FetchPending,
 }
@@ -66,6 +69,7 @@ pub struct PendingBlockSource<P: Provider + Send + Sync + 'static> {
     topics: Arc<Vec<Topic>>,
     max_blocks_per_batch: u64,
     phase: PendingPhase,
+    chain_id: u64,
 }
 
 impl<P: Provider + Send + Sync + 'static> PendingBlockSource<P> {
@@ -75,12 +79,14 @@ impl<P: Provider + Send + Sync + 'static> PendingBlockSource<P> {
         topics: Arc<Vec<Topic>>,
         max_blocks_per_batch: u64,
     ) -> Self {
+        let chain_id = pool_registry.get_network_id();
         Self {
             provider,
             pool_registry,
             topics,
             max_blocks_per_batch,
             phase: PendingPhase::PollBlockNumber,
+            chain_id,
         }
     }
 }
@@ -91,7 +97,8 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
         loop {
             match &mut self.phase {
                 PendingPhase::PollBlockNumber => {
-                    let latest_block = get_block_number_with_retry(&self.provider).await;
+                    let latest_block =
+                        get_block_number_with_retry(&self.provider, self.chain_id).await;
                     let last_processed = self.pool_registry.get_last_processed_block();
                     let next_block = last_processed + 1;
 
@@ -117,7 +124,10 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                     let from = *current_block;
                     let latest = *latest_block;
 
-                    info!("Processing blocks: {} - {}", from, batch_end);
+                    debug!(
+                        "[Chain {}] Processing blocks: {} - {}",
+                        self.chain_id, from, batch_end
+                    );
 
                     let events = fetch_events_with_retry(
                         &self.provider,
@@ -125,11 +135,13 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         self.topics.to_vec(),
                         BlockNumberOrTag::Number(from),
                         BlockNumberOrTag::Number(batch_end),
+                        self.chain_id,
                     )
                     .await?;
 
-                    info!(
-                        "Processing {} events from {} to {}",
+                    debug!(
+                        "[Chain {}] Processing {} events from {} to {}",
+                        self.chain_id,
                         events.len(),
                         from,
                         batch_end
@@ -167,10 +179,15 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         self.topics.to_vec(),
                         BlockNumberOrTag::Pending,
                         BlockNumberOrTag::Pending,
+                        self.chain_id,
                     )
                     .await?;
 
-                    info!("Processing {} events from pending block", events.len());
+                    debug!(
+                        "[Chain {}] Processing {} events from pending block",
+                        self.chain_id,
+                        events.len()
+                    );
 
                     // Reset to poll for next iteration
                     self.phase = PendingPhase::PollBlockNumber;
@@ -198,6 +215,7 @@ pub struct LatestBlockSource<P: Provider + Send + Sync + 'static> {
     wait_time_ms: u64,
     /// Internal state: remaining confirmed batches to process
     batches: Vec<(u64, u64, bool)>, // (from, to, is_latest_single_block)
+    chain_id: u64,
 }
 
 impl<P: Provider + Send + Sync + 'static> LatestBlockSource<P> {
@@ -208,6 +226,7 @@ impl<P: Provider + Send + Sync + 'static> LatestBlockSource<P> {
         max_blocks_per_batch: u64,
         wait_time_ms: u64,
     ) -> Self {
+        let chain_id = pool_registry.get_network_id();
         Self {
             provider,
             pool_registry,
@@ -215,6 +234,7 @@ impl<P: Provider + Send + Sync + 'static> LatestBlockSource<P> {
             max_blocks_per_batch,
             wait_time_ms,
             batches: Vec::new(),
+            chain_id,
         }
     }
 }
@@ -225,8 +245,9 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
         loop {
             // If we have pre-computed batches, yield the next one
             if let Some((from, to, is_latest_single)) = self.batches.pop() {
-                info!(
-                    "Fetching events for blocks {} - {} (remaining batches: {})",
+                debug!(
+                    "[Chain {}] Fetching events for blocks {} - {} (remaining batches: {})",
+                    self.chain_id,
                     from,
                     to,
                     self.batches.len()
@@ -238,6 +259,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
                     self.topics.to_vec(),
                     BlockNumberOrTag::Number(from),
                     BlockNumberOrTag::Number(to),
+                    self.chain_id,
                 )
                 .await?;
 
@@ -247,8 +269,9 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
                     ProcessingMode::ApplyOnly
                 };
 
-                info!(
-                    "Fetched {} events from {} to {} (mode: {})",
+                debug!(
+                    "[Chain {}] Fetched {} events from {} to {} (mode: {})",
+                    self.chain_id,
                     events.len(),
                     from,
                     to,
@@ -268,24 +291,24 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
 
             // No batches left — sleep before polling to avoid RPC rate limiting
             debug!(
-                "No batches, sleeping {}ms before polling...",
-                self.wait_time_ms
+                "[Chain {}] No batches, sleeping {}ms before polling...",
+                self.chain_id, self.wait_time_ms
             );
             tokio::time::sleep(Duration::from_millis(self.wait_time_ms)).await;
 
-            debug!("Calling get_block_number...");
-            let latest_block = get_block_number_with_retry(&self.provider).await;
+            debug!("[Chain {}] Calling get_block_number...", self.chain_id);
+            let latest_block = get_block_number_with_retry(&self.provider, self.chain_id).await;
             let last_processed = self.pool_registry.get_last_processed_block();
             let next_block = last_processed + 1;
             debug!(
-                "Block number received: latest={}, last_processed={}, next={}",
-                latest_block, last_processed, next_block
+                "[Chain {}] Block number received: latest={}, last_processed={}, next={}",
+                self.chain_id, latest_block, last_processed, next_block
             );
 
             if next_block > latest_block {
-                info!(
-                    "Waiting for new blocks. Last processed: {}, Latest: {}",
-                    last_processed, latest_block
+                debug!(
+                    "[Chain {}] Waiting for new blocks. Last processed: {}, Latest: {}",
+                    self.chain_id, last_processed, latest_block
                 );
                 continue;
             }
@@ -301,8 +324,9 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
                 batches.push((current, batch_end, is_latest_single));
                 current = batch_end + 1;
             }
-            info!(
-                "Created {} batches for blocks {} to {}",
+            debug!(
+                "[Chain {}] Created {} batches for blocks {} to {}",
+                self.chain_id,
                 batches.len(),
                 next_block,
                 latest_block
@@ -324,6 +348,7 @@ pub struct WebsocketBlockSource<P: Provider + Send + Sync + 'static> {
     pool_registry: Arc<PoolRegistry>,
     topics: Arc<Vec<Topic>>,
     max_blocks_per_batch: u64,
+    chain_id: u64,
 }
 
 impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
@@ -334,12 +359,14 @@ impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
         topics: Arc<Vec<Topic>>,
         max_blocks_per_batch: u64,
     ) -> Self {
+        let chain_id = pool_registry.get_network_id();
         Self {
             provider,
             event_queue,
             pool_registry,
             topics,
             max_blocks_per_batch,
+            chain_id,
         }
     }
 }
@@ -348,10 +375,14 @@ impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
 impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P> {
     async fn bootstrap(&mut self) -> Result<()> {
         let latest_block = self.provider.get_block_number().await?;
-        info!("Latest block: {}", latest_block);
+        info!("[Chain {}] Latest block: {}", self.chain_id, latest_block);
 
         let events = self.event_queue.get_all_available_events().await;
-        info!("Found {} events in EventQueue", events.len());
+        info!(
+            "[Chain {}] Found {} events in EventQueue",
+            self.chain_id,
+            events.len()
+        );
 
         let mut first_event_block = latest_block;
         let mut first_event_index = 0;
@@ -363,8 +394,8 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             first_event_log_index = first_event.log_index.unwrap();
         }
         info!(
-            "First event block: {}; index: {}",
-            first_event_block, first_event_index
+            "[Chain {}] First event block: {}; index: {}",
+            self.chain_id, first_event_block, first_event_index
         );
 
         // Catch up from last processed block to first websocket event
@@ -372,7 +403,10 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
         let mut start_block = last_processed_block;
         let topics = self.topics.to_vec();
 
-        info!("Catching up to first event block {}", first_event_block);
+        info!(
+            "[Chain {}] Catching up to first event block {}",
+            self.chain_id, first_event_block
+        );
         while start_block < first_event_block {
             let end_block =
                 std::cmp::min(start_block + self.max_blocks_per_batch, first_event_block);
@@ -388,7 +422,8 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             {
                 Ok(fetched_events) => {
                     info!(
-                        "Fetched {} events in batch {} - {}",
+                        "[Chain {}] Fetched {} events in batch {} - {}",
+                        self.chain_id,
                         fetched_events.len(),
                         start_block,
                         end_block
@@ -402,7 +437,8 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                             && event.log_index.unwrap() >= first_event_log_index
                         {
                             info!(
-                                "Reached first event {} block {} index {}, breaking",
+                                "[Chain {}] Reached first event {} block {} index {}, breaking",
+                                self.chain_id,
                                 event.transaction_hash.unwrap(),
                                 event.block_number.unwrap(),
                                 event.transaction_index.unwrap()
@@ -414,7 +450,8 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                         if let Some(pool) = self.pool_registry.get_pool(&event.address()) {
                             if let Err(e) = pool.write().await.apply_log(&event) {
                                 error!(
-                                    "Error applying event {} for pool {}, event {}",
+                                    "[Chain {}] Error applying event {} for pool {}, event {}",
+                                    self.chain_id,
                                     e,
                                     event.address(),
                                     event.transaction_hash.unwrap()
@@ -429,8 +466,8 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 }
                 Err(e) => {
                     error!(
-                        "Error fetching events in batch {}-{}: {}",
-                        start_block, end_block, e
+                        "[Chain {}] Error fetching events in batch {}-{}: {}",
+                        self.chain_id, start_block, end_block, e
                     );
                     continue;
                 }
@@ -444,7 +481,8 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             if let Some(pool) = self.pool_registry.get_pool(&event.address()) {
                 if let Err(e) = pool.write().await.apply_log(&event) {
                     error!(
-                        "Error applying event {} for pool {}, event {}",
+                        "[Chain {}] Error applying event {} for pool {}, event {}",
+                        self.chain_id,
                         e,
                         event.address(),
                         event.transaction_hash.unwrap()
@@ -464,7 +502,11 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 continue;
             }
 
-            info!("Processing {} events from EventQueue", events.len());
+            debug!(
+                "[Chain {}] Processing {} events from EventQueue",
+                self.chain_id,
+                events.len()
+            );
 
             return Ok(EventBatch {
                 events,
@@ -481,7 +523,10 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
 
 /// Get block number from provider with exponential backoff retry.
 /// Includes a 30-second timeout per attempt to handle stale RPC connections.
-async fn get_block_number_with_retry<P: Provider + Send + Sync>(provider: &Arc<P>) -> u64 {
+async fn get_block_number_with_retry<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    chain_id: u64,
+) -> u64 {
     let mut backoff = Duration::from_millis(50);
     let max_backoff = Duration::from_millis(500);
     let rpc_timeout = Duration::from_secs(30);
@@ -489,13 +534,14 @@ async fn get_block_number_with_retry<P: Provider + Send + Sync>(provider: &Arc<P
     loop {
         attempt += 1;
         if attempt > 1 {
-            debug!("get_block_number attempt {}", attempt);
+            debug!("[Chain {}] get_block_number attempt {}", chain_id, attempt);
         }
         match tokio::time::timeout(rpc_timeout, provider.get_block_number()).await {
             Ok(Ok(block)) => return block,
             Ok(Err(e)) => {
                 error!(
-                    "Error fetching block number (attempt {}), retrying in {}ms: {}",
+                    "[Chain {}] Error fetching block number (attempt {}), retrying in {}ms: {}",
+                    chain_id,
                     attempt,
                     backoff.as_millis(),
                     e
@@ -503,7 +549,8 @@ async fn get_block_number_with_retry<P: Provider + Send + Sync>(provider: &Arc<P
             }
             Err(_) => {
                 error!(
-                    "Timeout fetching block number (attempt {}, {}s), retrying in {}ms",
+                    "[Chain {}] Timeout fetching block number (attempt {}, {}s), retrying in {}ms",
+                    chain_id,
                     attempt,
                     rpc_timeout.as_secs(),
                     backoff.as_millis()

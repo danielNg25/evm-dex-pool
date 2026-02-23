@@ -24,23 +24,27 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
     metrics: Option<Arc<dyn CollectorMetrics>>,
     swap_event_tx: Option<mpsc::Sender<PendingEvent>>,
 ) -> Result<()> {
+    let chain_id = pool_registry.get_network_id();
+
     if config.use_websocket {
-        info!("Starting collector with websocket mode");
-        let event_queue = EventQueue::new(1000, 1000);
+        info!("[Chain {}] Starting collector with websocket mode", chain_id);
+        let event_queue = EventQueue::new(1000, 1000, chain_id);
 
         for url in &config.websocket_urls {
             let event_sender = event_queue.get_sender().clone();
             let pool_registry_clone = pool_registry.clone();
             let url = url.clone();
             tokio::spawn(async move {
+                let chain_id = pool_registry_clone.get_network_id();
                 let ws = WebsocketListener::new(
                     url,
                     pool_registry_clone.get_all_addresses(),
                     event_sender,
                     pool_registry_clone.get_topics().clone(),
+                    chain_id,
                 );
                 if let Err(e) = ws.start().await {
-                    error!("Websocket listener error: {}", e);
+                    error!("[Chain {}] Websocket listener error: {}", chain_id, e);
                 }
             });
         }
@@ -57,11 +61,11 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
 
         tokio::spawn(async move {
             if let Err(e) = updater.start().await {
-                error!("Collector error: {}", e);
+                error!("[Chain {}] Collector error: {}", chain_id, e);
             }
         });
     } else if config.use_pending_blocks {
-        info!("Starting collector with pending block mode");
+        info!("[Chain {}] Starting collector with pending block mode", chain_id);
         let mut updater = UnifiedPoolUpdater::new(
             provider,
             pool_registry,
@@ -74,11 +78,11 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
 
         tokio::spawn(async move {
             if let Err(e) = updater.start().await {
-                error!("Collector error: {}", e);
+                error!("[Chain {}] Collector error: {}", chain_id, e);
             }
         });
     } else {
-        info!("Starting collector with latest block mode");
+        info!("[Chain {}] Starting collector with latest block mode", chain_id);
         let mut updater = UnifiedPoolUpdater::new(
             provider,
             pool_registry,
@@ -93,7 +97,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
 
         tokio::spawn(async move {
             if let Err(e) = updater.start().await {
-                error!("Collector error: {}", e);
+                error!("[Chain {}] Collector error: {}", chain_id, e);
             }
         });
     }

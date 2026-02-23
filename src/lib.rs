@@ -10,6 +10,10 @@ pub(crate) mod contracts_rpc;
 mod token_info;
 #[cfg(feature = "rpc")]
 pub use token_info::TokenInfo;
+#[cfg(feature = "rpc")]
+pub mod utils;
+#[cfg(feature = "rpc")]
+pub use utils::create_fallback_provider;
 
 // Core traits and types
 pub use pool::{EventApplicable, PoolInterface, PoolType, PoolTypeTrait, TopicList, Topic, POOL_CREATED_TOPICS};

@@ -4,6 +4,7 @@ pub mod config;
 pub mod event_processor;
 pub mod event_queue;
 pub mod metrics;
+pub mod pool_fetcher;
 pub mod unified_pool_updater;
 pub mod utils;
 pub mod websocket_listener;
@@ -13,10 +14,11 @@ pub use block_source::{
     WebsocketBlockSource,
 };
 pub use bootstrap::start_collector;
-pub use config::CollectorConfig;
+pub use config::{CollectorConfig, PoolFetchConfig};
 pub use event_processor::{EventProcessor, PendingEvent};
 pub use event_queue::{create_event_queue, EventQueue, EventSender};
 pub use metrics::CollectorMetrics;
+pub use pool_fetcher::{fetch_pool, fetch_pools_into_registry, identify_pool_type};
 pub use unified_pool_updater::{UnifiedPoolUpdater, UpdaterMode};
 pub use utils::*;
 pub use websocket_listener::WebsocketListener;

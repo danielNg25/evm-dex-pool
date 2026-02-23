@@ -12,6 +12,7 @@ use tokio::time::Duration;
 pub struct EventQueue {
     sender: Arc<EventSender>,
     receiver: Arc<Mutex<mpsc::Receiver<Log>>>,
+    chain_id: u64,
 }
 
 #[derive(Debug)]
@@ -20,21 +21,24 @@ pub struct EventSender {
     recent_events: Arc<Mutex<HashMap<(TxHash, u64), Log>>>,
     event_order: Arc<Mutex<VecDeque<(TxHash, u64)>>>,
     max_events: usize,
+    chain_id: u64,
 }
 
 impl EventQueue {
     /// Creates a new event queue with the specified buffer size and max tracked events
-    pub fn new(buffer_size: usize, max_events: usize) -> Self {
+    pub fn new(buffer_size: usize, max_events: usize, chain_id: u64) -> Self {
         let (sender, receiver) = mpsc::channel(buffer_size);
         let event_sender = Arc::new(EventSender {
             inner: sender,
             recent_events: Arc::new(Mutex::new(HashMap::with_capacity(max_events))),
             event_order: Arc::new(Mutex::new(VecDeque::with_capacity(max_events))),
             max_events,
+            chain_id,
         });
         Self {
             sender: event_sender,
             receiver: Arc::new(Mutex::new(receiver)),
+            chain_id,
         }
     }
 
@@ -64,7 +68,7 @@ impl EventQueue {
             }
         }
 
-        debug!("Retrieved {} events in batch", events.len());
+        debug!("[Chain {}] Retrieved {} events in batch", self.chain_id, events.len());
         events
     }
 
@@ -75,7 +79,8 @@ impl EventQueue {
 
         while let Ok(event) = receiver.try_recv() {
             info!(
-                "Received event: tx={}, log_index={}",
+                "[Chain {}] Received event: tx={}, log_index={}",
+                self.chain_id,
                 event.transaction_hash.unwrap_or_default(),
                 event.log_index.unwrap_or_default()
             );
@@ -99,7 +104,8 @@ impl EventQueue {
         }
 
         debug!(
-            "Retrieved {} events with {}ms batch timeout",
+            "[Chain {}] Retrieved {} events with {}ms batch timeout",
+            self.chain_id,
             events.len(),
             batch_timeout.as_millis()
         );
@@ -134,8 +140,8 @@ impl EventSender {
             let key = (transaction_hash, log_index);
             if recent_events.contains_key(&key) {
                 debug!(
-                    "Skipped duplicate event: tx={}, log_index={}",
-                    transaction_hash, log_index
+                    "[Chain {}] Skipped duplicate event: tx={}, log_index={}",
+                    self.chain_id, transaction_hash, log_index
                 );
                 return Ok(());
             }
@@ -144,8 +150,8 @@ impl EventSender {
                 if let Some(old_key) = event_order.pop_front() {
                     recent_events.remove(&old_key);
                     debug!(
-                        "Pruned oldest event: tx={}, log_index={}",
-                        old_key.0, old_key.1
+                        "[Chain {}] Pruned oldest event: tx={}, log_index={}",
+                        self.chain_id, old_key.0, old_key.1
                     );
                 }
             }
@@ -153,8 +159,8 @@ impl EventSender {
             recent_events.insert(key, event.clone());
             event_order.push_back(key);
             info!(
-                "Added event to recent_events: tx={}, log_index={}",
-                transaction_hash, log_index
+                "[Chain {}] Added event to recent_events: tx={}, log_index={}",
+                self.chain_id, transaction_hash, log_index
             );
         } // Release locks before sending to reduce contention
 
@@ -167,8 +173,8 @@ impl EventSender {
     }
 }
 
-pub fn create_event_queue(buffer_size: usize, max_events: usize) -> (EventQueue, Arc<EventSender>) {
-    let queue = EventQueue::new(buffer_size, max_events);
+pub fn create_event_queue(buffer_size: usize, max_events: usize, chain_id: u64) -> (EventQueue, Arc<EventSender>) {
+    let queue = EventQueue::new(buffer_size, max_events, chain_id);
     let sender = queue.get_sender();
     (queue, sender)
 }

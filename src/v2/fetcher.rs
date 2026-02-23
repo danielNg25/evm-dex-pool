@@ -99,7 +99,7 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
                 .get_storage_at(pool_address, U256::from(FACTORY_STORAGE_SLOT))
                 .await?;
             let factory = Address::from(U160::from(factory_storage));
-            info!("Pool factory from storage: {}", factory);
+            info!("[Chain {}] Pool factory from storage: {}", chain_id, factory);
             factory
         };
         // Try to get fee from factory to fee map (config override)
@@ -163,7 +163,7 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
                                     {
                                         fee_found = Some(fee);
                                         factory = all_aero[i];
-                                        info!("Found Aero factory: {}", factory);
+                                        info!("[Chain {}] Found Aero factory: {}", chain_id, factory);
                                         break;
                                     }
                                 };
@@ -189,7 +189,7 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
 
     // Pool type
     let pool_type = if is_stable {
-        info!("Pool is stable");
+        info!("[Chain {}] Pool is stable", chain_id);
         V2PoolType::Stable
     } else {
         V2PoolType::UniswapV2
@@ -202,7 +202,8 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
         token_info.get_or_fetch_token(provider, token1_address, multicall_address).await?;
     // Create and return V2 pool
     info!(
-        "{} Token0: {}, Token1: {}, Fee: {}, Factory: {}",
+        "[Chain {}] {} Token0: {}, Token1: {}, Fee: {}, Factory: {}",
+        chain_id,
         if is_stable { "Stable Pool" } else { "V2 Pool" },
         token0,
         token1,

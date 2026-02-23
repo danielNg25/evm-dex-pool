@@ -28,6 +28,7 @@ pub struct UnifiedPoolUpdater {
     source: Box<dyn BlockSource>,
     event_processor: EventProcessor,
     pool_registry: Arc<PoolRegistry>,
+    chain_id: u64,
 }
 
 impl UnifiedPoolUpdater {
@@ -40,16 +41,18 @@ impl UnifiedPoolUpdater {
         max_blocks_per_batch: u64,
         mode: UpdaterMode,
     ) -> Self {
+        let chain_id = pool_registry.get_network_id();
+
         // Initialize last_processed_block
         let current_block = pool_registry.get_last_processed_block();
         if current_block == 0 {
             pool_registry.set_last_processed_block(start_block);
-            info!("Initialized last processed block to {}", start_block);
+            info!("[Chain {}] Initialized last processed block to {}", chain_id, start_block);
         } else if start_block > 0 && start_block > current_block {
             pool_registry.set_last_processed_block(start_block);
             info!(
-                "Updated last processed block from {} to {}",
-                current_block, start_block
+                "[Chain {}] Updated last processed block from {} to {}",
+                chain_id, current_block, start_block
             );
         }
 
@@ -90,17 +93,19 @@ impl UnifiedPoolUpdater {
             source,
             event_processor,
             pool_registry,
+            chain_id,
         }
     }
 
     /// Run the updater loop. This never returns under normal operation.
     pub async fn start(&mut self) -> Result<()> {
-        info!("UnifiedPoolUpdater: starting bootstrap...");
+        let chain_id = self.chain_id;
+        info!("[Chain {}] UnifiedPoolUpdater: starting bootstrap...", chain_id);
         self.source.bootstrap().await?;
-        info!("UnifiedPoolUpdater: bootstrap complete, entering main loop");
+        info!("[Chain {}] UnifiedPoolUpdater: bootstrap complete, entering main loop", chain_id);
 
         loop {
-            debug!("UnifiedPoolUpdater: calling next_batch...");
+            debug!("[Chain {}] UnifiedPoolUpdater: calling next_batch...", chain_id);
             let batch = self.source.next_batch().await;
 
             match batch {
@@ -111,38 +116,38 @@ impl UnifiedPoolUpdater {
                 }) => {
                     let event_count = events.len();
                     debug!(
-                        "UnifiedPoolUpdater: received batch with {} events",
-                        event_count
+                        "[Chain {}] UnifiedPoolUpdater: received batch with {} events",
+                        chain_id, event_count
                     );
 
                     match processing_mode {
                         ProcessingMode::ApplyOnly => {
-                            debug!("UnifiedPoolUpdater: applying {} events (ApplyOnly)", event_count);
+                            debug!("[Chain {}] UnifiedPoolUpdater: applying {} events (ApplyOnly)", chain_id, event_count);
                             self.event_processor.apply_events_to_registry(&events).await;
                         }
                         ProcessingMode::ConfirmedWithSwaps => {
                             debug!(
-                                "UnifiedPoolUpdater: processing {} events (ConfirmedWithSwaps)",
-                                event_count
+                                "[Chain {}] UnifiedPoolUpdater: processing {} events (ConfirmedWithSwaps)",
+                                chain_id, event_count
                             );
                             self.event_processor
                                 .process_confirmed_events(events)
                                 .await;
                         }
                         ProcessingMode::Pending => {
-                            debug!("UnifiedPoolUpdater: processing {} events (Pending)", event_count);
+                            debug!("[Chain {}] UnifiedPoolUpdater: processing {} events (Pending)", chain_id, event_count);
                             self.event_processor.process_pending_events(events).await;
                         }
                     }
 
                     if let Some(block) = processed_through_block {
                         self.pool_registry.set_last_processed_block(block);
-                        info!("Successfully processed through block {}", block);
+                        info!("[Chain {}] Successfully processed through block {}", chain_id, block);
                     }
-                    debug!("UnifiedPoolUpdater: batch processing complete");
+                    debug!("[Chain {}] UnifiedPoolUpdater: batch processing complete", chain_id);
                 }
                 Err(e) => {
-                    error!("Error fetching event batch: {}", e);
+                    error!("[Chain {}] Error fetching event batch: {}", chain_id, e);
                 }
             }
         }

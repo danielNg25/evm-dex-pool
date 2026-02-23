@@ -17,6 +17,7 @@ pub struct WebsocketListener {
     is_running: Arc<RwLock<bool>>,
     last_event_time: Arc<RwLock<Instant>>,
     topics: Arc<RwLock<Vec<Topic>>>,
+    chain_id: u64,
 }
 
 impl WebsocketListener {
@@ -26,6 +27,7 @@ impl WebsocketListener {
         pool_addresses: Vec<Address>,
         event_sender: Arc<EventSender>,
         topics: Vec<Topic>,
+        chain_id: u64,
     ) -> Self {
         Self {
             ws_url,
@@ -34,13 +36,14 @@ impl WebsocketListener {
             is_running: Arc::new(RwLock::new(false)),
             last_event_time: Arc::new(RwLock::new(Instant::now())),
             topics: Arc::new(RwLock::new(topics)),
+            chain_id,
         }
     }
 
     /// Starts the WebSocket listener in a background task
     pub async fn start(&self) -> Result<()> {
         *self.is_running.write().await = true;
-        info!("Starting WebSocket listener for {}", self.ws_url);
+        info!("[Chain {}] Starting WebSocket listener for {}", self.chain_id, self.ws_url);
 
         let ws_url = self.ws_url.clone();
         let pool_addresses = self.pool_addresses.clone();
@@ -48,6 +51,7 @@ impl WebsocketListener {
         let is_running = Arc::clone(&self.is_running);
         let last_event_time = Arc::clone(&self.last_event_time);
         let topics = self.topics.read().await.clone();
+        let chain_id = self.chain_id;
 
         tokio::spawn(async move {
             while *is_running.read().await {
@@ -57,19 +61,20 @@ impl WebsocketListener {
                     &event_sender,
                     &last_event_time,
                     topics.clone(),
+                    chain_id,
                 )
                 .await
                 {
                     Ok(_) => {
-                        info!("WebSocket connection closed for {}", ws_url);
+                        info!("[Chain {}] WebSocket connection closed for {}", chain_id, ws_url);
                     }
                     Err(e) => {
-                        error!("WebSocket connection error for {}: {}", ws_url, e);
+                        error!("[Chain {}] WebSocket connection error for {}: {}", chain_id, ws_url, e);
                     }
                 }
 
                 sleep(Duration::from_secs(2)).await;
-                info!("Attempting to reconnect to WebSocket at {}", ws_url);
+                info!("[Chain {}] Attempting to reconnect to WebSocket at {}", chain_id, ws_url);
             }
         });
 
@@ -79,7 +84,7 @@ impl WebsocketListener {
     /// Stops the WebSocket listener
     pub async fn stop(&self) -> Result<()> {
         *self.is_running.write().await = false;
-        info!("Stopping WebSocket listener for {}", self.ws_url);
+        info!("[Chain {}] Stopping WebSocket listener for {}", self.chain_id, self.ws_url);
         Ok(())
     }
 
@@ -90,6 +95,7 @@ impl WebsocketListener {
         event_sender: &Arc<EventSender>,
         last_event_time: &Arc<RwLock<Instant>>,
         topics: Vec<Topic>,
+        chain_id: u64,
     ) -> Result<()> {
         // Connect to the WebSocket
         let ws_provider = ProviderBuilder::new()
@@ -97,7 +103,7 @@ impl WebsocketListener {
             .await
             .context("Failed to connect to WebSocket")?;
 
-        info!("Connected to WebSocket at {}", ws_url);
+        info!("[Chain {}] Connected to WebSocket at {}", chain_id, ws_url);
 
         // Subscribe to logs (starts from current block)
 
@@ -111,7 +117,8 @@ impl WebsocketListener {
             .context("Failed to subscribe to logs")?;
 
         info!(
-            "Subscribed to logs for {} pool addresses at {}",
+            "[Chain {}] Subscribed to logs for {} pool addresses at {}",
+            chain_id,
             pool_addresses.len(),
             ws_url
         );
@@ -133,8 +140,8 @@ impl WebsocketListener {
 
                 if last_event_time_clone.read().await.elapsed() > Duration::from_secs(180) {
                     warn!(
-                        "No events received for 180 seconds at {}; forcing reconnect",
-                        ws_url_clone
+                        "[Chain {}] No events received for 180 seconds at {}; forcing reconnect",
+                        chain_id, ws_url_clone
                     );
                     break;
                 }
@@ -142,15 +149,15 @@ impl WebsocketListener {
                 match provider_clone.get_block_number().await {
                     Ok(_) => {
                         ping_failures = 0;
-                        debug!("Sent heartbeat ping for {}", ws_url_clone);
+                        debug!("[Chain {}] Sent heartbeat ping for {}", chain_id, ws_url_clone);
                     }
                     Err(e) => {
                         ping_failures += 1;
-                        error!("Ping failed for {}: {}", ws_url_clone, e);
+                        error!("[Chain {}] Ping failed for {}: {}", chain_id, ws_url_clone, e);
                         if ping_failures >= MAX_PING_FAILURES {
                             warn!(
-                                "Max ping failures ({}) reached for {}; forcing reconnect",
-                                MAX_PING_FAILURES, ws_url_clone
+                                "[Chain {}] Max ping failures ({}) reached for {}; forcing reconnect",
+                                chain_id, MAX_PING_FAILURES, ws_url_clone
                             );
                             break;
                         }
@@ -165,7 +172,8 @@ impl WebsocketListener {
         let mut stream = subscription.into_stream();
         while let Some(event_log) = stream.next().await {
             debug!(
-                "Received log: address={}, topics={:?}",
+                "[Chain {}] Received log: address={}, topics={:?}",
+                chain_id,
                 event_log.address(),
                 event_log.topics()
             );
@@ -174,13 +182,13 @@ impl WebsocketListener {
             *last_event_time.write().await = Instant::now();
 
             if let Err(e) = event_sender.send(event_log).await {
-                error!("Failed to send event to queue: {}", e);
+                error!("[Chain {}] Failed to send event to queue: {}", chain_id, e);
             }
         }
 
         // Stop pinging task
         *is_running.write().await = false;
-        info!("WebSocket subscription ended for {}", ws_url);
+        info!("[Chain {}] WebSocket subscription ended for {}", chain_id, ws_url);
         Ok(())
     }
 }

@@ -34,6 +34,7 @@ pub struct EventProcessor {
     metrics: Option<Arc<dyn CollectorMetrics>>,
     swap_event_tx: Option<mpsc::Sender<PendingEvent>>,
     profitable_topics: Arc<HashSet<Topic>>,
+    chain_id: u64,
 }
 
 impl EventProcessor {
@@ -43,11 +44,13 @@ impl EventProcessor {
         swap_event_tx: Option<mpsc::Sender<PendingEvent>>,
         profitable_topics: Arc<HashSet<Topic>>,
     ) -> Self {
+        let chain_id = pool_registry.get_network_id();
         Self {
             pool_registry,
             metrics,
             swap_event_tx,
             profitable_topics,
+            chain_id,
         }
     }
 
@@ -56,7 +59,7 @@ impl EventProcessor {
     /// Used during bootstrap/catch-up phases (confirmed blocks that are not the latest).
     /// Groups events by pool address to minimize lock acquisitions.
     pub async fn apply_events_to_registry(&self, events: &[Log]) {
-        debug!("apply_events_to_registry: applying {} events", events.len());
+        debug!("[Chain {}] apply_events_to_registry: applying {} events", self.chain_id, events.len());
 
         // Group events by pool address
         let mut events_by_pool: HashMap<Address, Vec<&Log>> = HashMap::new();
@@ -70,7 +73,8 @@ impl EventProcessor {
         for (address, pool_events) in &events_by_pool {
             if let Some(pool) = self.pool_registry.get_pool(address) {
                 debug!(
-                    "apply_events_to_registry: acquiring write lock for pool {} ({} events)",
+                    "[Chain {}] apply_events_to_registry: acquiring write lock for pool {} ({} events)",
+                    self.chain_id,
                     address,
                     pool_events.len()
                 );
@@ -78,7 +82,8 @@ impl EventProcessor {
                 for event in pool_events {
                     if let Err(e) = pool_guard.apply_log(event) {
                         error!(
-                            "Error applying event {} for pool {}, event {}",
+                            "[Chain {}] Error applying event {} for pool {}, event {}",
+                            self.chain_id,
                             e,
                             event.address(),
                             event.transaction_hash.unwrap()
@@ -87,7 +92,7 @@ impl EventProcessor {
                 }
             }
         }
-        debug!("apply_events_to_registry: done");
+        debug!("[Chain {}] apply_events_to_registry: done", self.chain_id);
     }
 
     /// Apply events to the registry and send profitable swap events to the downstream consumer.
@@ -98,8 +103,8 @@ impl EventProcessor {
         let received_at = Utc::now().timestamp_millis() as u64;
         let event_count = events.len();
         info!(
-            "process_confirmed_events: processing {} events",
-            event_count
+            "[Chain {}] process_confirmed_events: processing {} events",
+            self.chain_id, event_count
         );
 
         // Group events by pool address (preserve order within each pool)
@@ -119,7 +124,8 @@ impl EventProcessor {
             let pool_events = events_by_pool.remove(address).unwrap();
             if let Some(pool) = self.pool_registry.get_pool(address) {
                 debug!(
-                    "process_confirmed_events: acquiring write lock for pool {} ({} events)",
+                    "[Chain {}] process_confirmed_events: acquiring write lock for pool {} ({} events)",
+                    self.chain_id,
                     address,
                     pool_events.len()
                 );
@@ -127,7 +133,8 @@ impl EventProcessor {
                 for event in pool_events {
                     if let Err(e) = pool_guard.apply_log(&event) {
                         error!(
-                            "Error applying event {} for pool {}, event {}",
+                            "[Chain {}] Error applying event {} for pool {}, event {}",
+                            self.chain_id,
                             e,
                             event.address(),
                             event.transaction_hash.unwrap()
@@ -142,17 +149,17 @@ impl EventProcessor {
 
         if collect_swaps {
             info!(
-                "process_confirmed_events: sending {} swap events",
-                swap_events.len()
+                "[Chain {}] process_confirmed_events: sending {} swap events",
+                self.chain_id, swap_events.len()
             );
             let empty_modified_pools = Arc::new(RwLock::new(HashMap::new()));
             for (i, event) in swap_events.into_iter().enumerate() {
-                debug!("process_confirmed_events: sending swap event {}", i + 1);
+                debug!("[Chain {}] process_confirmed_events: sending swap event {}", self.chain_id, i + 1);
                 self.send_swap_event(event, Arc::clone(&empty_modified_pools), received_at)
                     .await;
             }
         }
-        info!("process_confirmed_events: done");
+        info!("[Chain {}] process_confirmed_events: done", self.chain_id);
     }
 
     /// Process pending block events: clone pools into speculative state, apply events
@@ -191,7 +198,7 @@ impl EventProcessor {
 
             // Apply the event to the pool copy
             if let Err(e) = pool.apply_log(&event) {
-                error!("Error applying pending event: {}", e);
+                error!("[Chain {}] Error applying pending event: {}", self.chain_id, e);
             }
             drop(pools_guard);
 
@@ -214,14 +221,14 @@ impl EventProcessor {
         let log_index = event.log_index.unwrap();
 
         if let Some(metrics) = &self.metrics {
-            debug!("send_swap_event: updating metrics...");
+            debug!("[Chain {}] send_swap_event: updating metrics...", self.chain_id);
             metrics.add_opportunity(tx_hash, log_index, received_at);
             metrics.set_processed_at(tx_hash, log_index, Utc::now().timestamp_millis() as u64);
-            debug!("send_swap_event: metrics updated");
+            debug!("[Chain {}] send_swap_event: metrics updated", self.chain_id);
         }
 
         if let Some(tx) = &self.swap_event_tx {
-            debug!("send_swap_event: sending to channel...");
+            debug!("[Chain {}] send_swap_event: sending to channel...", self.chain_id);
             if let Err(e) = tx
                 .send(PendingEvent {
                     event,
@@ -229,9 +236,9 @@ impl EventProcessor {
                 })
                 .await
             {
-                error!("Error sending swap event: {}", e);
+                error!("[Chain {}] Error sending swap event: {}", self.chain_id, e);
             }
-            debug!("send_swap_event: sent");
+            debug!("[Chain {}] send_swap_event: sent", self.chain_id);
         }
     }
 }
@@ -244,6 +251,7 @@ pub async fn fetch_events_with_retry<P: Provider + Send + Sync>(
     topics: Vec<Topic>,
     from_block: BlockNumberOrTag,
     to_block: BlockNumberOrTag,
+    chain_id: u64,
 ) -> Result<Vec<Log>> {
     let mut backoff = Duration::from_millis(50);
     let max_backoff = Duration::from_millis(500);
@@ -253,8 +261,8 @@ pub async fn fetch_events_with_retry<P: Provider + Send + Sync>(
     loop {
         attempt += 1;
         debug!(
-            "fetch_events_with_retry: attempt {} for blocks {:?} to {:?}",
-            attempt, from_block, to_block
+            "[Chain {}] fetch_events_with_retry: attempt {} for blocks {:?} to {:?}",
+            chain_id, attempt, from_block, to_block
         );
         match tokio::time::timeout(
             rpc_timeout,
@@ -264,7 +272,8 @@ pub async fn fetch_events_with_retry<P: Provider + Send + Sync>(
         {
             Ok(Ok(events)) => {
                 debug!(
-                    "fetch_events_with_retry: got {} events (attempt {})",
+                    "[Chain {}] fetch_events_with_retry: got {} events (attempt {})",
+                    chain_id,
                     events.len(),
                     attempt
                 );
@@ -272,7 +281,8 @@ pub async fn fetch_events_with_retry<P: Provider + Send + Sync>(
             }
             Ok(Err(e)) => {
                 error!(
-                    "Error fetching events (attempt {}), retrying in {}ms: {}",
+                    "[Chain {}] Error fetching events (attempt {}), retrying in {}ms: {}",
+                    chain_id,
                     attempt,
                     backoff.as_millis(),
                     e
@@ -280,7 +290,8 @@ pub async fn fetch_events_with_retry<P: Provider + Send + Sync>(
             }
             Err(_) => {
                 error!(
-                    "Timeout fetching events (attempt {}, {}s), retrying in {}ms",
+                    "[Chain {}] Timeout fetching events (attempt {}, {}s), retrying in {}ms",
+                    chain_id,
                     attempt,
                     rpc_timeout.as_secs(),
                     backoff.as_millis()
