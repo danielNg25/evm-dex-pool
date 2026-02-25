@@ -19,7 +19,7 @@ pub struct CollectorConfig {
 pub struct PoolFetchConfig {
     pub multicall_address: Address,
     pub chain_id: u64,
-    /// Factory address (lowercase hex) -> fee in 1_000_000 basis. Used for V2 pools.
+    /// Factory address (hex, any case) -> fee in 1_000_000 basis. Used for V2 pools.
     pub factory_to_fee: HashMap<String, u64>,
     /// Aerodrome-style factory addresses (for stable/volatile detection).
     pub aero_factory_addresses: Vec<Address>,

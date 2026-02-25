@@ -103,8 +103,10 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
             factory
         };
         // Try to get fee from factory to fee map (config override)
-        match factory_to_fee.get(&factory.to_string().to_lowercase()) {
-            Some(fee) => U256::from(*fee),
+        // Case-insensitive lookup: callers may store keys as checksummed or lowercase
+        let factory_str = factory.to_string().to_lowercase();
+        match factory_to_fee.iter().find(|(k, _)| k.to_lowercase() == factory_str) {
+            Some((_, fee)) => U256::from(*fee),
             None => match get_v2_factory_fee_by_chain_id(chain_id, &factory) {
                 // Hardcoded chain-specific factory fee
                 Ok(fee) => fee,
