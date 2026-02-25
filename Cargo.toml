@@ -1,6 +1,6 @@
 [package]
 name = "evm-dex-pool"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["danielNg25 <ndtr2000@gmail.com>"]
 license = "MIT"
