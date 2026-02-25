@@ -635,9 +635,7 @@ pub mod factories {
     pub mod fraxtal {
         pub const CHAIN_ID: u64 = 252;
         pub const V2_FACTORIES: &[(&str, u32)] = &[];
-        pub const AERO_FACTORIES: &[&str] = &[
-            "0xAAA16c016BF556fcD620328f0759252E29b1AB57",
-        ];
+        pub const AERO_FACTORIES: &[&str] = &["0xAAA16c016BF556fcD620328f0759252E29b1AB57"];
     }
 
     pub mod core {
@@ -652,33 +650,25 @@ pub mod factories {
     pub mod metis {
         pub const CHAIN_ID: u64 = 1088;
         pub const V2_FACTORIES: &[(&str, u32)] = &[];
-        pub const AERO_FACTORIES: &[&str] = &[
-            "0x12508dd9108Abab2c5fD8fC6E4984E46a3CF7824",
-        ];
+        pub const AERO_FACTORIES: &[&str] = &["0x12508dd9108Abab2c5fD8fC6E4984E46a3CF7824"];
     }
 
     pub mod zircuit {
         pub const CHAIN_ID: u64 = 48900;
         pub const V2_FACTORIES: &[(&str, u32)] = &[];
-        pub const AERO_FACTORIES: &[&str] = &[
-            "0xDd018347C29a27088eb2d0BF0637d9A05b30666c",
-        ];
+        pub const AERO_FACTORIES: &[&str] = &["0xDd018347C29a27088eb2d0BF0637d9A05b30666c"];
     }
 
     pub mod iota {
         pub const CHAIN_ID: u64 = 8822;
         pub const V2_FACTORIES: &[(&str, u32)] = &[];
-        pub const AERO_FACTORIES: &[&str] = &[
-            "0x10A288eF87586BE54ea690998cAC82F7Cc90BC50",
-        ];
+        pub const AERO_FACTORIES: &[&str] = &["0x10A288eF87586BE54ea690998cAC82F7Cc90BC50"];
     }
 
     pub mod lisk {
         pub const CHAIN_ID: u64 = 1135;
         pub const V2_FACTORIES: &[(&str, u32)] = &[];
-        pub const AERO_FACTORIES: &[&str] = &[
-            "0x31832f2a97Fd20664D76Cc421207669b55CE4BC0",
-        ];
+        pub const AERO_FACTORIES: &[&str] = &["0x31832f2a97Fd20664D76Cc421207669b55CE4BC0"];
     }
 }
 
@@ -725,20 +715,20 @@ pub fn get_v2_factory_fee_by_chain_id(chain_id: u64, factory_address: &Address) 
         88888 => factories::chiliz::V2_FACTORIES,
         543210 => factories::zero::V2_FACTORIES,
         747474 => factories::katana::V2_FACTORIES,
-        _ => return Err(anyhow::anyhow!("No hardcoded factories for chain ID: {}", chain_id)),
+        8453 => factories::base::V2_FACTORIES,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "No hardcoded factories for chain ID: {}",
+                chain_id
+            ))
+        }
     };
 
     chain_factories
         .iter()
         .find(|(addr, _)| addr.eq_ignore_ascii_case(&address_str))
         .map(|(_, fee)| U256::from(*fee))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Unknown V2 factory {} on chain {}",
-                address_str,
-                chain_id
-            )
-        })
+        .ok_or_else(|| anyhow::anyhow!("Unknown V2 factory {} on chain {}", address_str, chain_id))
 }
 
 /// Get hardcoded aero factory addresses for a given chain ID
