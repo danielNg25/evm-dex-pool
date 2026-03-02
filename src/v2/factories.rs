@@ -746,3 +746,66 @@ pub fn get_aero_factories_by_chain_id(chain_id: u64) -> Vec<Address> {
     };
     addrs.iter().filter_map(|a| a.parse().ok()).collect()
 }
+
+/// Get all V2 factory addresses and their fees for a given chain ID.
+/// Returns a list of (address_string, fee_in_basis_points) tuples.
+/// Returns an empty vec if the chain ID is not supported.
+pub fn get_all_v2_factories_by_chain_id(chain_id: u64) -> Vec<(String, u32)> {
+    let chain_factories: &[(&str, u32)] = match chain_id {
+        1 => factories::ethereum::V2_FACTORIES,
+        14 => factories::flare::V2_FACTORIES,
+        30 => factories::rootstock::V2_FACTORIES,
+        50 => factories::xdc::V2_FACTORIES,
+        56 => factories::bsc::V2_FACTORIES,
+        137 => factories::polygon::V2_FACTORIES,
+        169 => factories::manta::V2_FACTORIES,
+        252 => factories::fraxtal::V2_FACTORIES,
+        295 => factories::hbar::V2_FACTORIES,
+        369 => factories::pulse::V2_FACTORIES,
+        747 => factories::flow::V2_FACTORIES,
+        888 => factories::wan::V2_FACTORIES,
+        1030 => factories::cfx::V2_FACTORIES,
+        1088 => factories::metis::V2_FACTORIES,
+        1116 => factories::core::V2_FACTORIES,
+        1135 => factories::lisk::V2_FACTORIES,
+        1285 => factories::moonriver::V2_FACTORIES,
+        1329 => factories::sei::V2_FACTORIES,
+        1514 => factories::story::V2_FACTORIES,
+        1868 => factories::soneium::V2_FACTORIES,
+        2222 => factories::kava::V2_FACTORIES,
+        2741 => factories::abs::V2_FACTORIES,
+        2818 => factories::morph::V2_FACTORIES,
+        4689 => factories::iotx::V2_FACTORIES,
+        5000 => factories::mantle::V2_FACTORIES,
+        5031 => factories::somnia::V2_FACTORIES,
+        7000 => factories::zetachain::V2_FACTORIES,
+        8822 => factories::iota::V2_FACTORIES,
+        12164 => factories::zed::V2_FACTORIES,
+        34443 => factories::mode::V2_FACTORIES,
+        42793 => factories::etherlink::V2_FACTORIES,
+        43111 => factories::hemi::V2_FACTORIES,
+        43114 => factories::avalanche::V2_FACTORIES,
+        48900 => factories::zircuit::V2_FACTORIES,
+        57073 => factories::ink::V2_FACTORIES,
+        80094 => factories::bera::V2_FACTORIES,
+        88888 => factories::chiliz::V2_FACTORIES,
+        543210 => factories::zero::V2_FACTORIES,
+        747474 => factories::katana::V2_FACTORIES,
+        8453 => factories::base::V2_FACTORIES,
+        _ => return vec![],
+    };
+
+    chain_factories
+        .iter()
+        .map(|(addr, fee)| (addr.to_string(), *fee))
+        .collect()
+}
+
+/// Get all chain IDs that have factory data (V2 or Aerodrome) in evm-dex-pool.
+pub fn get_supported_chain_ids() -> Vec<u64> {
+    vec![
+        1, 14, 30, 50, 56, 137, 169, 252, 295, 369, 747, 888, 1030, 1088, 1116, 1135, 1285,
+        1329, 1514, 1868, 2222, 2741, 2818, 4689, 5000, 5031, 7000, 8453, 8822, 12164, 34443,
+        42793, 43111, 43114, 48900, 57073, 80094, 88888, 543210, 747474,
+    ]
+}

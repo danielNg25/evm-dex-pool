@@ -29,6 +29,7 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
     multicall_address: Address,
     chain_id: u64,
 ) -> Result<UniswapV3Pool> {
+    info!("[Chain {}] Fetching V3 pool: {}", chain_id, pool_address);
     let mut v3_pool_type = V3PoolType::UniswapV3;
     let uniswapv3_pool_instance = IUniswapV3Pool::new(pool_address, &provider);
     let clp_pool_instance = CLPPool::new(pool_address, &provider);
@@ -129,10 +130,12 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
         };
 
     // Create token objects (you'll need to fetch token details)
-    let (token0, _) =
-        token_info.get_or_fetch_token(provider, token0, multicall_address).await?;
-    let (token1, _) =
-        token_info.get_or_fetch_token(provider, token1, multicall_address).await?;
+    let (token0, _) = token_info
+        .get_or_fetch_token(provider, token0, multicall_address)
+        .await?;
+    let (token1, _) = token_info
+        .get_or_fetch_token(provider, token1, multicall_address)
+        .await?;
 
     info!(
         "[Chain {}] V3 Pool {:?}: Token0: {}, Token1: {}, Fee: {}, Factory: {}, Tick: {}, Liquidity: {}",
@@ -425,11 +428,17 @@ pub async fn calculate_ratio_conversion_factor<P: Provider + Send + Sync>(
                 } else {
                     amount_out_0 * U256::from(RAMSES_FACTOR) / amount_out_estimate_0 - U256::ONE
                 };
-                info!("[Chain {}] Ratio conversion factor 0: {}", chain_id, ratio_conversion_factor_0);
+                info!(
+                    "[Chain {}] Ratio conversion factor 0: {}",
+                    chain_id, ratio_conversion_factor_0
+                );
                 ratio_conversion_factor_0
             }
             Err(_) => {
-                info!("[Chain {}] Failed to fetch ratio conversion factor 0", chain_id);
+                info!(
+                    "[Chain {}] Failed to fetch ratio conversion factor 0",
+                    chain_id
+                );
                 U256::from(RAMSES_FACTOR)
             }
         };
@@ -458,11 +467,17 @@ pub async fn calculate_ratio_conversion_factor<P: Provider + Send + Sync>(
                 } else {
                     amount_out_1 * U256::from(RAMSES_FACTOR) / amount_out_estimate_1 - U256::ONE
                 };
-                info!("[Chain {}] Ratio conversion factor 1: {}", chain_id, ratio_conversion_factor_1);
+                info!(
+                    "[Chain {}] Ratio conversion factor 1: {}",
+                    chain_id, ratio_conversion_factor_1
+                );
                 ratio_conversion_factor_1
             }
             Err(_) => {
-                info!("[Chain {}] Failed to fetch ratio conversion factor 1", chain_id);
+                info!(
+                    "[Chain {}] Failed to fetch ratio conversion factor 1",
+                    chain_id
+                );
                 U256::from(RAMSES_FACTOR)
             }
         };

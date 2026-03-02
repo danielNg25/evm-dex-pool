@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::config::PoolFetchConfig;
+use super::multicall::resolve_multicall_address;
 
 /// Detect whether a pool is V2 or V3 by calling `liquidity()` (V3-specific).
 pub async fn identify_pool_type<P: Provider + Send + Sync>(
@@ -38,6 +39,7 @@ pub async fn fetch_pool<P: Provider + Send + Sync, T: TokenInfo>(
     token_info: &T,
     config: &PoolFetchConfig,
 ) -> Result<Box<dyn PoolInterface>> {
+    let multicall_address = resolve_multicall_address(config.chain_id, config.multicall_address);
     match pool_type {
         PoolType::UniswapV2 => {
             let pool = fetch_v2_pool(
@@ -45,7 +47,7 @@ pub async fn fetch_pool<P: Provider + Send + Sync, T: TokenInfo>(
                 pool_address,
                 block_number,
                 token_info,
-                config.multicall_address,
+                multicall_address,
                 config.chain_id,
                 &config.factory_to_fee,
                 &config.aero_factory_addresses,
@@ -59,7 +61,7 @@ pub async fn fetch_pool<P: Provider + Send + Sync, T: TokenInfo>(
                 pool_address,
                 block_number,
                 token_info,
-                config.multicall_address,
+                multicall_address,
                 config.chain_id,
             )
             .await?;

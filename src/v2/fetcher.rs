@@ -6,7 +6,9 @@ use crate::contracts_rpc::RpcUniswapV2FactoryGetFeePool as UniswapV2FactoryGetFe
 use crate::contracts_rpc::RpcUniswapV2FactoryPairFee as UniswapV2FactoryPairFee;
 use crate::contracts_rpc::RpcVolatileStableFeeInFactory as VolatileStableFeeInFactory;
 use crate::contracts_rpc::RpcVolatileStableGetFee as VolatileStableGetFee;
-use crate::v2::{get_aero_factories_by_chain_id, get_v2_factory_fee_by_chain_id, UniswapV2Pool, V2PoolType};
+use crate::v2::{
+    get_aero_factories_by_chain_id, get_v2_factory_fee_by_chain_id, UniswapV2Pool, V2PoolType,
+};
 use crate::TokenInfo;
 use alloy::{
     eips::BlockId,
@@ -33,6 +35,7 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
     factory_to_fee: &HashMap<String, u64>,
     aero_factories: &[Address],
 ) -> Result<UniswapV2Pool> {
+    info!("[Chain {}] Fetching V2 pool: {}", chain_id, pool_address);
     let pair_instance = IUniswapV2Pair::new(pool_address, &provider);
     let uint256_pair_instance = IV2PairUint256::new(pool_address, &provider);
     let volatile_stable_fee_in_factory_instance =
@@ -99,13 +102,19 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
                 .get_storage_at(pool_address, U256::from(FACTORY_STORAGE_SLOT))
                 .await?;
             let factory = Address::from(U160::from(factory_storage));
-            info!("[Chain {}] Pool factory from storage: {}", chain_id, factory);
+            info!(
+                "[Chain {}] Pool factory from storage: {}",
+                chain_id, factory
+            );
             factory
         };
         // Try to get fee from factory to fee map (config override)
         // Case-insensitive lookup: callers may store keys as checksummed or lowercase
         let factory_str = factory.to_string().to_lowercase();
-        match factory_to_fee.iter().find(|(k, _)| k.to_lowercase() == factory_str) {
+        match factory_to_fee
+            .iter()
+            .find(|(k, _)| k.to_lowercase() == factory_str)
+        {
             Some((_, fee)) => U256::from(*fee),
             None => match get_v2_factory_fee_by_chain_id(chain_id, &factory) {
                 // Hardcoded chain-specific factory fee
@@ -139,8 +148,7 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
                         let mut multicall =
                             MulticallBuilder::new_dynamic(provider).address(multicall_address);
                         for aero_factory in &all_aero {
-                            let factory_instance =
-                                IVeloPoolFactory::new(*aero_factory, &provider);
+                            let factory_instance = IVeloPoolFactory::new(*aero_factory, &provider);
                             multicall = multicall.add_dynamic(factory_instance.getPair(
                                 token0_address,
                                 token1_address,
@@ -165,7 +173,10 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
                                     {
                                         fee_found = Some(fee);
                                         factory = all_aero[i];
-                                        info!("[Chain {}] Found Aero factory: {}", chain_id, factory);
+                                        info!(
+                                            "[Chain {}] Found Aero factory: {}",
+                                            chain_id, factory
+                                        );
                                         break;
                                     }
                                 };
@@ -198,10 +209,12 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
     };
 
     // Create token objects (you'll need to fetch token details)
-    let (token0, decimals0) =
-        token_info.get_or_fetch_token(provider, token0_address, multicall_address).await?;
-    let (token1, decimals1) =
-        token_info.get_or_fetch_token(provider, token1_address, multicall_address).await?;
+    let (token0, decimals0) = token_info
+        .get_or_fetch_token(provider, token0_address, multicall_address)
+        .await?;
+    let (token1, decimals1) = token_info
+        .get_or_fetch_token(provider, token1_address, multicall_address)
+        .await?;
     // Create and return V2 pool
     info!(
         "[Chain {}] {} Token0: {}, Token1: {}, Fee: {}, Factory: {}",

@@ -17,7 +17,9 @@ pub struct CollectorConfig {
 
 /// Configuration for batch pool fetching from RPC.
 pub struct PoolFetchConfig {
-    pub multicall_address: Address,
+    /// Multicall3 address override. If None, falls back to chain-specific
+    /// custom address, then standard MULTICALL3 (0xcA11bde05977b3631167028862bE2a173976CA11).
+    pub multicall_address: Option<Address>,
     pub chain_id: u64,
     /// Factory address (hex, any case) -> fee in 1_000_000 basis. Used for V2 pools.
     pub factory_to_fee: HashMap<String, u64>,
