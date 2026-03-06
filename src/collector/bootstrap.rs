@@ -61,7 +61,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             cancel_rx,
         );
 
-        tokio::spawn(async move {
+        let updater_handle = tokio::spawn(async move {
             if let Err(e) = updater.start().await {
                 error!("[Chain {}] Collector error: {}", chain_id, e);
             }
@@ -70,6 +70,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
         let ws_urls = config.websocket_urls.clone();
         Ok(CollectorHandle::new(
             cancel_tx,
+            updater_handle,
             ws_listeners,
             ws_urls,
             provider,
@@ -91,7 +92,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             cancel_rx,
         );
 
-        tokio::spawn(async move {
+        let updater_handle = tokio::spawn(async move {
             if let Err(e) = updater.start().await {
                 error!("[Chain {}] Collector error: {}", chain_id, e);
             }
@@ -99,6 +100,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
 
         Ok(CollectorHandle::new(
             cancel_tx,
+            updater_handle,
             vec![],
             vec![],
             provider,
@@ -122,7 +124,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             cancel_rx,
         );
 
-        tokio::spawn(async move {
+        let updater_handle = tokio::spawn(async move {
             if let Err(e) = updater.start().await {
                 error!("[Chain {}] Collector error: {}", chain_id, e);
             }
@@ -130,6 +132,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
 
         Ok(CollectorHandle::new(
             cancel_tx,
+            updater_handle,
             vec![],
             vec![],
             provider,

@@ -26,6 +26,9 @@ use tokio::time::Duration;
 /// addresses while keeping all pool states consistent.
 pub struct CollectorHandle<P: Provider + Send + Sync + Clone + 'static> {
     cancel_tx: Option<oneshot::Sender<()>>,
+    /// JoinHandle for the running updater task. Awaited in `stop_updater` to
+    /// guarantee `last_processed_block` is fully committed before it is read.
+    updater_handle: Option<tokio::task::JoinHandle<()>>,
 
     // WS-specific (empty in HTTP / PendingBlock mode)
     ws_listeners: Vec<Arc<WebsocketListener>>,
@@ -43,6 +46,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cancel_tx: oneshot::Sender<()>,
+        updater_handle: tokio::task::JoinHandle<()>,
         ws_listeners: Vec<Arc<WebsocketListener>>,
         ws_urls: Vec<String>,
         provider: Arc<P>,
@@ -53,6 +57,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
     ) -> Self {
         Self {
             cancel_tx: Some(cancel_tx),
+            updater_handle: Some(updater_handle),
             ws_listeners,
             ws_urls,
             provider,
@@ -65,13 +70,17 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
 
     /// Stop the running collector (updater loop and all WS listeners).
     pub async fn stop(&mut self) {
-        self.stop_updater();
+        // Stop WS listeners first so the EventQueue channel stays open while
+        // we wait for the updater task to drain and exit. Stopping the updater
+        // first would drop the EventQueue receiver (closing the channel) before
+        // the listeners are told to stop, causing "channel closed" error spam.
         for listener in &self.ws_listeners {
             if let Err(e) = listener.stop().await {
                 error!("Error stopping WS listener: {}", e);
             }
         }
         self.ws_listeners.clear();
+        self.stop_updater().await;
     }
 
     /// Dynamically add new pool addresses to the running collector.
@@ -152,8 +161,8 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
             pools.len()
         );
 
-        // 3. Stop the updater. last_processed_block is now stable.
-        self.stop_updater();
+        // 3. Stop the updater and wait for it to exit. last_processed_block is now stable.
+        self.stop_updater().await;
 
         // 4. Read the final block the collector reached before stopping.
         let final_block = self.pool_registry.get_last_processed_block();
@@ -217,35 +226,11 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
     ) -> Result<()> {
         let chain_id = fetch_config.chain_id;
 
-        // 1. Use the live chain head as the fetch anchor.
-        //    last_processed_block stays at the bootstrap block in WS mode and
-        //    is therefore stale for catching up live state.
-        let chain_head_at_fetch = self.provider.get_block_number().await?;
-        info!(
-            "[Chain {}] add_pools(ws): fetching {} pools at chain head {}",
-            chain_id,
-            addresses.len(),
-            chain_head_at_fetch
-        );
-
-        // 2. Fetch new pool state into memory at chain_head_at_fetch.
-        let mut pools = fetch_pools_in_memory(
-            &self.provider,
-            addresses,
-            BlockId::Number(BlockNumberOrTag::Number(chain_head_at_fetch)),
-            token_info,
-            fetch_config,
-        )
-        .await?;
-
-        info!(
-            "[Chain {}] add_pools(ws): fetched {} pools, stopping updater and listeners",
-            chain_id,
-            pools.len()
-        );
-
-        // 3. Stop the updater and all WS listeners.
-        self.stop_updater();
+        // 1. Stop old WS listeners first so the EventQueue channel stays open
+        //    while we wait for the updater to drain and exit (step 2 below).
+        //    Stopping the updater first would drop the EventQueue receiver,
+        //    closing the channel and causing "channel closed" error spam from
+        //    listeners that haven't been told to stop yet.
         for listener in &self.ws_listeners {
             if let Err(e) = listener.stop().await {
                 error!("[Chain {}] Error stopping WS listener: {}", chain_id, e);
@@ -253,55 +238,32 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         }
         self.ws_listeners.clear();
 
-        // 4. Re-read chain head — may have advanced 1-2 blocks during the
-        //    (potentially multi-second) pool fetch.
-        let final_chain_head = self.provider.get_block_number().await?;
-
-        // 5. Catchup new pools from chain_head_at_fetch+1 to final_chain_head.
-        //    WS subscription will only deliver blocks after the subscription
-        //    point, so there is no overlap with these historical RPC events.
-        if final_chain_head > chain_head_at_fetch {
-            info!(
-                "[Chain {}] add_pools(ws): catching up new pools blocks {}..={}",
-                chain_id,
-                chain_head_at_fetch + 1,
-                final_chain_head
-            );
-            apply_catchup_events_in_memory(
-                &self.provider,
-                &mut pools,
-                self.pool_registry.get_topics(),
-                chain_head_at_fetch + 1,
-                final_chain_head,
-                chain_id,
-            )
-            .await?;
-        }
-
-        // 6. Register pools and any new event topics.
-        register_pools_and_topics(&self.pool_registry, pools);
-
-        // 7. Advance last_processed_block to final_chain_head.
-        //    The new updater's WS bootstrap will see a 0-block gap and skip
-        //    the RPC catchup phase — preventing any historical replay of events
-        //    that would double-apply to existing pools.
-        self.pool_registry.set_last_processed_block(final_chain_head);
+        // 2. Stop the updater and wait for it to exit. last_processed_block is now stable.
+        self.stop_updater().await;
+        let stop_block = self.pool_registry.get_last_processed_block();
         info!(
-            "[Chain {}] add_pools(ws): last_processed_block → {}",
-            chain_id, final_chain_head
+            "[Chain {}] add_pools(ws): updater stopped at block {}",
+            chain_id, stop_block
         );
 
-        // 8. Create a fresh EventQueue.
-        //    The old receiver was owned by the now-stopped updater.
+        // 3. Create a fresh EventQueue.
         let new_event_queue = EventQueue::new(1000, 1000, chain_id);
         let event_sender = new_event_queue.get_sender();
 
-        // 9. Start new WS listeners covering ALL addresses (existing + new).
-        let all_addresses = self.pool_registry.get_all_addresses();
+        // 4. Start new WS listeners for ALL addresses (existing + new) NOW,
+        //    so they buffer events during the upcoming (slow) pool fetch phase.
+        //    This mirrors the WebsocketBlockSource::bootstrap pattern: listeners
+        //    start first so no events are missed between fetch and subscription.
+        let all_current_addresses = self.pool_registry.get_all_addresses();
+        let all_addresses: Vec<Address> = {
+            let mut set: HashSet<Address> =
+                all_current_addresses.iter().copied().collect();
+            set.extend(addresses.iter().copied());
+            set.into_iter().collect()
+        };
         let topics = self.pool_registry.get_topics();
         let mut new_ws_listeners: Vec<Arc<WebsocketListener>> =
             Vec::with_capacity(self.ws_urls.len());
-
         for url in &self.ws_urls {
             let listener = Arc::new(WebsocketListener::new(
                 url.clone(),
@@ -320,19 +282,45 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         }
         self.ws_listeners = new_ws_listeners;
 
-        // 10. Restart the updater in Websocket mode with the new EventQueue.
-        //     start_block = final_chain_head → bootstrap finds 0-block gap.
+        // 5. Fetch new pool state into memory at stop_block.
+        //    WS listeners are already buffering events in the background.
+        info!(
+            "[Chain {}] add_pools(ws): fetching {} pools at block {}",
+            chain_id,
+            addresses.len(),
+            stop_block
+        );
+        let pools = fetch_pools_in_memory(
+            &self.provider,
+            addresses,
+            BlockId::Number(BlockNumberOrTag::Number(stop_block)),
+            token_info,
+            fetch_config,
+        )
+        .await?;
+
+        // 6. Register pools and any new event topics.
+        //    Pool state is at stop_block — consistent with existing pools.
+        register_pools_and_topics(&self.pool_registry, pools);
+
+        // 7. last_processed_block stays at stop_block (unchanged).
+        //    WebsocketBlockSource::bootstrap() will drain the EventQueue
+        //    (populated during step 5) and RPC-catch up ALL pools (old + new)
+        //    from stop_block to first_event_block, then apply buffered events.
+
+        // 8. Restart the updater in Websocket mode with the new EventQueue.
         self.spawn_updater(
             UpdaterMode::Websocket {
                 event_queue: new_event_queue,
             },
-            final_chain_head,
+            stop_block,
         );
 
         info!(
-            "[Chain {}] add_pools(ws): done — {} new pools now active",
+            "[Chain {}] add_pools(ws): done — {} new pools registered, updater restarted from block {}",
             chain_id,
-            addresses.len()
+            addresses.len(),
+            stop_block
         );
         Ok(())
     }
@@ -341,14 +329,22 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
     // Helpers
     // -------------------------------------------------------------------------
 
-    /// Send the cancel signal to the updater task only (does not touch WS listeners).
-    fn stop_updater(&mut self) {
+    /// Send the cancel signal and wait for the updater task to fully exit.
+    ///
+    /// Awaiting the `JoinHandle` guarantees that the updater's final
+    /// `set_last_processed_block` call has completed before we read the
+    /// registry's block cursor, preventing a stale-read race condition.
+    async fn stop_updater(&mut self) {
         if let Some(tx) = self.cancel_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(handle) = self.updater_handle.take() {
+            let _ = handle.await;
+        }
     }
 
-    /// Create and spawn a new `UnifiedPoolUpdater` task, storing the new cancel sender.
+    /// Create and spawn a new `UnifiedPoolUpdater` task, storing the cancel
+    /// sender and the `JoinHandle` for later awaiting in `stop_updater`.
     fn spawn_updater(&mut self, mode: UpdaterMode, start_block: u64) {
         let chain_id = self.pool_registry.get_network_id();
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -362,11 +358,12 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
             mode,
             cancel_rx,
         );
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = updater.start().await {
                 error!("[Chain {}] Collector error after restart: {}", chain_id, e);
             }
         });
+        self.updater_handle = Some(handle);
         self.cancel_tx = Some(cancel_tx);
     }
 }

@@ -182,7 +182,9 @@ impl WebsocketListener {
             *last_event_time.write().await = Instant::now();
 
             if let Err(e) = event_sender.send(event_log).await {
-                error!("[Chain {}] Failed to send event to queue: {}", chain_id, e);
+                // Channel closed is expected during shutdown (EventQueue receiver
+                // dropped when the updater exits). Log at debug, not error.
+                debug!("[Chain {}] Failed to send event to queue: {}", chain_id, e);
             }
         }
 

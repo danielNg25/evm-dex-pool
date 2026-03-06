@@ -1,7 +1,7 @@
 use crate::PoolRegistry;
 use alloy::providers::Provider;
 use anyhow::Result;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -113,8 +113,11 @@ impl UnifiedPoolUpdater {
             debug!("[Chain {}] UnifiedPoolUpdater: calling next_batch...", chain_id);
             let batch_result = tokio::select! {
                 biased;
-                _ = &mut self.cancel_rx => {
-                    info!("[Chain {}] Collector received stop signal, shutting down", chain_id);
+                result = &mut self.cancel_rx => {
+                    match result {
+                        Ok(()) => info!("[Chain {}] Collector received stop signal, shutting down", chain_id),
+                        Err(_)  => warn!("[Chain {}] Collector stopping: CollectorHandle was dropped (cancel_tx gone)", chain_id),
+                    }
                     return Ok(());
                 }
                 result = self.source.next_batch() => result,
