@@ -111,10 +111,12 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
         }
     }
 
+    let fetch_mode = if config.parallel_fetch { "parallel" } else { "sequential" };
     info!(
-        "[Chain {}] Fetching {} new pools in parallel chunks",
+        "[Chain {}] Fetching {} new pools in {} chunks",
         config.chain_id,
-        new_pool_addresses.len()
+        new_pool_addresses.len(),
+        fetch_mode,
     );
 
     let chunk_size = config.chunk_size.max(1);
@@ -131,27 +133,49 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
             chunk.len()
         );
 
-        let futures: Vec<_> = chunk
-            .iter()
-            .map(|&address| {
-                let provider = provider.clone();
-                async move {
-                    let pool_type = identify_pool_type(&provider, address).await?;
-                    let pool = fetch_pool(
-                        &provider,
-                        address,
-                        BlockId::Number(block_number),
-                        pool_type,
-                        token_info,
-                        config,
-                    )
-                    .await?;
-                    Ok::<_, anyhow::Error>((address, pool_type, pool))
+        let results: Vec<Result<(Address, PoolType, Box<dyn PoolInterface>), anyhow::Error>> =
+            if config.parallel_fetch {
+                let futures: Vec<_> = chunk
+                    .iter()
+                    .map(|&address| {
+                        let provider = provider.clone();
+                        async move {
+                            let pool_type = identify_pool_type(&provider, address).await?;
+                            let pool = fetch_pool(
+                                &provider,
+                                address,
+                                BlockId::Number(block_number),
+                                pool_type,
+                                token_info,
+                                config,
+                            )
+                            .await?;
+                            Ok::<_, anyhow::Error>((address, pool_type, pool))
+                        }
+                    })
+                    .collect();
+                join_all(futures).await
+            } else {
+                let mut seq_results = Vec::with_capacity(chunk.len());
+                for &address in chunk {
+                    let result = async {
+                        let pool_type = identify_pool_type(provider, address).await?;
+                        let pool = fetch_pool(
+                            provider,
+                            address,
+                            BlockId::Number(block_number),
+                            pool_type,
+                            token_info,
+                            config,
+                        )
+                        .await?;
+                        Ok::<_, anyhow::Error>((address, pool_type, pool))
+                    }
+                    .await;
+                    seq_results.push(result);
                 }
-            })
-            .collect();
-
-        let results = join_all(futures).await;
+                seq_results
+            };
 
         let mut failed_pools: Vec<Address> = Vec::new();
 

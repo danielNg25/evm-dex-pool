@@ -4,6 +4,7 @@ use anyhow::Result;
 use log::{debug, error, info};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 use super::block_source::{
     BlockSource, EventBatch, LatestBlockSource, PendingBlockSource, ProcessingMode,
@@ -29,9 +30,11 @@ pub struct UnifiedPoolUpdater {
     event_processor: EventProcessor,
     pool_registry: Arc<PoolRegistry>,
     chain_id: u64,
+    cancel_rx: oneshot::Receiver<()>,
 }
 
 impl UnifiedPoolUpdater {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<P: Provider + Send + Sync + 'static>(
         provider: Arc<P>,
         pool_registry: Arc<PoolRegistry>,
@@ -40,6 +43,7 @@ impl UnifiedPoolUpdater {
         start_block: u64,
         max_blocks_per_batch: u64,
         mode: UpdaterMode,
+        cancel_rx: oneshot::Receiver<()>,
     ) -> Self {
         let chain_id = pool_registry.get_network_id();
 
@@ -94,6 +98,7 @@ impl UnifiedPoolUpdater {
             event_processor,
             pool_registry,
             chain_id,
+            cancel_rx,
         }
     }
 
@@ -106,9 +111,16 @@ impl UnifiedPoolUpdater {
 
         loop {
             debug!("[Chain {}] UnifiedPoolUpdater: calling next_batch...", chain_id);
-            let batch = self.source.next_batch().await;
+            let batch_result = tokio::select! {
+                biased;
+                _ = &mut self.cancel_rx => {
+                    info!("[Chain {}] Collector received stop signal, shutting down", chain_id);
+                    return Ok(());
+                }
+                result = self.source.next_batch() => result,
+            };
 
-            match batch {
+            match batch_result {
                 Ok(EventBatch {
                     events,
                     processing_mode,

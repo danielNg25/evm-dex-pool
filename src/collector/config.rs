@@ -31,4 +31,7 @@ pub struct PoolFetchConfig {
     pub wait_time_between_chunks: u64,
     /// Max retry attempts per pool with exponential backoff (default: 5).
     pub max_retries: u32,
+    /// Whether to fetch pools within each chunk in parallel (default: true).
+    /// Set to false for rate-limited RPCs to fetch pools sequentially.
+    pub parallel_fetch: bool,
 }
