@@ -1,7 +1,7 @@
 use super::event_queue::EventSender;
 use crate::Topic;
 use alloy::primitives::Address;
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
 use anyhow::{Context, Result};
 use futures_util::stream::StreamExt;
@@ -43,7 +43,10 @@ impl WebsocketListener {
     /// Starts the WebSocket listener in a background task
     pub async fn start(&self) -> Result<()> {
         *self.is_running.write().await = true;
-        info!("[Chain {}] Starting WebSocket listener for {}", self.chain_id, self.ws_url);
+        info!(
+            "[Chain {}] Starting WebSocket listener for {}",
+            self.chain_id, self.ws_url
+        );
 
         let ws_url = self.ws_url.clone();
         let pool_addresses = self.pool_addresses.clone();
@@ -66,15 +69,24 @@ impl WebsocketListener {
                 .await
                 {
                     Ok(_) => {
-                        info!("[Chain {}] WebSocket connection closed for {}", chain_id, ws_url);
+                        info!(
+                            "[Chain {}] WebSocket connection closed for {}",
+                            chain_id, ws_url
+                        );
                     }
                     Err(e) => {
-                        error!("[Chain {}] WebSocket connection error for {}: {}", chain_id, ws_url, e);
+                        error!(
+                            "[Chain {}] WebSocket connection error for {}: {:#}",
+                            chain_id, ws_url, e
+                        );
                     }
                 }
 
                 sleep(Duration::from_secs(2)).await;
-                info!("[Chain {}] Attempting to reconnect to WebSocket at {}", chain_id, ws_url);
+                info!(
+                    "[Chain {}] Attempting to reconnect to WebSocket at {}",
+                    chain_id, ws_url
+                );
             }
         });
 
@@ -84,7 +96,10 @@ impl WebsocketListener {
     /// Stops the WebSocket listener
     pub async fn stop(&self) -> Result<()> {
         *self.is_running.write().await = false;
-        info!("[Chain {}] Stopping WebSocket listener for {}", self.chain_id, self.ws_url);
+        info!(
+            "[Chain {}] Stopping WebSocket listener for {}",
+            self.chain_id, self.ws_url
+        );
         Ok(())
     }
 
@@ -97,9 +112,9 @@ impl WebsocketListener {
         topics: Vec<Topic>,
         chain_id: u64,
     ) -> Result<()> {
-        // Connect to the WebSocket
+        // Connect to the WebSocket using WsConnect (supports wss:// URLs)
         let ws_provider = ProviderBuilder::new()
-            .connect(ws_url)
+            .connect_ws(WsConnect::new(ws_url))
             .await
             .context("Failed to connect to WebSocket")?;
 
@@ -149,11 +164,17 @@ impl WebsocketListener {
                 match provider_clone.get_block_number().await {
                     Ok(_) => {
                         ping_failures = 0;
-                        debug!("[Chain {}] Sent heartbeat ping for {}", chain_id, ws_url_clone);
+                        debug!(
+                            "[Chain {}] Sent heartbeat ping for {}",
+                            chain_id, ws_url_clone
+                        );
                     }
                     Err(e) => {
                         ping_failures += 1;
-                        error!("[Chain {}] Ping failed for {}: {}", chain_id, ws_url_clone, e);
+                        error!(
+                            "[Chain {}] Ping failed for {}: {}",
+                            chain_id, ws_url_clone, e
+                        );
                         if ping_failures >= MAX_PING_FAILURES {
                             warn!(
                                 "[Chain {}] Max ping failures ({}) reached for {}; forcing reconnect",
@@ -190,7 +211,10 @@ impl WebsocketListener {
 
         // Stop pinging task
         *is_running.write().await = false;
-        info!("[Chain {}] WebSocket subscription ended for {}", chain_id, ws_url);
+        info!(
+            "[Chain {}] WebSocket subscription ended for {}",
+            chain_id, ws_url
+        );
         Ok(())
     }
 }

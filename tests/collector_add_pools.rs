@@ -399,8 +399,8 @@ async fn test_add_pools_ws() -> Result<()> {
     )
     .await?;
 
-    println!("[ws] WS collector running — sleeping 60 s …");
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    println!("[ws] WS collector running — sleeping 100 s …");
+    tokio::time::sleep(Duration::from_secs(100)).await;
 
     // ── Dynamically add new pools ──────────────────────────────────────────
     println!("[ws] adding {} new pool(s) …", new_addrs.len());
@@ -430,9 +430,9 @@ async fn test_add_pools_ws() -> Result<()> {
         catchup_block,
     )
     .await;
-    println!("[ws] new-pool exact verification passed — sleeping 60 s …");
+    println!("[ws] new-pool exact verification passed — sleeping 100 s …");
 
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    tokio::time::sleep(Duration::from_secs(100)).await;
 
     // ── Stop and sanity-check ──────────────────────────────────────────────
     handle.stop().await;
