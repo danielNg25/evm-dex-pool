@@ -15,6 +15,11 @@ cargo test                                     # Default feature tests
 cargo test --features collector                # All tests including collector module
 cargo test test_name                           # Run a specific test by name
 cargo fmt && cargo clippy                      # Format and lint
+
+# Integration tests (ignored by default, hit live Ethereum mainnet RPC)
+cargo test --features collector -- --ignored --nocapture
+cargo test --features collector test_add_pools_http -- --ignored --nocapture  # HTTP mode only
+cargo test --features collector test_add_pools_ws -- --ignored --nocapture    # WebSocket mode only
 ```
 
 ## Feature Flags
@@ -26,7 +31,7 @@ Feature selection is critical — large portions of the codebase are gated:
 | _(none)_ | Pool types (`UniswapV2Pool`, `UniswapV3Pool`, ERC4626), traits, math |
 | `rpc` | `fetch_v2_pool`, `fetch_v3_pool`, alloy provider/contract bindings, `TokenInfo` trait, `create_fallback_provider` |
 | `registry` | `PoolRegistry` (DashMap-backed, thread-safe pool storage) |
-| `collector` | Full event collection system: `start_collector`, `UnifiedPoolUpdater`, `WebsocketListener`, `EventProcessor`, `fetch_pools_into_registry` (implies `rpc` + `registry`) |
+| `collector` | Full event collection system: `start_collector`, `UnifiedPoolUpdater`, `WebsocketListener`, `EventProcessor`, `fetch_pools_into_registry`. **Implies `rpc` + `registry`** — enabling `collector` alone is sufficient for full builds. |
 
 ## Architecture
 
@@ -43,7 +48,7 @@ All pool types implement `PoolInterface`, which requires:
 ### Pool Implementations
 
 - **`src/v2/`** — `UniswapV2Pool` with `V2PoolType` (UniswapV2 or Stable). Fee stored in 1_000_000 basis. `src/v2/factories.rs` has chain-specific factory address → fee mappings for 80+ networks.
-- **`src/v3/`** — `UniswapV3Pool` with full tick-based concentrated liquidity math (bit_math, full_math, sqrt_price_math, swap_math, tick_math — Rust ports of Uniswap V3 Solidity contracts).
+- **`src/v3/`** — `UniswapV3Pool` with full tick-based concentrated liquidity math (bit_math, full_math, sqrt_price_math, swap_math, tick_math — Rust ports of Uniswap V3 Solidity contracts). `V3PoolType` has 6 variants: `UniswapV3`, `PancakeV3`, `AlgebraV3`, `RamsesV2`, `AlgebraTwoSideFee`, `AlgebraPoolFeeInState`.
 - **`src/erc4626/`** — `ERC4626Standard` and `VerioIP` variants. `ERC4626Pool` enum selects the variant.
 
 ### Registry (`src/registry.rs`, feature `registry`)
@@ -56,7 +61,7 @@ All pool types implement `PoolInterface`, which requires:
 
 ### Collector System (`src/collector/`, feature `collector`)
 
-Entry point: `start_collector(provider, config, pool_registry, metrics, swap_event_tx)` — spawns the appropriate updater based on `CollectorConfig`.
+Entry point: `start_collector(provider, config, pool_registry, metrics, swap_event_tx)` — spawns the appropriate updater based on `CollectorConfig`. Returns `CollectorHandle` which provides `stop()` for graceful shutdown and `add_pools(addresses, fetch_config, token_info)` for dynamically adding pools while the collector is running.
 
 **Three updater modes** (all implemented via `UnifiedPoolUpdater` + a `BlockSource` trait):
 - `PendingBlock` — polls pending block logs via RPC
@@ -74,9 +79,13 @@ BlockSource (RPC/WS logs)
 
 **Pool fetching:** `fetch_pools_into_registry` fetches a list of addresses in parallel chunks with exponential backoff retry. It calls `identify_pool_type` (tries `liquidity()` RPC call — success = V3, failure = V2) then the appropriate typed fetcher. Panics after `max_retries` exhausted.
 
+### TokenInfo Trait (`src/token_info.rs`, feature `rpc`)
+
+All pool fetchers require a `&impl TokenInfo` to resolve token addresses to `(address, decimals)`. Callers must implement this trait with caching — it's called per-token during fetch. See `tests/collector_add_pools.rs` for a minimal `SimpleTokenCache` implementation.
+
 ### RPC Contracts (`src/contracts.rs`, `src/contracts_rpc.rs`)
 
-ABI bindings are generated via `alloy::sol!` macro from JSON files in `contracts/ABI/`. `contracts.rs` has bindings used in pure pool math (sync/event parsing). `contracts_rpc.rs` has bindings requiring the `rpc` feature (provider-based calls).
+ABI bindings are generated via `alloy::sol!` macro from JSON files in `contracts/ABI/`. `contracts.rs` has bindings used in pure pool math (sync/event parsing). `contracts_rpc.rs` has bindings requiring the `rpc` feature (provider-based calls). To add a new pool type: add the ABI JSON to `contracts/ABI/`, add a `sol!` declaration in the appropriate contracts file, then implement `PoolInterface` for the new type.
 
 ### Key Config Structs
 

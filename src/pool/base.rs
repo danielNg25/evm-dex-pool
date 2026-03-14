@@ -1,10 +1,8 @@
-use crate::contracts::{
-    IAlgebraFactory, IUniswapV2Factory, IUniswapV3Factory, IVeloPoolFactory,
-};
+use crate::contracts::{IAlgebraFactory, IUniswapV2Factory, IUniswapV3Factory, IVeloPoolFactory};
 use crate::erc4626::ERC4626Pool;
+use crate::erc4626::VerioIP;
 use crate::v2::UniswapV2Pool;
 use crate::v3::UniswapV3Pool;
-use crate::erc4626::VerioIP;
 use alloy::sol_types::SolEvent;
 use alloy::{
     primitives::{Address, FixedBytes, U256},

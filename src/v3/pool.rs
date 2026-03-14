@@ -1,7 +1,7 @@
 use crate::contracts::{IAlgebraPoolSei, IPancakeV3Pool, IUniswapV3Pool};
 use crate::pool::base::{EventApplicable, PoolInterface, PoolType, PoolTypeTrait, TopicList};
-use alloy::primitives::{aliases::U24, Address, Signed, U160, U256};
 use alloy::primitives::FixedBytes;
+use alloy::primitives::{aliases::U24, Address, Signed, U160, U256};
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{anyhow, Result};
@@ -259,12 +259,7 @@ impl UniswapV3Pool {
     }
 
     /// Helper for applying burn events (R6 refactoring: dedup V3 burn handling)
-    fn apply_burn_event(
-        &mut self,
-        tick_lower: i32,
-        tick_upper: i32,
-        amount: u128,
-    ) -> Result<()> {
+    fn apply_burn_event(&mut self, tick_lower: i32, tick_upper: i32, amount: u128) -> Result<()> {
         if tick_lower >= tick_upper {
             return Err(anyhow!(
                 "Invalid tick range: tick_lower {} >= tick_upper {}",

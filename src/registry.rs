@@ -1,6 +1,6 @@
+use crate::{PoolInterface, PoolType, Topic};
 use alloy::primitives::Address;
 use dashmap::DashMap;
-use crate::{PoolInterface, PoolType, Topic};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -14,7 +14,8 @@ use std::sync::{Arc, RwLock};
 /// - R4: Plain `RwLock` for topics (set once, then read-only)
 /// - R5: Convenience methods delegate to `get_pools_by_type`
 pub struct PoolRegistry {
-    by_address: Arc<DashMap<Address, Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>>>,
+    by_address:
+        Arc<DashMap<Address, Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>>>,
     last_processed_block: AtomicU64,
     topics: RwLock<Vec<Topic>>,
     profitable_topics: RwLock<HashSet<Topic>>,
@@ -50,7 +51,8 @@ impl PoolRegistry {
     /// Add a pool to the registry
     pub fn add_pool(&self, pool: Box<dyn PoolInterface + Send + Sync>) {
         let address = pool.address();
-        self.by_address.insert(address, Arc::new(tokio::sync::RwLock::new(pool)));
+        self.by_address
+            .insert(address, Arc::new(tokio::sync::RwLock::new(pool)));
     }
 
     /// Get a pool by address (lock-free read)
@@ -58,7 +60,9 @@ impl PoolRegistry {
         &self,
         address: &Address,
     ) -> Option<Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>> {
-        self.by_address.get(address).map(|entry| Arc::clone(entry.value()))
+        self.by_address
+            .get(address)
+            .map(|entry| Arc::clone(entry.value()))
     }
 
     /// Remove a pool by address
@@ -70,7 +74,9 @@ impl PoolRegistry {
     }
 
     /// Get all pools
-    pub fn get_all_pools(&self) -> Vec<Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>> {
+    pub fn get_all_pools(
+        &self,
+    ) -> Vec<Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>> {
         self.by_address
             .iter()
             .map(|entry| Arc::clone(entry.value()))
@@ -85,19 +91,27 @@ impl PoolRegistry {
         self.by_address
             .iter()
             .filter(|entry| {
-                entry.value().try_read().map(|p| p.pool_type() == pool_type).unwrap_or(false)
+                entry
+                    .value()
+                    .try_read()
+                    .map(|p| p.pool_type() == pool_type)
+                    .unwrap_or(false)
             })
             .map(|entry| Arc::clone(entry.value()))
             .collect()
     }
 
     /// Get V2 pools (R5: delegates to get_pools_by_type)
-    pub fn get_v2_pools(&self) -> Vec<Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>> {
+    pub fn get_v2_pools(
+        &self,
+    ) -> Vec<Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>> {
         self.get_pools_by_type(PoolType::UniswapV2)
     }
 
     /// Get V3 pools (R5: delegates to get_pools_by_type)
-    pub fn get_v3_pools(&self) -> Vec<Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>> {
+    pub fn get_v3_pools(
+        &self,
+    ) -> Vec<Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>> {
         self.get_pools_by_type(PoolType::UniswapV3)
     }
 
@@ -106,7 +120,11 @@ impl PoolRegistry {
         self.by_address
             .iter()
             .filter(|entry| {
-                entry.value().try_read().map(|p| p.pool_type() == pool_type).unwrap_or(false)
+                entry
+                    .value()
+                    .try_read()
+                    .map(|p| p.pool_type() == pool_type)
+                    .unwrap_or(false)
             })
             .map(|entry| *entry.key())
             .collect()
@@ -147,7 +165,8 @@ impl PoolRegistry {
 
     /// Set the last processed block (R3: lock-free atomic)
     pub fn set_last_processed_block(&self, block_number: u64) {
-        self.last_processed_block.store(block_number, Ordering::Relaxed);
+        self.last_processed_block
+            .store(block_number, Ordering::Relaxed);
     }
 
     /// Add topics to the registry

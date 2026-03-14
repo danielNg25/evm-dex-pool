@@ -117,10 +117,41 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         }
 
         if self.collector_config.use_websocket {
-            self.add_pools_ws(&addresses, fetch_config, token_info).await
+            self.add_pools_ws(&addresses, fetch_config, token_info)
+                .await
         } else {
-            self.add_pools_http(&addresses, fetch_config, token_info).await
+            self.add_pools_http(&addresses, fetch_config, token_info)
+                .await
         }
+    }
+
+    /// Remove pool addresses from the registry.
+    ///
+    /// The collector continues running — events for removed pools are
+    /// silently skipped by the `EventProcessor`. In RPC modes the
+    /// address filter narrows on the next batch; in WebSocket mode the
+    /// subscription remains unchanged (events arrive but are ignored).
+    ///
+    /// Returns the number of pools actually removed (addresses not in
+    /// the registry are silently skipped).
+    pub fn remove_pools(&self, addresses: &[Address]) -> usize {
+        let chain_id = self.pool_registry.get_network_id();
+        let mut removed = 0usize;
+        for addr in addresses {
+            if self.pool_registry.remove_pool(addr).is_some() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            info!(
+                "[Chain {}] remove_pools: removed {} of {} requested pools ({} remaining)",
+                chain_id,
+                removed,
+                addresses.len(),
+                self.pool_registry.pool_count(),
+            );
+        }
+        removed
     }
 
     // -------------------------------------------------------------------------
@@ -256,8 +287,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         //    start first so no events are missed between fetch and subscription.
         let all_current_addresses = self.pool_registry.get_all_addresses();
         let all_addresses: Vec<Address> = {
-            let mut set: HashSet<Address> =
-                all_current_addresses.iter().copied().collect();
+            let mut set: HashSet<Address> = all_current_addresses.iter().copied().collect();
             set.extend(addresses.iter().copied());
             set.into_iter().collect()
         };
@@ -405,8 +435,15 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                     let provider = Arc::clone(provider);
                     async move {
                         let pool_type = identify_pool_type(&provider, address).await?;
-                        fetch_pool(&provider, address, block_number, pool_type, token_info, config)
-                            .await
+                        fetch_pool(
+                            &provider,
+                            address,
+                            block_number,
+                            pool_type,
+                            token_info,
+                            config,
+                        )
+                        .await
                     }
                 })
                 .collect();
@@ -416,8 +453,15 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
             for &address in chunk {
                 let pool_type = identify_pool_type(provider, address).await?;
                 seq.push(
-                    fetch_pool(provider, address, block_number, pool_type, token_info, config)
-                        .await,
+                    fetch_pool(
+                        provider,
+                        address,
+                        block_number,
+                        pool_type,
+                        token_info,
+                        config,
+                    )
+                    .await,
                 );
             }
             seq
@@ -449,7 +493,15 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                 tokio::time::sleep(delay).await;
                 match async {
                     let pool_type = identify_pool_type(provider, address).await?;
-                    fetch_pool(provider, address, block_number, pool_type, token_info, config).await
+                    fetch_pool(
+                        provider,
+                        address,
+                        block_number,
+                        pool_type,
+                        token_info,
+                        config,
+                    )
+                    .await
                 }
                 .await
                 {

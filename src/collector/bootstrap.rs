@@ -29,7 +29,10 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
     let (cancel_tx, cancel_rx) = oneshot::channel();
 
     if config.use_websocket {
-        info!("[Chain {}] Starting collector with websocket mode", chain_id);
+        info!(
+            "[Chain {}] Starting collector with websocket mode",
+            chain_id
+        );
         let event_queue = EventQueue::new(1000, 1000, chain_id);
         let event_sender = event_queue.get_sender();
 
@@ -80,7 +83,10 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             config,
         ))
     } else if config.use_pending_blocks {
-        info!("[Chain {}] Starting collector with pending block mode", chain_id);
+        info!(
+            "[Chain {}] Starting collector with pending block mode",
+            chain_id
+        );
         let mut updater = UnifiedPoolUpdater::new(
             Arc::clone(&provider),
             Arc::clone(&pool_registry),
@@ -110,7 +116,10 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             config,
         ))
     } else {
-        info!("[Chain {}] Starting collector with latest block mode", chain_id);
+        info!(
+            "[Chain {}] Starting collector with latest block mode",
+            chain_id
+        );
         let mut updater = UnifiedPoolUpdater::new(
             Arc::clone(&provider),
             Arc::clone(&pool_registry),

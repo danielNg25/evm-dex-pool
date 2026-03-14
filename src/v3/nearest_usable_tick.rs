@@ -1,5 +1,5 @@
-use alloy::primitives::aliases::I24;
 use crate::v3::tick_math::{MAX_TICK, MIN_TICK};
+use alloy::primitives::aliases::I24;
 
 /// Returns the closest tick that is nearest a given tick and usable for the given tick spacing
 ///
@@ -27,7 +27,8 @@ pub fn nearest_usable_tick(tick: I24, tick_spacing: I24) -> I24 {
     };
     let floor_remainder = tick_i32 - floored_quotient * spacing_i32;
 
-    let rounded = (floored_quotient + (floor_remainder + spacing_i32 / 2) / spacing_i32) * spacing_i32;
+    let rounded =
+        (floored_quotient + (floor_remainder + spacing_i32 / 2) / spacing_i32) * spacing_i32;
 
     let min_tick_i32 = MIN_TICK.as_i32();
     let max_tick_i32 = MAX_TICK.as_i32();

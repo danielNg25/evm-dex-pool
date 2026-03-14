@@ -188,7 +188,6 @@ pub fn v3_swap(
     while !state.amount_specified_remaining.is_zero()
         && state.sqrt_price_x96 != sqrt_price_limit_x96
     {
-
         let mut step = StepComputations {
             sqrt_price_start_x96: state.sqrt_price_x96,
             ..Default::default()
@@ -234,7 +233,8 @@ pub fn v3_swap(
         if step.amount_in.is_zero() && step.amount_out.is_zero() && step.fee_amount.is_zero() {
             return Err(anyhow!(
                 "v3_swap: no progress (zero amounts, liquidity={}, tick={})",
-                state.liquidity, state.tick_current
+                state.liquidity,
+                state.tick_current
             ));
         }
 

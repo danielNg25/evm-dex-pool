@@ -1,8 +1,8 @@
+pub(crate) mod contracts;
+pub mod erc4626;
 pub mod pool;
 pub mod v2;
 pub mod v3;
-pub mod erc4626;
-pub(crate) mod contracts;
 
 #[cfg(feature = "rpc")]
 pub(crate) mod contracts_rpc;
@@ -16,14 +16,16 @@ pub mod utils;
 pub use utils::create_fallback_provider;
 
 // Core traits and types
-pub use pool::{EventApplicable, PoolInterface, PoolType, PoolTypeTrait, TopicList, Topic, POOL_CREATED_TOPICS};
 pub use pool::MockPool;
+pub use pool::{
+    EventApplicable, PoolInterface, PoolType, PoolTypeTrait, Topic, TopicList, POOL_CREATED_TOPICS,
+};
 
 // V2
 pub use v2::{UniswapV2Pool, V2PoolType};
 
 // V3
-pub use v3::{UniswapV3Pool, V3PoolType, Tick, TickMap};
+pub use v3::{Tick, TickMap, UniswapV3Pool, V3PoolType};
 
 // ERC4626
 pub use erc4626::{ERC4626Pool, ERC4626Standard, VerioIP};

@@ -7,9 +7,7 @@ use tower::ServiceBuilder;
 use url::Url;
 
 /// Create an RPC provider with fallback layer across multiple RPC URLs.
-pub fn create_fallback_provider(
-    rpc_urls: &[String],
-) -> impl Provider + Clone + 'static {
+pub fn create_fallback_provider(rpc_urls: &[String]) -> impl Provider + Clone + 'static {
     let rpc_len = rpc_urls.len();
     let fallback_layer =
         FallbackLayer::default().with_active_transport_count(NonZeroUsize::new(rpc_len).unwrap());

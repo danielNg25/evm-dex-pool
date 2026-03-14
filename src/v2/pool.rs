@@ -122,9 +122,7 @@ impl UniswapV2Pool {
                 }
                 Ok(output)
             }
-            V2PoolType::Stable => {
-                self.calculate_stable_output(amount_in, true)
-            }
+            V2PoolType::Stable => self.calculate_stable_output(amount_in, true),
         }
     }
 
@@ -150,9 +148,7 @@ impl UniswapV2Pool {
                 }
                 Ok(output)
             }
-            V2PoolType::Stable => {
-                self.calculate_stable_output(amount_in, false)
-            }
+            V2PoolType::Stable => self.calculate_stable_output(amount_in, false),
         }
     }
 

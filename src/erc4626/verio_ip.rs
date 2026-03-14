@@ -1,6 +1,6 @@
 use crate::contracts::IERC4626;
-use crate::pool::base::{EventApplicable, PoolInterface, PoolType, PoolTypeTrait, TopicList};
 use crate::erc4626::{ERC4626Pool, ERC4626Standard};
+use crate::pool::base::{EventApplicable, PoolInterface, PoolType, PoolTypeTrait, TopicList};
 use alloy::sol_types::SolEvent;
 use alloy::{
     primitives::{Address, FixedBytes, U256},

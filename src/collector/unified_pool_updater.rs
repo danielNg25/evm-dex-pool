@@ -51,7 +51,10 @@ impl UnifiedPoolUpdater {
         let current_block = pool_registry.get_last_processed_block();
         if current_block == 0 {
             pool_registry.set_last_processed_block(start_block);
-            info!("[Chain {}] Initialized last processed block to {}", chain_id, start_block);
+            info!(
+                "[Chain {}] Initialized last processed block to {}",
+                chain_id, start_block
+            );
         } else if start_block > 0 && start_block > current_block {
             pool_registry.set_last_processed_block(start_block);
             info!(
@@ -105,12 +108,21 @@ impl UnifiedPoolUpdater {
     /// Run the updater loop. This never returns under normal operation.
     pub async fn start(&mut self) -> Result<()> {
         let chain_id = self.chain_id;
-        info!("[Chain {}] UnifiedPoolUpdater: starting bootstrap...", chain_id);
+        info!(
+            "[Chain {}] UnifiedPoolUpdater: starting bootstrap...",
+            chain_id
+        );
         self.source.bootstrap().await?;
-        info!("[Chain {}] UnifiedPoolUpdater: bootstrap complete, entering main loop", chain_id);
+        info!(
+            "[Chain {}] UnifiedPoolUpdater: bootstrap complete, entering main loop",
+            chain_id
+        );
 
         loop {
-            debug!("[Chain {}] UnifiedPoolUpdater: calling next_batch...", chain_id);
+            debug!(
+                "[Chain {}] UnifiedPoolUpdater: calling next_batch...",
+                chain_id
+            );
             let batch_result = tokio::select! {
                 biased;
                 result = &mut self.cancel_rx => {
@@ -137,7 +149,10 @@ impl UnifiedPoolUpdater {
 
                     match processing_mode {
                         ProcessingMode::ApplyOnly => {
-                            debug!("[Chain {}] UnifiedPoolUpdater: applying {} events (ApplyOnly)", chain_id, event_count);
+                            debug!(
+                                "[Chain {}] UnifiedPoolUpdater: applying {} events (ApplyOnly)",
+                                chain_id, event_count
+                            );
                             self.event_processor.apply_events_to_registry(&events).await;
                         }
                         ProcessingMode::ConfirmedWithSwaps => {
@@ -145,21 +160,28 @@ impl UnifiedPoolUpdater {
                                 "[Chain {}] UnifiedPoolUpdater: processing {} events (ConfirmedWithSwaps)",
                                 chain_id, event_count
                             );
-                            self.event_processor
-                                .process_confirmed_events(events)
-                                .await;
+                            self.event_processor.process_confirmed_events(events).await;
                         }
                         ProcessingMode::Pending => {
-                            debug!("[Chain {}] UnifiedPoolUpdater: processing {} events (Pending)", chain_id, event_count);
+                            debug!(
+                                "[Chain {}] UnifiedPoolUpdater: processing {} events (Pending)",
+                                chain_id, event_count
+                            );
                             self.event_processor.process_pending_events(events).await;
                         }
                     }
 
                     if let Some(block) = processed_through_block {
                         self.pool_registry.set_last_processed_block(block);
-                        info!("[Chain {}] Successfully processed through block {}", chain_id, block);
+                        info!(
+                            "[Chain {}] Successfully processed through block {}",
+                            chain_id, block
+                        );
                     }
-                    debug!("[Chain {}] UnifiedPoolUpdater: batch processing complete", chain_id);
+                    debug!(
+                        "[Chain {}] UnifiedPoolUpdater: batch processing complete",
+                        chain_id
+                    );
                 }
                 Err(e) => {
                     error!("[Chain {}] Error fetching event batch: {}", chain_id, e);

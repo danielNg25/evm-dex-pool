@@ -68,14 +68,9 @@ pub async fn fetch_pool<P: Provider + Send + Sync, T: TokenInfo>(
             Ok(Box::new(pool))
         }
         PoolType::ERC4626(pool_type) => {
-            let pool = fetch_erc4626_pool(
-                provider,
-                pool_type,
-                pool_address,
-                block_number,
-                token_info,
-            )
-            .await?;
+            let pool =
+                fetch_erc4626_pool(provider, pool_type, pool_address, block_number, token_info)
+                    .await?;
             Ok(pool)
         }
     }
@@ -105,13 +100,20 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
     let mut new_pool_addresses = Vec::new();
     for &address in pool_addresses {
         if pool_registry.get_pool(&address).is_some() {
-            debug!("[Chain {}] Pool {} already exists in registry, skipping", config.chain_id, address);
+            debug!(
+                "[Chain {}] Pool {} already exists in registry, skipping",
+                config.chain_id, address
+            );
         } else {
             new_pool_addresses.push(address);
         }
     }
 
-    let fetch_mode = if config.parallel_fetch { "parallel" } else { "sequential" };
+    let fetch_mode = if config.parallel_fetch {
+        "parallel"
+    } else {
+        "sequential"
+    };
     info!(
         "[Chain {}] Fetching {} new pools in {} chunks",
         config.chain_id,
@@ -182,13 +184,19 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
         for (i, result) in results.into_iter().enumerate() {
             match result {
                 Ok((address, pool_type, pool)) => {
-                    info!("[Chain {}] Fetched pool {} ({:?})", config.chain_id, address, pool_type);
+                    info!(
+                        "[Chain {}] Fetched pool {} ({:?})",
+                        config.chain_id, address, pool_type
+                    );
                     pool_registry.add_pool(pool);
                     pool_types_present.insert(pool_type);
                     fetched_addresses.push(address);
                 }
                 Err(e) => {
-                    error!("[Chain {}] Failed to fetch pool {}: {}", config.chain_id, chunk[i], e);
+                    error!(
+                        "[Chain {}] Failed to fetch pool {}: {}",
+                        config.chain_id, chunk[i], e
+                    );
                     failed_pools.push(chunk[i]);
                 }
             }
@@ -198,8 +206,7 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
         for &address in &failed_pools {
             let mut success = false;
             for attempt in 1..=config.max_retries {
-                let delay =
-                    tokio::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                let delay = tokio::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
                 info!(
                     "[Chain {}] Retrying pool {} (attempt {}/{}) after {:?}",
                     config.chain_id, address, attempt, config.max_retries, delay

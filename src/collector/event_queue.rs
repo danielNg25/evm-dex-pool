@@ -68,7 +68,11 @@ impl EventQueue {
             }
         }
 
-        debug!("[Chain {}] Retrieved {} events in batch", self.chain_id, events.len());
+        debug!(
+            "[Chain {}] Retrieved {} events in batch",
+            self.chain_id,
+            events.len()
+        );
         events
     }
 
@@ -173,7 +177,11 @@ impl EventSender {
     }
 }
 
-pub fn create_event_queue(buffer_size: usize, max_events: usize, chain_id: u64) -> (EventQueue, Arc<EventSender>) {
+pub fn create_event_queue(
+    buffer_size: usize,
+    max_events: usize,
+    chain_id: u64,
+) -> (EventQueue, Arc<EventSender>) {
     let queue = EventQueue::new(buffer_size, max_events, chain_id);
     let sender = queue.get_sender();
     (queue, sender)
