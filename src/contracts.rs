@@ -33,6 +33,12 @@ sol! {
     "contracts/ABI/IERC4626.json"
 }
 
+// LB event contracts (for EventApplicable + TopicList)
+sol! {
+    ILBPair,
+    "contracts/ABI/ILBPair.json"
+}
+
 // Factory event contracts (for POOL_CREATED_TOPICS)
 sol! {
     IUniswapV2Factory,

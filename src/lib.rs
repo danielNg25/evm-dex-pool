@@ -1,5 +1,6 @@
 pub(crate) mod contracts;
 pub mod erc4626;
+pub mod lb;
 pub mod pool;
 pub mod v2;
 pub mod v3;
@@ -29,6 +30,9 @@ pub use v3::{Tick, TickMap, UniswapV3Pool, V3PoolType};
 
 // ERC4626
 pub use erc4626::{ERC4626Pool, ERC4626Standard, VerioIP};
+
+// LB (TraderJoe Liquidity Book)
+pub use lb::LBPool;
 
 // Registry (optional feature)
 #[cfg(feature = "registry")]

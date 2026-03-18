@@ -89,6 +89,13 @@ sol! {
     "contracts/ABI/IQuoter.json"
 }
 
+// LB pool contracts (for fetching)
+sol! {
+    #[sol(rpc)]
+    RpcILBPair,
+    "contracts/ABI/ILBPair.json"
+}
+
 // ERC4626 contracts (for fetching)
 sol! {
     #[sol(rpc)]

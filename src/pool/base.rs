@@ -1,6 +1,7 @@
 use crate::contracts::{IAlgebraFactory, IUniswapV2Factory, IUniswapV3Factory, IVeloPoolFactory};
 use crate::erc4626::ERC4626Pool;
 use crate::erc4626::VerioIP;
+use crate::lb::LBPool;
 use crate::v2::UniswapV2Pool;
 use crate::v3::UniswapV3Pool;
 use alloy::sol_types::SolEvent;
@@ -88,6 +89,8 @@ pub enum PoolType {
     UniswapV3,
     /// ERC4626-compatible pool
     ERC4626(ERC4626Pool),
+    /// TraderJoe Liquidity Book pool (bin-based AMM)
+    TraderJoeLB,
 }
 
 impl Default for PoolType {
@@ -102,6 +105,7 @@ impl PoolType {
             Self::UniswapV2 => UniswapV2Pool::topics(),
             Self::UniswapV3 => UniswapV3Pool::topics(),
             Self::ERC4626(ERC4626Pool::VerioIP) => VerioIP::topics(),
+            Self::TraderJoeLB => LBPool::topics(),
         }
     }
 
@@ -110,6 +114,7 @@ impl PoolType {
             Self::UniswapV2 => UniswapV2Pool::profitable_topics(),
             Self::UniswapV3 => UniswapV3Pool::profitable_topics(),
             Self::ERC4626(ERC4626Pool::VerioIP) => VerioIP::profitable_topics(),
+            Self::TraderJoeLB => LBPool::profitable_topics(),
         }
     }
 }

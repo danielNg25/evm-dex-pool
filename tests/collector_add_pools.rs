@@ -112,6 +112,7 @@ fn build_fetch_config() -> PoolFetchConfig {
         wait_time_between_chunks: 200,
         max_retries: 3,
         parallel_fetch: true,
+        lb_bin_depth: None,
     }
 }
 

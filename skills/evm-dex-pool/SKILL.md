@@ -1,6 +1,6 @@
 ---
 name: evm-dex-pool
-description: Guide for using the evm-dex-pool Rust library — EVM DEX pool types (UniswapV2, UniswapV3, ERC4626), PoolRegistry, and the collector system (start_collector, CollectorHandle, add_pools, fetch_pools_into_registry). Use this skill whenever the user asks how to use evm-dex-pool, how to start a collector, how to add pools dynamically, how to configure CollectorConfig or PoolFetchConfig, how to implement TokenInfo, or when they encounter bugs or unexpected behavior in evm-dex-pool (collector stopping, channel errors, stale block numbers, WebSocket failures, etc.).
+description: Guide for using the evm-dex-pool Rust library — EVM DEX pool types (UniswapV2, UniswapV3, ERC4626), PoolRegistry, and the collector system (start_collector, CollectorHandle, add_pools, remove_pools, fetch_pools_into_registry). Use this skill whenever the user asks how to use evm-dex-pool, how to start a collector, how to add or remove pools dynamically, how to configure CollectorConfig or PoolFetchConfig, how to implement TokenInfo, or when they encounter bugs or unexpected behavior in evm-dex-pool (collector stopping, channel errors, stale block numbers, WebSocket failures, etc.).
 ---
 
 # evm-dex-pool Usage Guide
@@ -178,7 +178,7 @@ handle.stop().await;
 
 ## CollectorHandle API
 
-These are two independent operations — do NOT call `stop()` before `add_pools()`:
+Three independent operations — do NOT call `stop()` before `add_pools()` or `remove_pools()`:
 
 ```rust
 // permanently stop the collector when you're done
@@ -187,12 +187,23 @@ handle.stop().await;
 // add new pools while the collector keeps running
 // add_pools internally stops → updates → restarts the collector
 handle.add_pools(new_addresses, &fetch_config, &token_info).await?;
+
+// remove pools without stopping the collector
+// returns number of pools actually removed
+let removed = handle.remove_pools(&addresses_to_remove);
 ```
 
 `add_pools` handles everything internally — no need to stop first:
 
 - **HTTP/LatestBlock mode:** fetches new pools in memory (collector still running), then stops, catchup to final block, restarts
 - **WS mode:** stops old WS listeners, stops updater, starts new WS listeners (to buffer events during fetch), fetches, registers, restarts from stable block
+
+`remove_pools` is lightweight — it only removes pools from the registry. The collector keeps running:
+
+- Events for removed pools are silently skipped by `EventProcessor` (it checks `registry.get_pool()` and continues on `None`)
+- In RPC modes, `get_all_addresses()` is called each batch, so removed pools drop out of filters on the next iteration
+- In WS mode, the subscription is static — events still arrive but are skipped. Slight bandwidth overhead, but avoids tearing down/rebuilding WS listeners
+- Re-adding pools later via `add_pools` works normally — it fetches fresh state and catches up to the current block
 
 ---
 
@@ -281,7 +292,7 @@ Calls `liquidity()` RPC — success = V3, failure = V2. Can misidentify exotic p
 | File                                    | Purpose                                                           |
 | --------------------------------------- | ----------------------------------------------------------------- |
 | `src/collector/bootstrap.rs`            | `start_collector` entry point                                     |
-| `src/collector/handle.rs`               | `CollectorHandle`, `add_pools_http`, `add_pools_ws`               |
+| `src/collector/handle.rs`               | `CollectorHandle`, `add_pools_http`, `add_pools_ws`, `remove_pools` |
 | `src/collector/config.rs`               | `CollectorConfig`, `PoolFetchConfig` structs                      |
 | `src/collector/block_source.rs`         | `LatestBlockSource`, `PendingBlockSource`, `WebsocketBlockSource` |
 | `src/collector/unified_pool_updater.rs` | Main event loop, cancel signal handling                           |

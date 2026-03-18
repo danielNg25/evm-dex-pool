@@ -1,5 +1,7 @@
+use crate::contracts_rpc::RpcILBPair;
 use crate::contracts_rpc::RpcIUniswapV3Pool as IUniswapV3Pool;
 use crate::erc4626::fetch_erc4626_pool;
+use crate::lb::fetch_lb_pool;
 use crate::pool::base::PoolInterface;
 use crate::v2::fetch_v2_pool;
 use crate::v3::fetch_v3_pool;
@@ -16,15 +18,24 @@ use std::sync::Arc;
 use super::config::PoolFetchConfig;
 use super::multicall::resolve_multicall_address;
 
-/// Detect whether a pool is V2 or V3 by calling `liquidity()` (V3-specific).
+/// Detect pool type by calling type-specific view functions.
+///
+/// Order: LB (`getBinStep`) → V3 (`liquidity`) → V2 (fallback).
 pub async fn identify_pool_type<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     pool_address: Address,
 ) -> Result<PoolType> {
-    let pair_instance = IUniswapV3Pool::new(pool_address, provider);
-    let fee_call = pair_instance.liquidity().into_transaction_request();
+    // Try LB first: getBinStep() is unique to Liquidity Book pools
+    let lb_instance = RpcILBPair::new(pool_address, provider);
+    let lb_call = lb_instance.getBinStep().into_transaction_request();
+    if provider.call(lb_call).await.is_ok() {
+        return Ok(PoolType::TraderJoeLB);
+    }
 
-    match provider.call(fee_call).await {
+    // Then V3: liquidity() is unique to V3 pools
+    let v3_instance = IUniswapV3Pool::new(pool_address, provider);
+    let v3_call = v3_instance.liquidity().into_transaction_request();
+    match provider.call(v3_call).await {
         Ok(_) => Ok(PoolType::UniswapV3),
         Err(_) => Ok(PoolType::UniswapV2),
     }
@@ -72,6 +83,19 @@ pub async fn fetch_pool<P: Provider + Send + Sync, T: TokenInfo>(
                 fetch_erc4626_pool(provider, pool_type, pool_address, block_number, token_info)
                     .await?;
             Ok(pool)
+        }
+        PoolType::TraderJoeLB => {
+            let pool = fetch_lb_pool(
+                provider,
+                pool_address,
+                block_number,
+                token_info,
+                multicall_address,
+                config.chain_id,
+                config.lb_bin_depth,
+            )
+            .await?;
+            Ok(Box::new(pool))
         }
     }
 }

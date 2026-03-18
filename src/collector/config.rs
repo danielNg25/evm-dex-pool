@@ -34,4 +34,8 @@ pub struct PoolFetchConfig {
     /// Whether to fetch pools within each chunk in parallel (default: true).
     /// Set to false for rate-limited RPCs to fetch pools sequentially.
     pub parallel_fetch: bool,
+    /// Fallback bin depth for LB pools if tree bitmap discovery fails (default: 100).
+    /// The fetcher first tries reading the on-chain tree bitmap to discover all non-empty bins.
+    /// If that fails, it falls back to a fixed window of ±`lb_bin_depth` around `active_id`.
+    pub lb_bin_depth: Option<u32>,
 }
