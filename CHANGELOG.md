@@ -2,6 +2,24 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.2.1]
+
+### Changed
+
+- **`PoolType` now implements `Display`** — replaced manual `impl ToString` with idiomatic
+  `impl Display`, enabling `format!("{}", pool_type)` and consistent string formatting.
+  `From<PoolType> for String` now delegates to `Display`.
+- **Removed `lb_bin_depth` from `PoolFetchConfig`** — the LB fetcher now always discovers all
+  bins (tree bitmap + `getNextNonEmptyBin` walk fallback), making the depth option unnecessary.
+
+### Improved
+
+- **Faster pool type identification** — `identify_pool_type` now accepts a `multicall_address`
+  parameter and uses the configured address instead of the default. New `identify_pool_types`
+  batch function identifies all pools in a chunk concurrently.
+- **LB bin discovery for v2.1 pools** — tree bitmap now tries both v2.2 (slot 7) and v2.1
+  (slot 8) storage layouts, with `getNextNonEmptyBin` sequential walk as final fallback.
+
 ## [1.2.0]
 
 ### Fixed

@@ -93,6 +93,23 @@ pub enum PoolType {
     TraderJoeLB,
 }
 
+impl std::fmt::Display for PoolType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PoolType::UniswapV2 => write!(f, "uniswap_v2"),
+            PoolType::UniswapV3 => write!(f, "uniswap_v3"),
+            PoolType::ERC4626(ERC4626Pool::VerioIP) => write!(f, "verio_ip"),
+            PoolType::TraderJoeLB => write!(f, "traderjoe_liquidity_book"),
+        }
+    }
+}
+
+impl From<PoolType> for String {
+    fn from(pool_type: PoolType) -> Self {
+        pool_type.to_string()
+    }
+}
+
 impl Default for PoolType {
     fn default() -> Self {
         PoolType::UniswapV2
