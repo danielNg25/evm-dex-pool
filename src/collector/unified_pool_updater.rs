@@ -174,8 +174,8 @@ impl UnifiedPoolUpdater {
                     if let Some(block) = processed_through_block {
                         self.pool_registry.set_last_processed_block(block);
                         info!(
-                            "[Chain {}] Successfully processed through block {}",
-                            chain_id, block
+                            "[Chain {}] Successfully processed through block {} with {} events",
+                            chain_id, block, event_count
                         );
                     }
                     debug!(

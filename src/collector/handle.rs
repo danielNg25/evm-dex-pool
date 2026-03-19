@@ -415,6 +415,8 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
     config: &PoolFetchConfig,
 ) -> Result<Vec<Box<dyn PoolInterface>>> {
     let chain_id = config.chain_id;
+    let multicall_address =
+        crate::collector::resolve_multicall_address(config.chain_id, config.multicall_address);
     let chunk_size = config.chunk_size.max(1);
     let chunk_count = addresses.len().div_ceil(chunk_size);
     let mut pools: Vec<Box<dyn PoolInterface>> = Vec::with_capacity(addresses.len());
@@ -434,7 +436,8 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                 .map(|&address| {
                     let provider = Arc::clone(provider);
                     async move {
-                        let pool_type = identify_pool_type(&provider, address).await?;
+                        let pool_type =
+                            identify_pool_type(&provider, address, multicall_address).await?;
                         fetch_pool(
                             &provider,
                             address,
@@ -451,7 +454,8 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
         } else {
             let mut seq = Vec::with_capacity(chunk.len());
             for &address in chunk {
-                let pool_type = identify_pool_type(provider, address).await?;
+                let pool_type =
+                    identify_pool_type(provider, address, multicall_address).await?;
                 seq.push(
                     fetch_pool(
                         provider,
@@ -492,7 +496,8 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                 );
                 tokio::time::sleep(delay).await;
                 match async {
-                    let pool_type = identify_pool_type(provider, address).await?;
+                    let pool_type =
+                        identify_pool_type(provider, address, multicall_address).await?;
                     fetch_pool(
                         provider,
                         address,

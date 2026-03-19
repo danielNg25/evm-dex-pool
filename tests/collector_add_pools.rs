@@ -145,7 +145,11 @@ async fn assert_pools_match_chain_at<P>(
             .unwrap_or_else(|| panic!("[verify] Pool {} not found in registry", addr));
         let pool = pool_arc.read().await;
 
-        let pool_type = identify_pool_type(provider, addr)
+        let multicall_addr = evm_dex_pool::collector::resolve_multicall_address(
+            fetch_config.chain_id,
+            fetch_config.multicall_address,
+        );
+        let pool_type = identify_pool_type(provider, addr, multicall_addr)
             .await
             .unwrap_or_else(|e| panic!("[verify] identify_pool_type failed for {addr}: {e}"));
 

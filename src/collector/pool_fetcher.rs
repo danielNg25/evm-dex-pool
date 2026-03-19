@@ -18,27 +18,63 @@ use std::sync::Arc;
 use super::config::PoolFetchConfig;
 use super::multicall::resolve_multicall_address;
 
-/// Detect pool type by calling type-specific view functions.
+/// Detect pool type by calling type-specific view functions in a single multicall.
 ///
-/// Order: LB (`getBinStep`) → V3 (`liquidity`) → V2 (fallback).
+/// Calls `getBinStep()` and `liquidity()` together via `try_aggregate(false)`:
+/// - `getBinStep` succeeds → LB
+/// - `liquidity` succeeds → V3
+/// - both fail → V2
 pub async fn identify_pool_type<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     pool_address: Address,
+    multicall_address: Address,
 ) -> Result<PoolType> {
-    // Try LB first: getBinStep() is unique to Liquidity Book pools
     let lb_instance = RpcILBPair::new(pool_address, provider);
-    let lb_call = lb_instance.getBinStep().into_transaction_request();
-    if provider.call(lb_call).await.is_ok() {
+    let v3_instance = IUniswapV3Pool::new(pool_address, provider);
+
+    let result = provider
+        .multicall()
+        .address(multicall_address)
+        .add(lb_instance.getBinStep())   // 0
+        .add(v3_instance.liquidity())    // 1
+        .try_aggregate(false)
+        .await?;
+
+    if result.0.is_ok() {
         return Ok(PoolType::TraderJoeLB);
     }
-
-    // Then V3: liquidity() is unique to V3 pools
-    let v3_instance = IUniswapV3Pool::new(pool_address, provider);
-    let v3_call = v3_instance.liquidity().into_transaction_request();
-    match provider.call(v3_call).await {
-        Ok(_) => Ok(PoolType::UniswapV3),
-        Err(_) => Ok(PoolType::UniswapV2),
+    if result.1.is_ok() {
+        return Ok(PoolType::UniswapV3);
     }
+    Ok(PoolType::UniswapV2)
+}
+
+/// Identify pool types for multiple addresses concurrently.
+///
+/// Fires all probes in parallel using the resolved multicall address.
+pub async fn identify_pool_types<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    addresses: &[Address],
+    multicall_address: Address,
+) -> Result<Vec<(Address, PoolType)>> {
+    if addresses.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let futures: Vec<_> = addresses
+        .iter()
+        .map(|&addr| {
+            let provider = provider.clone();
+            async move {
+                let pool_type =
+                    identify_pool_type(&provider, addr, multicall_address).await?;
+                Ok::<_, anyhow::Error>((addr, pool_type))
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+    results.into_iter().collect()
 }
 
 /// Fetch a single pool by type using the appropriate fetcher.
@@ -159,14 +195,17 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
             chunk.len()
         );
 
+        // Identify all pool types in the chunk concurrently (1 multicall per pool, all in parallel)
+        let multicall_address = resolve_multicall_address(config.chain_id, config.multicall_address);
+        let chunk_types = identify_pool_types(provider, chunk, multicall_address).await?;
+
         let results: Vec<Result<(Address, PoolType, Box<dyn PoolInterface>), anyhow::Error>> =
             if config.parallel_fetch {
-                let futures: Vec<_> = chunk
+                let futures: Vec<_> = chunk_types
                     .iter()
-                    .map(|&address| {
+                    .map(|&(address, pool_type)| {
                         let provider = provider.clone();
                         async move {
-                            let pool_type = identify_pool_type(&provider, address).await?;
                             let pool = fetch_pool(
                                 &provider,
                                 address,
@@ -183,9 +222,8 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                 join_all(futures).await
             } else {
                 let mut seq_results = Vec::with_capacity(chunk.len());
-                for &address in chunk {
+                for &(address, pool_type) in &chunk_types {
                     let result = async {
-                        let pool_type = identify_pool_type(provider, address).await?;
                         let pool = fetch_pool(
                             provider,
                             address,
@@ -238,7 +276,7 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                 tokio::time::sleep(delay).await;
 
                 match async {
-                    let pool_type = identify_pool_type(provider, address).await?;
+                    let pool_type = identify_pool_type(provider, address, multicall_address).await?;
                     let pool = fetch_pool(
                         provider,
                         address,
