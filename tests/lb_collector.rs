@@ -111,7 +111,7 @@ fn build_fetch_config() -> PoolFetchConfig {
         wait_time_between_chunks: 500,
         max_retries: 3,
         parallel_fetch: true,
-        lb_bin_depth: None,
+
     }
 }
 
@@ -242,8 +242,9 @@ async fn test_lb_collector_lifecycle() -> Result<()> {
 
     let new_addrs = vec![V22_POOL_2, V21_POOL_2];
     println!("  Adding {} pool(s): {:?}", new_addrs.len(), new_addrs);
+    let add_block = provider.get_block_number().await?;
     handle
-        .add_pools(new_addrs.clone(), &fetch_config, &token_info)
+        .add_pools(new_addrs.clone(), add_block, &fetch_config, &token_info)
         .await?;
     println!(
         "  add_pools done — registry now has {} pool(s)",

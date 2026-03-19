@@ -59,8 +59,8 @@ pub async fn fetch_v2_pool<P: Provider + Send + Sync, T: TokenInfo>(
         .await?;
 
     // Tokens
-    let (token0_address, token1_address) =
-        (multicall_result.0.unwrap(), multicall_result.1.unwrap());
+    let token0_address = multicall_result.0.map_err(|e| anyhow!("token0() failed for {}: {}", pool_address, e))?;
+    let token1_address = multicall_result.1.map_err(|e| anyhow!("token1() failed for {}: {}", pool_address, e))?;
     // Factory
     let mut factory = multicall_result.3.unwrap_or(Address::ZERO);
     // Reserves

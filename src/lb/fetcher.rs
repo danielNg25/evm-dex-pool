@@ -183,7 +183,6 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
     token_info: &T,
     multicall_address: Address,
     chain_id: u64,
-    _bin_depth: Option<u32>,
 ) -> Result<LBPool> {
     info!(
         "[Chain {}] Fetching LB pool: {}",

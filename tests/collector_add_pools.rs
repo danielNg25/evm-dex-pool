@@ -112,7 +112,7 @@ fn build_fetch_config() -> PoolFetchConfig {
         wait_time_between_chunks: 200,
         max_retries: 3,
         parallel_fetch: true,
-        lb_bin_depth: None,
+
     }
 }
 
@@ -289,8 +289,9 @@ async fn test_add_pools_http() -> Result<()> {
 
     // ── Dynamically add new pools ──────────────────────────────────────────
     println!("[http] adding {} new pool(s) …", new_addrs.len());
+    let add_block = provider.get_block_number().await?;
     handle
-        .add_pools(new_addrs.clone(), &fetch_config, &token_info)
+        .add_pools(new_addrs.clone(), add_block, &fetch_config, &token_info)
         .await?;
     println!(
         "[http] add_pools done (registry now has {} pool(s)) — sleeping 100 s …",
@@ -409,8 +410,9 @@ async fn test_add_pools_ws() -> Result<()> {
 
     // ── Dynamically add new pools ──────────────────────────────────────────
     println!("[ws] adding {} new pool(s) …", new_addrs.len());
+    let add_block = provider.get_block_number().await?;
     handle
-        .add_pools(new_addrs.clone(), &fetch_config, &token_info)
+        .add_pools(new_addrs.clone(), add_block, &fetch_config, &token_info)
         .await?;
 
     // Immediately after add_pools_ws:

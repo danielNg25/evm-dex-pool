@@ -128,7 +128,6 @@ pub async fn fetch_pool<P: Provider + Send + Sync, T: TokenInfo>(
                 token_info,
                 multicall_address,
                 config.chain_id,
-                config.lb_bin_depth,
             )
             .await?;
             Ok(Box::new(pool))
@@ -310,10 +309,10 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                 }
             }
             if !success {
-                panic!(
+                return Err(anyhow::anyhow!(
                     "Failed to fetch pool {} after {} retries. Check RPC connection and rate limits.",
                     address, config.max_retries
-                );
+                ));
             }
         }
 

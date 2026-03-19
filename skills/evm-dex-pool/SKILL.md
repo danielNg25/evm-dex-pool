@@ -186,7 +186,8 @@ handle.stop().await;
 
 // add new pools while the collector keeps running
 // add_pools internally stops → updates → restarts the collector
-handle.add_pools(new_addresses, &fetch_config, &token_info).await?;
+// block_number: the block at which the new pools were detected
+handle.add_pools(new_addresses, block_number, &fetch_config, &token_info).await?;
 
 // remove pools without stopping the collector
 // returns number of pools actually removed

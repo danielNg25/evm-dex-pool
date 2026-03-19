@@ -477,6 +477,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
         }
 
         // Apply the initial websocket events that were buffered
+        let max_ws_block = events.iter().filter_map(|e| e.block_number).max();
         for event in events {
             if let Some(pool) = self.pool_registry.get_pool(&event.address()) {
                 if let Err(e) = pool.write().await.apply_log(&event) {
@@ -490,6 +491,16 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 }
             }
         }
+
+        // Advance cursor so it reflects the actual chain state after catch-up.
+        // Without this, last_processed_block stays at the stale bootstrap value
+        // and add_pools may try to fetch at a block where new pools don't exist.
+        let bootstrap_block = max_ws_block.unwrap_or(first_event_block);
+        self.pool_registry.set_last_processed_block(bootstrap_block);
+        info!(
+            "[Chain {}] Bootstrap complete, set last_processed_block to {}",
+            self.chain_id, bootstrap_block
+        );
 
         Ok(())
     }
@@ -508,10 +519,12 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 events.len()
             );
 
+            let max_block = events.iter().filter_map(|e| e.block_number).max();
+
             return Ok(EventBatch {
                 events,
                 processing_mode: ProcessingMode::ConfirmedWithSwaps,
-                processed_through_block: None,
+                processed_through_block: max_block,
             });
         }
     }

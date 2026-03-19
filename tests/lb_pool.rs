@@ -173,7 +173,6 @@ async fn test_lb_fuzz() -> Result<()> {
             &token_info,
             multicall_address,
             CHAIN_ID,
-            None,
         )
         .await
         {
