@@ -2,6 +2,14 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.2.3]
+
+### Improved
+
+- **Info logging for sequential fetch delays** — added log messages showing the wait duration
+  and progress (e.g. `Sequential mode: waiting 200ms before next pool (3/10)`) in both
+  `fetch_pools_into_registry` and `fetch_pools_in_memory`.
+
 ## [1.2.2]
 
 ### Fixed

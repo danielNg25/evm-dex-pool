@@ -237,6 +237,10 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                     .await;
                     seq_results.push(result);
                     if i + 1 < chunk_types.len() && config.wait_time_between_chunks > 0 {
+                        info!(
+                            "[Chain {}] Sequential mode: waiting {}ms before next pool ({}/{})",
+                            config.chain_id, config.wait_time_between_chunks, i + 1, chunk_types.len()
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_millis(
                             config.wait_time_between_chunks,
                         ))

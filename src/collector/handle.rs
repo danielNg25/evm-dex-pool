@@ -534,6 +534,10 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                     .await,
                 );
                 if i + 1 < chunk.len() && config.wait_time_between_chunks > 0 {
+                    info!(
+                        "[Chain {}] Sequential mode: waiting {}ms before next pool ({}/{})",
+                        chain_id, config.wait_time_between_chunks, i + 1, chunk.len()
+                    );
                     tokio::time::sleep(Duration::from_millis(
                         config.wait_time_between_chunks,
                     ))
