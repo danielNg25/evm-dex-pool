@@ -274,7 +274,17 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
         }
 
         // Retry failed pools with exponential backoff
-        for &address in &failed_pools {
+        for (retry_idx, &address) in failed_pools.iter().enumerate() {
+            if retry_idx > 0 && config.wait_time_between_chunks > 0 {
+                info!(
+                    "[Chain {}] Sequential mode: waiting {}ms before retrying next pool",
+                    config.chain_id, config.wait_time_between_chunks
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    config.wait_time_between_chunks,
+                ))
+                .await;
+            }
             let mut success = false;
             for attempt in 1..=config.max_retries {
                 let delay = tokio::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));

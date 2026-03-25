@@ -562,7 +562,17 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
             }
         }
 
-        for (_, address) in failed {
+        for (retry_idx, (_, address)) in failed.into_iter().enumerate() {
+            if retry_idx > 0 && config.wait_time_between_chunks > 0 {
+                info!(
+                    "[Chain {}] Sequential mode: waiting {}ms before retrying next pool",
+                    chain_id, config.wait_time_between_chunks
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    config.wait_time_between_chunks,
+                ))
+                .await;
+            }
             let mut success = false;
             for attempt in 1..=config.max_retries {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));

@@ -2,6 +2,14 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.2.4]
+
+### Improved
+
+- **Rate-limit delay between retry attempts** — added `wait_time_between_chunks` delay between
+  retrying different failed pools in both `fetch_pools_into_registry` and `fetch_pools_in_memory`,
+  preventing RPC rate limits during retry sequences.
+
 ## [1.2.3]
 
 ### Improved
