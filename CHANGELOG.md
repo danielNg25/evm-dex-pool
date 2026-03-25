@@ -2,6 +2,16 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.2.2]
+
+### Fixed
+
+- **Sequential fetch mode ignoring `wait_time_between_chunks`** — in sequential mode
+  (`parallel_fetch: false`), pools within a chunk were fetched back-to-back with no delay,
+  causing RPC rate limits on slower endpoints. Now `wait_time_between_chunks` is applied
+  between each individual pool fetch in sequential mode (in both `fetch_pools_into_registry`
+  and `fetch_pools_in_memory`).
+
 ## [1.2.1]
 
 ### Changed

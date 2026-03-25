@@ -221,7 +221,7 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                 join_all(futures).await
             } else {
                 let mut seq_results = Vec::with_capacity(chunk.len());
-                for &(address, pool_type) in &chunk_types {
+                for (i, &(address, pool_type)) in chunk_types.iter().enumerate() {
                     let result = async {
                         let pool = fetch_pool(
                             provider,
@@ -236,6 +236,12 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                     }
                     .await;
                     seq_results.push(result);
+                    if i + 1 < chunk_types.len() && config.wait_time_between_chunks > 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            config.wait_time_between_chunks,
+                        ))
+                        .await;
+                    }
                 }
                 seq_results
             };

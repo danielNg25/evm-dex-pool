@@ -519,7 +519,7 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
             join_all(futures).await
         } else {
             let mut seq = Vec::with_capacity(chunk.len());
-            for &address in chunk {
+            for (i, &address) in chunk.iter().enumerate() {
                 let pool_type =
                     identify_pool_type(provider, address, multicall_address).await?;
                 seq.push(
@@ -533,6 +533,12 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                     )
                     .await,
                 );
+                if i + 1 < chunk.len() && config.wait_time_between_chunks > 0 {
+                    tokio::time::sleep(Duration::from_millis(
+                        config.wait_time_between_chunks,
+                    ))
+                    .await;
+                }
             }
             seq
         };
