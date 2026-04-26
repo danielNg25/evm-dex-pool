@@ -98,6 +98,10 @@ impl UniswapV3Pool {
         self.ratio_conversion_factor = factor;
     }
 
+    pub fn set_fee(&mut self, fee: U24) {
+        self.fee = fee;
+    }
+
     /// Update pool state based on swap event
     pub fn update_state(&mut self, sqrt_price_x96: U160, tick: i32, liquidity: u128) -> Result<()> {
         if sqrt_price_x96 == U160::ZERO {

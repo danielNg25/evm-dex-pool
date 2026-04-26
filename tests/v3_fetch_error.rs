@@ -180,6 +180,7 @@ async fn test_add_pools_survives_bad_pool_katana() -> Result<()> {
             use_websocket: true,
             websocket_urls: vec![KATANA_WS.to_string()],
             wait_time: 2_000,
+            refetch_algebra_fee: false,
         },
         Arc::clone(&registry),
         None,

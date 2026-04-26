@@ -1,3 +1,4 @@
+pub mod algebra_fee_refetch;
 pub mod block_source;
 pub mod bootstrap;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod unified_pool_updater;
 pub mod utils;
 pub mod websocket_listener;
 
+pub use algebra_fee_refetch::refetch_algebra_v3_fees;
 pub use block_source::{
     BlockSource, EventBatch, LatestBlockSource, PendingBlockSource, ProcessingMode,
     WebsocketBlockSource,

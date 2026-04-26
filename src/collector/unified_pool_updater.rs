@@ -1,4 +1,5 @@
 use crate::PoolRegistry;
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use anyhow::Result;
 use log::{debug, error, info, warn};
@@ -6,12 +7,14 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+use super::algebra_fee_refetch::refetch_algebra_v3_fees;
 use super::block_source::{
     BlockSource, EventBatch, LatestBlockSource, PendingBlockSource, ProcessingMode,
     WebsocketBlockSource,
 };
 use super::event_processor::{EventProcessor, PendingEvent};
 use super::metrics::CollectorMetrics;
+use super::multicall::resolve_multicall_address;
 use super::EventQueue;
 
 /// Updater mode configuration.
@@ -25,17 +28,24 @@ pub enum UpdaterMode {
 ///
 /// Replaces the three separate updaters (PoolUpdater, PoolUpdaterLatestBlock,
 /// PoolUpdaterLatestBlockWs) with a single implementation.
-pub struct UnifiedPoolUpdater {
+pub struct UnifiedPoolUpdater<P: Provider + Send + Sync + 'static> {
+    provider: Arc<P>,
     source: Box<dyn BlockSource>,
     event_processor: EventProcessor,
     pool_registry: Arc<PoolRegistry>,
     chain_id: u64,
     cancel_rx: oneshot::Receiver<()>,
+    /// If true, multicall `fee()` for every tracked Algebra V3 pool after each
+    /// batch and write the fresh fee back into the registry.
+    refetch_algebra_fee: bool,
+    /// Resolved multicall3 address for this chain. Used by the post-batch
+    /// Algebra fee refetch.
+    multicall_address: Address,
 }
 
-impl UnifiedPoolUpdater {
+impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new<P: Provider + Send + Sync + 'static>(
+    pub fn new(
         provider: Arc<P>,
         pool_registry: Arc<PoolRegistry>,
         metrics: Option<Arc<dyn CollectorMetrics>>,
@@ -44,6 +54,7 @@ impl UnifiedPoolUpdater {
         max_blocks_per_batch: u64,
         mode: UpdaterMode,
         cancel_rx: oneshot::Receiver<()>,
+        refetch_algebra_fee: bool,
     ) -> Self {
         let chain_id = pool_registry.get_network_id();
 
@@ -75,20 +86,20 @@ impl UnifiedPoolUpdater {
 
         let source: Box<dyn BlockSource> = match mode {
             UpdaterMode::PendingBlock => Box::new(PendingBlockSource::new(
-                provider,
+                Arc::clone(&provider),
                 Arc::clone(&pool_registry),
                 Arc::clone(&topics),
                 max_blocks_per_batch,
             )),
             UpdaterMode::LatestBlock { wait_time_ms } => Box::new(LatestBlockSource::new(
-                provider,
+                Arc::clone(&provider),
                 Arc::clone(&pool_registry),
                 Arc::clone(&topics),
                 max_blocks_per_batch,
                 wait_time_ms,
             )),
             UpdaterMode::Websocket { event_queue } => Box::new(WebsocketBlockSource::new(
-                provider,
+                Arc::clone(&provider),
                 event_queue,
                 Arc::clone(&pool_registry),
                 Arc::clone(&topics),
@@ -96,12 +107,17 @@ impl UnifiedPoolUpdater {
             )),
         };
 
+        let multicall_address = resolve_multicall_address(chain_id, None);
+
         Self {
+            provider,
             source,
             event_processor,
             pool_registry,
             chain_id,
             cancel_rx,
+            refetch_algebra_fee,
+            multicall_address,
         }
     }
 
@@ -168,6 +184,29 @@ impl UnifiedPoolUpdater {
                                 chain_id, event_count
                             );
                             self.event_processor.process_pending_events(events).await;
+                        }
+                    }
+
+                    if self.refetch_algebra_fee {
+                        if let Some(block) = processed_through_block {
+                            let addresses = self.pool_registry.get_algebra_v3_addresses();
+                            if !addresses.is_empty() {
+                                if let Err(e) = refetch_algebra_v3_fees(
+                                    &self.provider,
+                                    &self.pool_registry,
+                                    &addresses,
+                                    self.multicall_address,
+                                    chain_id,
+                                    block,
+                                )
+                                .await
+                                {
+                                    warn!(
+                                        "[Chain {}] Algebra V3 fee refetch failed: {}",
+                                        chain_id, e
+                                    );
+                                }
+                            }
                         }
                     }
 

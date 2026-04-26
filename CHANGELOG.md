@@ -2,6 +2,30 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.3.0]
+
+### Added
+
+- **Algebra V3 dynamic fee refetch** — opt-in `CollectorConfig::refetch_algebra_fee` flag.
+  When enabled, after each event batch the collector multicalls `fee()` on every tracked
+  Algebra V3 pool (`V3PoolType::AlgebraV3`) and writes the fresh fee back into the registry.
+  Required for chains where Algebra plugins update the swap fee per-block via an oracle,
+  without emitting an on-chain event.
+- `PoolRegistry::add_algebra_v3_address`, `remove_algebra_v3_address`, and
+  `get_algebra_v3_addresses` — backing store for tracked Algebra V3 pool addresses.
+- `UniswapV3Pool::set_fee` — mutate the cached fee.
+- `evm_dex_pool::collector::refetch_algebra_v3_fees` — public helper for callers who want
+  to trigger the refetch manually outside the collector loop.
+
+### Changed
+
+- **Breaking: `CollectorConfig`** gained a `refetch_algebra_fee: bool` field. Existing
+  callers must add `refetch_algebra_fee: false` to their struct literal.
+- **Breaking: `UnifiedPoolUpdater`** is now generic over the provider type
+  (`UnifiedPoolUpdater<P>`) and `UnifiedPoolUpdater::new` takes an additional
+  `refetch_algebra_fee: bool` argument at the end. Direct callers of `new` must update.
+  `start_collector` callers are unaffected.
+
 ## [1.2.4]
 
 ### Improved

@@ -6,6 +6,7 @@ use crate::collector::pool_fetcher::{fetch_pool, identify_pool_type};
 use crate::collector::unified_pool_updater::{UnifiedPoolUpdater, UpdaterMode};
 use crate::collector::websocket_listener::WebsocketListener;
 use crate::collector::CollectorConfig;
+use crate::v3::{UniswapV3Pool, V3PoolType};
 use crate::{PoolInterface, PoolRegistry, PoolType, TokenInfo};
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::Address;
@@ -140,6 +141,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         let mut removed = 0usize;
         for addr in addresses {
             if self.pool_registry.remove_pool(addr).is_some() {
+                self.pool_registry.remove_algebra_v3_address(addr);
                 removed += 1;
             }
         }
@@ -453,6 +455,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
             self.collector_config.max_blocks_per_batch,
             mode,
             cancel_rx,
+            self.collector_config.refetch_algebra_fee,
         );
         let handle = tokio::spawn(async move {
             if let Err(e) = updater.start().await {
@@ -735,15 +738,27 @@ async fn catchup_registry_to_block<P: Provider + Send + Sync>(
 }
 
 /// Insert pool objects into the registry and register any previously unseen
-/// pool-type event topics.
+/// pool-type event topics. Also tracks Algebra V3 addresses for periodic fee
+/// refetch (see [`crate::collector::algebra_fee_refetch`]).
 fn register_pools_and_topics(registry: &Arc<PoolRegistry>, pools: Vec<Box<dyn PoolInterface>>) {
     let mut new_pool_types: HashSet<PoolType> = HashSet::new();
     for pool in pools {
         new_pool_types.insert(pool.pool_type());
+        track_if_algebra_v3(registry, pool.as_ref());
         registry.add_pool(pool);
     }
     for pool_type in new_pool_types {
         registry.add_topics(pool_type.topics());
         registry.add_profitable_topics(pool_type.profitable_topics());
+    }
+}
+
+/// If `pool` is a `V3PoolType::AlgebraV3`, register its address with the
+/// registry so the collector can refetch its dynamic fee after each batch.
+pub(crate) fn track_if_algebra_v3(registry: &PoolRegistry, pool: &dyn PoolInterface) {
+    if let Some(v3) = pool.as_any().downcast_ref::<UniswapV3Pool>() {
+        if v3.pool_type == V3PoolType::AlgebraV3 {
+            registry.add_algebra_v3_address(v3.address);
+        }
     }
 }

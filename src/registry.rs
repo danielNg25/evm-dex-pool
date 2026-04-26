@@ -1,6 +1,7 @@
 use crate::{PoolInterface, PoolType, Topic};
 use alloy::primitives::Address;
 use dashmap::DashMap;
+use log::info;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -16,6 +17,10 @@ use std::sync::{Arc, RwLock};
 pub struct PoolRegistry {
     by_address:
         Arc<DashMap<Address, Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>>>,
+    /// Addresses of pools whose `fee()` may change every block without emitting
+    /// an event (currently `V3PoolType::AlgebraV3`). Maintained as pools are
+    /// added/removed so the collector can refetch fees in a single multicall.
+    algebra_v3_addresses: Arc<DashMap<Address, ()>>,
     last_processed_block: AtomicU64,
     topics: RwLock<Vec<Topic>>,
     profitable_topics: RwLock<HashSet<Topic>>,
@@ -26,11 +31,44 @@ impl PoolRegistry {
     pub fn new(network_id: u64) -> Self {
         Self {
             by_address: Arc::new(DashMap::new()),
+            algebra_v3_addresses: Arc::new(DashMap::new()),
             last_processed_block: AtomicU64::new(0),
             topics: RwLock::new(Vec::new()),
             profitable_topics: RwLock::new(HashSet::new()),
             network_id,
         }
+    }
+
+    /// Track an Algebra V3 pool address for periodic fee refetch.
+    pub fn add_algebra_v3_address(&self, address: Address) {
+        if self.algebra_v3_addresses.insert(address, ()).is_none() {
+            info!(
+                "[Chain {}] Tracking Algebra V3 pool {} for periodic fee refetch ({} total)",
+                self.network_id,
+                address,
+                self.algebra_v3_addresses.len()
+            );
+        }
+    }
+
+    /// Stop tracking an Algebra V3 pool address.
+    pub fn remove_algebra_v3_address(&self, address: &Address) {
+        if self.algebra_v3_addresses.remove(address).is_some() {
+            info!(
+                "[Chain {}] Untracking Algebra V3 pool {} ({} remaining)",
+                self.network_id,
+                address,
+                self.algebra_v3_addresses.len()
+            );
+        }
+    }
+
+    /// Snapshot of currently tracked Algebra V3 pool addresses.
+    pub fn get_algebra_v3_addresses(&self) -> Vec<Address> {
+        self.algebra_v3_addresses
+            .iter()
+            .map(|entry| *entry.key())
+            .collect()
     }
 
     /// Set network ID for this registry
@@ -196,6 +234,7 @@ impl Clone for PoolRegistry {
     fn clone(&self) -> Self {
         Self {
             by_address: Arc::clone(&self.by_address),
+            algebra_v3_addresses: Arc::clone(&self.algebra_v3_addresses),
             last_processed_block: AtomicU64::new(self.last_processed_block.load(Ordering::Relaxed)),
             topics: RwLock::new(self.topics.read().unwrap().clone()),
             profitable_topics: RwLock::new(self.profitable_topics.read().unwrap().clone()),

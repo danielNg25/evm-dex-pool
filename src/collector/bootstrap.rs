@@ -62,6 +62,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             config.max_blocks_per_batch,
             UpdaterMode::Websocket { event_queue },
             cancel_rx,
+            config.refetch_algebra_fee,
         );
 
         let updater_handle = tokio::spawn(async move {
@@ -96,6 +97,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             config.max_blocks_per_batch,
             UpdaterMode::PendingBlock,
             cancel_rx,
+            config.refetch_algebra_fee,
         );
 
         let updater_handle = tokio::spawn(async move {
@@ -131,6 +133,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
                 wait_time_ms: config.wait_time,
             },
             cancel_rx,
+            config.refetch_algebra_fee,
         );
 
         let updater_handle = tokio::spawn(async move {

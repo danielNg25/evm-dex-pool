@@ -4,7 +4,7 @@ use crate::erc4626::fetch_erc4626_pool;
 use crate::lb::fetch_lb_pool;
 use crate::pool::base::PoolInterface;
 use crate::v2::fetch_v2_pool;
-use crate::v3::fetch_v3_pool;
+use crate::v3::{fetch_v3_pool, UniswapV3Pool, V3PoolType};
 use crate::{PoolRegistry, PoolType, TokenInfo};
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::Address;
@@ -135,6 +135,16 @@ pub async fn fetch_pool<P: Provider + Send + Sync, T: TokenInfo>(
     }
 }
 
+/// If `pool` is a `V3PoolType::AlgebraV3`, register its address with the
+/// registry so the collector can refetch its dynamic fee after each batch.
+fn track_if_algebra_v3(registry: &PoolRegistry, pool: &dyn PoolInterface) {
+    if let Some(v3) = pool.as_any().downcast_ref::<UniswapV3Pool>() {
+        if v3.pool_type == V3PoolType::AlgebraV3 {
+            registry.add_algebra_v3_address(v3.address);
+        }
+    }
+}
+
 /// Fetch pools from chain into the registry.
 ///
 /// Skips pools already present in the registry. Fetches in parallel chunks
@@ -259,6 +269,7 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                         "[Chain {}] Fetched pool {} ({:?})",
                         config.chain_id, address, pool_type
                     );
+                    track_if_algebra_v3(pool_registry, pool.as_ref());
                     pool_registry.add_pool(pool);
                     pool_types_present.insert(pool_type);
                     fetched_addresses.push(address);
@@ -314,6 +325,7 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                             "[Chain {}] Fetched pool {} ({:?}) on retry {}",
                             config.chain_id, address, pool_type, attempt
                         );
+                        track_if_algebra_v3(pool_registry, pool.as_ref());
                         pool_registry.add_pool(pool);
                         pool_types_present.insert(pool_type);
                         fetched_addresses.push(address);

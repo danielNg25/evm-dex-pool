@@ -199,6 +199,7 @@ async fn test_lb_collector_lifecycle() -> Result<()> {
             use_websocket: false,
             websocket_urls: vec![],
             wait_time: 2_000,
+            refetch_algebra_fee: false,
         },
         Arc::clone(&registry),
         None,
