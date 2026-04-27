@@ -37,6 +37,9 @@ pub struct CollectorHandle<P: Provider + Send + Sync + Clone + 'static> {
 
     // Stored for collector restart
     provider: Arc<P>,
+    /// Optional dedicated provider for the per-batch Algebra V3 fee refetch.
+    /// When `None`, the refetch reuses `provider`.
+    algebra_refetch_provider: Option<Arc<P>>,
     pool_registry: Arc<PoolRegistry>,
     metrics: Option<Arc<dyn CollectorMetrics>>,
     swap_event_tx: Option<mpsc::Sender<PendingEvent>>,
@@ -51,6 +54,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         ws_listeners: Vec<Arc<WebsocketListener>>,
         ws_urls: Vec<String>,
         provider: Arc<P>,
+        algebra_refetch_provider: Option<Arc<P>>,
         pool_registry: Arc<PoolRegistry>,
         metrics: Option<Arc<dyn CollectorMetrics>>,
         swap_event_tx: Option<mpsc::Sender<PendingEvent>>,
@@ -62,6 +66,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
             ws_listeners,
             ws_urls,
             provider,
+            algebra_refetch_provider,
             pool_registry,
             metrics,
             swap_event_tx,
@@ -456,6 +461,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
             mode,
             cancel_rx,
             self.collector_config.refetch_algebra_fee,
+            self.algebra_refetch_provider.as_ref().map(Arc::clone),
         );
         let handle = tokio::spawn(async move {
             if let Err(e) = updater.start().await {

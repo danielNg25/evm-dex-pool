@@ -2,6 +2,27 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.4.0]
+
+### Added
+
+- **Optional dedicated provider for Algebra V3 fee refetch** —
+  `start_collector` now takes a `algebra_refetch_provider: Option<Arc<P>>`
+  argument. When `Some`, the per-batch Algebra V3 fee multicall is sent on
+  this provider instead of the main one, letting callers point fee refetches
+  at a different RPC endpoint than the one driving event ingestion. When
+  `None`, the main provider is reused (existing behavior).
+
+### Changed
+
+- **Breaking: `start_collector` signature** — gained a final
+  `algebra_refetch_provider: Option<Arc<P>>` parameter. Pass `None` to
+  preserve existing behavior.
+- **Breaking: `UnifiedPoolUpdater::new`** — gained a final
+  `algebra_refetch_provider: Option<Arc<P>>` argument.
+- **Breaking: `CollectorHandle::new`** — gained a
+  `algebra_refetch_provider: Option<Arc<P>>` argument (after `provider`).
+
 ## [1.3.0]
 
 ### Added

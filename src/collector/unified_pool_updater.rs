@@ -38,6 +38,11 @@ pub struct UnifiedPoolUpdater<P: Provider + Send + Sync + 'static> {
     /// If true, multicall `fee()` for every tracked Algebra V3 pool after each
     /// batch and write the fresh fee back into the registry.
     refetch_algebra_fee: bool,
+    /// Optional dedicated provider for the Algebra fee refetch. If `None`,
+    /// the refetch reuses the main `provider`. Lets callers point the
+    /// (potentially heavy) per-batch refetch at a different RPC endpoint
+    /// than the one driving event ingestion.
+    algebra_refetch_provider: Option<Arc<P>>,
     /// Resolved multicall3 address for this chain. Used by the post-batch
     /// Algebra fee refetch.
     multicall_address: Address,
@@ -55,6 +60,7 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
         mode: UpdaterMode,
         cancel_rx: oneshot::Receiver<()>,
         refetch_algebra_fee: bool,
+        algebra_refetch_provider: Option<Arc<P>>,
     ) -> Self {
         let chain_id = pool_registry.get_network_id();
 
@@ -117,6 +123,7 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
             chain_id,
             cancel_rx,
             refetch_algebra_fee,
+            algebra_refetch_provider,
             multicall_address,
         }
     }
@@ -191,8 +198,12 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
                         if let Some(block) = processed_through_block {
                             let addresses = self.pool_registry.get_algebra_v3_addresses();
                             if !addresses.is_empty() {
+                                let refetch_provider = self
+                                    .algebra_refetch_provider
+                                    .as_ref()
+                                    .unwrap_or(&self.provider);
                                 if let Err(e) = refetch_algebra_v3_fees(
-                                    &self.provider,
+                                    refetch_provider,
                                     &self.pool_registry,
                                     &addresses,
                                     self.multicall_address,

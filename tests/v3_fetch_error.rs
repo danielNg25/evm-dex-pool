@@ -185,6 +185,7 @@ async fn test_add_pools_survives_bad_pool_katana() -> Result<()> {
         Arc::clone(&registry),
         None,
         None,
+        None,
     )
     .await?;
 

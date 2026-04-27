@@ -282,6 +282,7 @@ async fn test_add_pools_http() -> Result<()> {
         Arc::clone(&registry),
         None,
         None,
+        None,
     )
     .await?;
 
@@ -402,6 +403,7 @@ async fn test_add_pools_ws() -> Result<()> {
             refetch_algebra_fee: false,
         },
         Arc::clone(&registry),
+        None,
         None,
         None,
     )

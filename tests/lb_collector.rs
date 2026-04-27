@@ -204,6 +204,7 @@ async fn test_lb_collector_lifecycle() -> Result<()> {
         Arc::clone(&registry),
         None,
         None,
+        None,
     )
     .await?;
 
