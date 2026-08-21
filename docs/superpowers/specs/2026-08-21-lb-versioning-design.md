@@ -350,9 +350,30 @@ Zero-reserve bins are **not** a source of divergence: `update_bin` removes bins 
 
 - `PoolType::TraderJoeLB` keeps its shape — no match arms break.
 - `LBPool` keeps its name and all existing public fields; `version` and `hooks_parameters` are
-  additive with `#[serde(default)]`, so persisted snapshots still load.
+  additive with `#[serde(default)]`.
 - `PoolInterface` gains only defaulted methods.
 - `identify_pool_type` keeps its signature.
+
+### 8.1 Persisted snapshots do NOT survive — and that is fine
+
+An earlier draft of this section claimed `#[serde(default)]` keeps persisted 1.4.0 snapshots
+loadable. **That is false for the actual consumer.** `evm-dex-arbitrage` persists `LBPool` with
+**bincode** (`src/core/database/mod.rs:47,51`, via the `lb_pools` tree at
+`src/models/pool/persistence.rs:75-85`). bincode is positional and non-self-describing, so it
+ignores serde defaults entirely: a record written with 17 fields cannot be read into a 19-field
+struct.
+
+Two consequences follow, and the design accommodates both:
+
+1. **Both new fields must sit at the END of the struct.** A field inserted mid-struct makes bincode
+   read the following field's bytes as the new field — and an `LBVersion` tag of 0, 1, or 2 decodes
+   as *valid*, silently shifting every subsequent field and yielding a pool with corrupted reserves.
+   Trailing fields instead produce a clean EOF error.
+2. **A clean error is an acceptable outcome.** `load_all_from_db` logs and skips unreadable records
+   (`persistence.rs:98`), so a stale LB snapshot is dropped and the pool is re-fetched from chain.
+   The database is a cache, not a source of truth.
+
+The JSON path still benefits from `#[serde(default)]`, so both attributes stay.
 
 The one deliberate behaviour change is that a v2.0 address, which today panics the bootstrap, now
 fetches correctly. Release as a **minor** version bump.
