@@ -23,10 +23,6 @@ use std::fmt;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LBPool {
     pub address: Address,
-    /// LB protocol generation. Defaults to v2.1 for snapshots persisted
-    /// before v2.0 support existed.
-    #[serde(default)]
-    pub version: LBVersion,
     pub token_x: Address,
     pub token_y: Address,
     pub bin_step: u16,
@@ -55,6 +51,15 @@ pub struct LBPool {
     pub last_updated: u64,
     pub created_at: u64,
 
+    /// LB protocol generation. Defaults to v2.1 for snapshots persisted
+    /// before v2.0 support existed.
+    ///
+    /// Kept at the end of the struct deliberately: downstream persists this
+    /// type with bincode, which is positional and ignores serde defaults.
+    /// A trailing field makes an old record fail cleanly at EOF instead of
+    /// misparsing every field after it.
+    #[serde(default)]
+    pub version: LBVersion,
     /// v2.2 only. `Some(non-zero)` means the pair has hooks installed and its
     /// observable behaviour may deviate from pure LB math.
     #[serde(default)]
@@ -85,7 +90,6 @@ impl LBPool {
         let now = chrono::Utc::now().timestamp() as u64;
         Self {
             address,
-            version: LBVersion::default(),
             token_x,
             token_y,
             bin_step,
@@ -104,6 +108,7 @@ impl LBPool {
             time_of_last_update,
             last_updated: now,
             created_at: now,
+            version: LBVersion::default(),
             hooks_parameters: None,
         }
     }
