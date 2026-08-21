@@ -277,7 +277,7 @@ mod tests {
     /// The two generations' Swap events must be distinguishable by topic0,
     /// because apply_log dispatches on topic0 alone.
     #[test]
-    fn swap_topics_differ_between_generations() {
+    fn swap_topics_match_deployed_contracts() {
         assert_ne!(
             crate::contracts::ILBPair::Swap::SIGNATURE_HASH,
             crate::contracts::ILBPairV20::Swap::SIGNATURE_HASH
