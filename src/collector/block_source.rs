@@ -1,4 +1,5 @@
 use crate::PoolRegistry;
+use crate::PoolType;
 use crate::Topic;
 use alloy::eips::BlockNumberOrTag;
 use alloy::providers::Provider;
@@ -10,7 +11,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::event_processor::fetch_events_with_retry;
-use super::{fetch_events, EventQueue};
+use super::{enrich_log_timestamps, fetch_events, EventQueue};
+
+/// Enrich `events` with block timestamps, but only when the registry holds
+/// at least one LB pool — no other pool type has time-dependent state, so a
+/// deployment without them pays nothing for this extra RPC round trip.
+async fn enrich_if_lb_pools_present<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    pool_registry: &PoolRegistry,
+    events: &mut [Log],
+) -> Result<()> {
+    if !pool_registry
+        .get_addresses_by_type(PoolType::TraderJoeLB)
+        .is_empty()
+    {
+        enrich_log_timestamps(provider, events).await?;
+    }
+    Ok(())
+}
 
 /// How the unified updater should process a batch of events.
 pub enum ProcessingMode {
@@ -129,7 +147,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         self.chain_id, from, batch_end
                     );
 
-                    let events = fetch_events_with_retry(
+                    let mut events = fetch_events_with_retry(
                         &self.provider,
                         self.pool_registry.get_all_addresses(),
                         self.topics.to_vec(),
@@ -146,6 +164,9 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         from,
                         batch_end
                     );
+
+                    enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events)
+                        .await?;
 
                     // Advance phase
                     let next_block = batch_end + 1;
@@ -173,7 +194,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         continue;
                     }
 
-                    let events = fetch_events_with_retry(
+                    let mut events = fetch_events_with_retry(
                         &self.provider,
                         addresses,
                         self.topics.to_vec(),
@@ -188,6 +209,9 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         self.chain_id,
                         events.len()
                     );
+
+                    enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events)
+                        .await?;
 
                     // Reset to poll for next iteration
                     self.phase = PendingPhase::PollBlockNumber;
@@ -253,7 +277,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
                     self.batches.len()
                 );
 
-                let events = fetch_events_with_retry(
+                let mut events = fetch_events_with_retry(
                     &self.provider,
                     self.pool_registry.get_all_addresses(),
                     self.topics.to_vec(),
@@ -262,6 +286,9 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
                     self.chain_id,
                 )
                 .await?;
+
+                enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events)
+                    .await?;
 
                 let mode = if is_latest_single {
                     ProcessingMode::ConfirmedWithSwaps
@@ -507,7 +534,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
 
     async fn next_batch(&mut self) -> Result<EventBatch> {
         loop {
-            let events = self.event_queue.get_all_available_events().await;
+            let mut events = self.event_queue.get_all_available_events().await;
             if events.is_empty() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
@@ -518,6 +545,8 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 self.chain_id,
                 events.len()
             );
+
+            enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events).await?;
 
             let max_block = events.iter().filter_map(|e| e.block_number).max();
 
