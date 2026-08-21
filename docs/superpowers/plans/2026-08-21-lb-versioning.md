@@ -1632,6 +1632,119 @@ gate that proves apply_log is correct."
 
 ---
 
+### Task 7b: Reproduce `updateReferences` in `apply_log`
+
+**Files:**
+- Modify: `src/lb/pool.rs`
+- Test: `tests/lb_convergence.rs` (rerun; no edits)
+
+**Interfaces:**
+- Consumes: `LBPool::update_references` (already exists, already correct), `Self::log_timestamp` (Task 5).
+- Produces: no new API. `apply_log` becomes a faithful replay of the contract's swap-time reference update.
+
+**This is a confirmed defect, found by Task 7's convergence test**, not a
+hypothesis. On the v2.1 fixture, replay produced `volatility_reference` 10088
+against a fetched 6250, and `id_reference` 8395262 against 8395261. All 1423
+bins matched, so bin accounting is correct — the fee state is not.
+
+Cause: `update_references` (`src/lb/pool.rs:167`) is a correct port of
+`PairParameterHelper.updateReferences()`, but it is only ever called from
+`simulate_swap_out_at` and `simulate_swap_in_at` — the read-only quote paths.
+`apply_log` never calls it, so on replay it sets `id_reference` to the swap's
+**final** bin (where the contract sets it to the **pre-swap** `activeId`) and
+never writes `volatility_reference` at all.
+
+The arithmetic reconciles exactly: `volAcc_pre 12500 → volRef 6250`
+(reduction factor 5000) `→ 6250 + 10000 = 16250`, the fetched accumulator.
+
+**Why it costs money.** Both fields feed quotes through `update_references`
+whenever `dt < filter_period` — rapid successive swaps, which is exactly the
+arbitrage window. Wrong volatility state there means wrong fees and wrong
+quotes precisely when they matter most.
+
+- [ ] **Step 1: Confirm the test fails on these fields**
+
+Run: `cargo test --features collector test_lb_convergence_v21 -- --ignored --nocapture`
+Expected: FAIL on `volatility_reference`, and behind it `id_reference`.
+Record the actual numbers — they will differ from the run above, since the
+range is head-derived.
+
+- [ ] **Step 2: Call `update_references` in the Swap arm**
+
+In `src/lb/pool.rs`, in `apply_log`'s `ILBPair::Swap` arm, mirror the contract's
+own ordering. `LBPair.swap()` calls `updateReferences(block.timestamp)` **once,
+before** the bin loop, then updates the accumulator per bin, then stamps
+`timeOfLastUpdate`.
+
+Order is load-bearing: `update_references` reads `self.active_id` to derive
+`id_ref`, so it must run **before** `active_id` is overwritten with the event's
+bin, and before `time_of_last_update` is restamped.
+
+```rust
+                // Mirror LBPair.swap(): updateReferences() runs once, before
+                // the bin loop, using PRE-swap state. It reads self.active_id
+                // for id_ref and self.time_of_last_update for dt, so it must
+                // run before either is overwritten below.
+                let ts = Self::log_timestamp(event);
+                let (vol_ref, id_ref) = self.update_references(ts);
+                self.volatility_reference = vol_ref;
+                self.id_reference = id_ref;
+
+                // Now apply the event's own state.
+                self.active_id = id;
+                self.volatility_accumulator = swap_data.volatilityAccumulator.to();
+                self.time_of_last_update = ts;
+```
+
+Delete the existing `self.id_reference = id;` line — that assignment is the
+bug. Keep `self.last_updated = chrono::Utc::now()…` on wall clock (Task 5).
+
+**Multi-bin swaps are self-correcting, and you should confirm you understand
+why before changing anything.** One `swap()` crossing N bins emits N `Swap`
+logs, so replay calls `update_references` N times where the contract called it
+once. That is harmless: after the first log sets `time_of_last_update = ts`,
+every subsequent log in the same transaction computes `dt = 0`, which is
+`< filter_period`, so the update branch does not fire and both references stay
+put. The first log's values survive — which is the contract's behaviour.
+
+- [ ] **Step 3: Rerun convergence**
+
+Run: `cargo test --features collector test_lb_convergence -- --ignored --nocapture`
+Expected: **both** pools converge on every compared field.
+
+If v2.1 now converges but some other field diverges, report it — do not adjust
+the assertion.
+
+- [ ] **Step 4: Regression**
+
+Run: `cargo test --features collector --lib`
+Run: `cargo test --features collector test_lb_fuzz -- --ignored --nocapture`
+Expected: lib suite green; fuzz still 260/260. The fuzz test exercises
+`simulate_swap_*_at`, which already called `update_references` — this change
+must not alter quote parity.
+
+- [ ] **Step 5: Verify builds**
+
+Run: `cargo check && cargo check --features collector && cargo check --features rpc`
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/lb/pool.rs
+git commit -m "fix(lb): reproduce updateReferences when replaying swaps
+
+apply_log never called update_references, so replayed state carried a
+volatility_reference that was never written and an id_reference set to the
+swap's final bin rather than the pre-swap activeId. Both feed quotes through
+update_references whenever dt < filter_period — rapid successive swaps, the
+arbitrage window — so the error surfaced exactly where quotes matter most.
+
+Found by the event-replay convergence test: v2.1 replay produced volRef 10088
+against a fetched 6250."
+```
+
+---
+
 ### Task 8: Composition fee handling
 
 **Files:**
@@ -1642,7 +1755,40 @@ gate that proves apply_log is correct."
 - Consumes: `ILBPair::CompositionFees` binding (Task 2).
 - Produces: `LBPool::topics()` includes `CompositionFees`; `apply_log` handles it.
 
-**Only do this task if Task 7 Step 2 failed on bin reserves.** If convergence already passed, skip to Task 9 and record why.
+**Status after Task 7: not settled either way — validate it, do not assume.**
+
+Task 7's convergence run showed bins matching exactly (158/158 and 1423/1423),
+which might look like evidence that composition fees need no handling. It is
+not. Those windows contained **no `CompositionFees` events at all**, so they
+say nothing about the case.
+
+Measured separately: `CompositionFees` (topic0 `0x3f0b4672…`) fires **7 times
+in 30,000 blocks** on the v2.1 fixture `0x4224f6f4…`, at blocks 93345318,
+93346900, 93343919, 93343044, 93340472, 93336667 and 93333307. Roughly one per
+4,300 blocks — sparse enough that a random 500–2000 block window usually misses
+it, which is exactly what happened.
+
+So this task must be validated against a **pinned range containing real
+events**, not a head-derived one:
+
+```rust
+/// Contains two real CompositionFees events (blocks 93345318 and 93346900),
+/// located by scanning the v2.1 pool's logs. A head-derived range almost
+/// always misses them — they occur roughly once per 4,300 blocks.
+const V21_COMPOSITION_FEE_RANGE: (u64, u64) = (93_345_191, 93_347_191);
+
+#[tokio::test]
+#[ignore]
+async fn test_lb_convergence_v21_with_composition_fees() -> Result<()> {
+    converge_one(V21_POOL, "v2.1+compfees", Some(V21_COMPOSITION_FEE_RANGE)).await
+}
+```
+
+Add that test **first**, before touching `apply_log`. If it passes without any
+`CompositionFees` handling, then `DepositedToBins` already reports amounts net
+of the fee and this task's premise is wrong — record that and skip the handler.
+If it fails on bin reserves, implement the handler below and confirm it closes
+the gap. Either outcome is a successful task; assuming is the only failure.
 
 Composition fees are charged when liquidity is added to the active bin at a ratio different from the bin's current composition. The fee is credited to that bin's reserves, so ignoring the event leaves replayed reserves short.
 
