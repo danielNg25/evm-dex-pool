@@ -1,4 +1,3 @@
-use crate::contracts_rpc::RpcILBPair;
 use crate::contracts_rpc::RpcIUniswapV3Pool as IUniswapV3Pool;
 use crate::erc4626::fetch_erc4626_pool;
 use crate::lb::fetch_lb_pool;
@@ -20,30 +19,33 @@ use super::multicall::resolve_multicall_address;
 
 /// Detect pool type by calling type-specific view functions in a single multicall.
 ///
-/// Calls `getBinStep()` and `liquidity()` together via `try_aggregate(false)`:
-/// - `getBinStep` succeeds → LB
-/// - `liquidity` succeeds → V3
-/// - both fail → V2
+/// LB is probed first via [`crate::lb::detect_lb_version`], which uses a
+/// positive per-version discriminator. `liquidity()` succeeding then means
+/// V3; otherwise V2.
 pub async fn identify_pool_type<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     pool_address: Address,
     multicall_address: Address,
 ) -> Result<PoolType> {
-    let lb_instance = RpcILBPair::new(pool_address, provider);
-    let v3_instance = IUniswapV3Pool::new(pool_address, provider);
+    // LB first, using a positive per-version discriminator. The previous
+    // getBinStep() probe existed only on v2.1+, so v2.0 pairs fell through
+    // to the UniswapV2 default and panicked the bootstrap in fetch_v2_pool.
+    if crate::lb::detect_lb_version(provider, pool_address, multicall_address, BlockId::latest())
+        .await?
+        .is_some()
+    {
+        return Ok(PoolType::TraderJoeLB);
+    }
 
+    let v3_instance = IUniswapV3Pool::new(pool_address, provider);
     let result = provider
         .multicall()
         .address(multicall_address)
-        .add(lb_instance.getBinStep())   // 0
-        .add(v3_instance.liquidity())    // 1
+        .add(v3_instance.liquidity())
         .try_aggregate(false)
         .await?;
 
     if result.0.is_ok() {
-        return Ok(PoolType::TraderJoeLB);
-    }
-    if result.1.is_ok() {
         return Ok(PoolType::UniswapV3);
     }
     Ok(PoolType::UniswapV2)

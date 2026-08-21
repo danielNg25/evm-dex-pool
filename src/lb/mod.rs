@@ -10,3 +10,5 @@ mod pool;
 pub use fetcher::*;
 pub use pool::*;
 pub use version::LBVersion;
+#[cfg(feature = "rpc")]
+pub use version::detect_lb_version;

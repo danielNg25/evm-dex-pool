@@ -65,3 +65,61 @@ mod tests {
         assert_eq!(restored.hooks_parameters, None);
     }
 }
+
+#[cfg(feature = "rpc")]
+mod detect {
+    use super::LBVersion;
+    use crate::contracts_rpc::{RpcILBPair, RpcILBPairV20};
+    use alloy::eips::BlockId;
+    use alloy::primitives::Address;
+    use alloy::providers::Provider;
+    use anyhow::Result;
+    use std::sync::Arc;
+
+    /// Determine which LB generation a pair is, using a positive
+    /// discriminator: each version is identified by a method only that
+    /// version exposes.
+    ///
+    /// - `getLBHooksParameters()` → v2.2 only
+    /// - `getFactory()` → v2.1 or v2.2
+    /// - `factory()` + `feeParameters()` → v2.0
+    ///
+    /// `factory()` is paired with `feeParameters()` because `factory()` alone
+    /// is too common among non-LB contracts to be a reliable signal.
+    ///
+    /// Returns `Ok(None)` when the address is not an LB pair.
+    pub async fn detect_lb_version<P: Provider + Send + Sync>(
+        provider: &Arc<P>,
+        pool_address: Address,
+        multicall_address: Address,
+        block_number: BlockId,
+    ) -> Result<Option<LBVersion>> {
+        let v21 = RpcILBPair::new(pool_address, provider);
+        let v20 = RpcILBPairV20::new(pool_address, provider);
+
+        let r = provider
+            .multicall()
+            .address(multicall_address)
+            .add(v21.getLBHooksParameters()) // 0
+            .add(v21.getFactory()) // 1
+            .add(v20.factory()) // 2
+            .add(v20.feeParameters()) // 3
+            .block(block_number)
+            .try_aggregate(false)
+            .await?;
+
+        if r.0.is_ok() {
+            return Ok(Some(LBVersion::V2_2));
+        }
+        if r.1.is_ok() {
+            return Ok(Some(LBVersion::V2_1));
+        }
+        if r.2.is_ok() && r.3.is_ok() {
+            return Ok(Some(LBVersion::V2_0));
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(feature = "rpc")]
+pub use detect::detect_lb_version;
