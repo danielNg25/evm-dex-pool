@@ -232,13 +232,22 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
     let var_fees = multicall_result.5?;
 
     let hooks_parameters = if version == LBVersion::V2_2 {
-        lb_instance
+        // Version detection already succeeded via this same call (it is the
+        // v2.2 discriminator in `detect_lb_version`), so a failure here is a
+        // genuine fetch problem, not evidence the pool lacks hooks. Swallowing
+        // it would make "no hooks" and "couldn't check" indistinguishable,
+        // silently disabling the warning below for a pool that may actually
+        // have hooks installed.
+        let h = lb_instance
             .getLBHooksParameters()
             .block(block_number)
             .call()
-            .await
-            .ok()
-            .filter(|h| !h.is_zero())
+            .await?;
+        if h.is_zero() {
+            None
+        } else {
+            Some(h)
+        }
     } else {
         None
     };
