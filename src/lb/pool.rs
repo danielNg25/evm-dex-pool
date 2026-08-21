@@ -587,27 +587,24 @@ impl EventApplicable for LBPool {
                 let new_ry = ry.saturating_add(in_y).saturating_sub(out_y);
                 self.update_bin(id, new_rx, new_ry);
 
-                // Update active_id to the bin where this swap event occurred.
-                // For multi-bin swaps, the last Swap event carries the final active ID.
+                // Mirror LBPair.swap(): updateReferences() runs once, before
+                // the bin loop, using PRE-swap state. It reads self.active_id
+                // for id_ref and self.time_of_last_update for dt, so it must
+                // run before either is overwritten below.
+                let ts = Self::log_timestamp(event);
+                let (vol_ref, id_ref) = self.update_references(ts);
+                self.volatility_reference = vol_ref;
+                self.id_reference = id_ref;
+
+                // Now apply the event's own state.
                 self.active_id = id;
-
-                // Update volatility accumulator from the event
                 self.volatility_accumulator = swap_data.volatilityAccumulator.to();
+                self.time_of_last_update = ts;
 
-                // Update id_reference and time_of_last_update to reflect
-                // the post-swap state. The contract calls updateReferences()
-                // before the swap loop, so after the swap completes these
-                // values are current.
-                //
-                // time_of_last_update mirrors chain state (feeds the on-chain
-                // volatility decay in update_references) and must come from
-                // the log's block time. last_updated is local bookkeeping —
-                // "when this process last touched the pool" — and stays wall
-                // clock, same as every other pool type and as apply_swap.
-                // Do not collapse these back into one `now`.
-                self.id_reference = id;
-                self.time_of_last_update = Self::log_timestamp(event);
-
+                // last_updated is local bookkeeping — "when this process last
+                // touched the pool" — and stays wall clock, same as every
+                // other pool type and as apply_swap. Do not collapse this
+                // back into time_of_last_update, which mirrors chain state.
                 self.last_updated = chrono::Utc::now().timestamp() as u64;
                 Ok(())
             }
