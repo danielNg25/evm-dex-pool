@@ -371,6 +371,14 @@ impl LBPool {
 
         Ok((amount_in, amount_out_left, total_fee))
     }
+
+    /// Chain time for an event, falling back to wall clock only when the log
+    /// carries no block timestamp (some RPCs omit it on pending logs).
+    fn log_timestamp(event: &Log) -> u64 {
+        event
+            .block_timestamp
+            .unwrap_or_else(|| chrono::Utc::now().timestamp() as u64)
+    }
 }
 
 // ─── PoolInterface ───────────────────────────────────────────────────────────
@@ -531,7 +539,7 @@ impl EventApplicable for LBPool {
                 // before the swap loop, so after the swap completes these
                 // values are current.
                 self.id_reference = id;
-                let now = chrono::Utc::now().timestamp() as u64;
+                let now = Self::log_timestamp(event);
                 self.time_of_last_update = now;
 
                 self.last_updated = now;
@@ -547,7 +555,7 @@ impl EventApplicable for LBPool {
                         self.update_bin(id, rx.saturating_add(add_x), ry.saturating_add(add_y));
                     }
                 }
-                self.last_updated = chrono::Utc::now().timestamp() as u64;
+                self.last_updated = Self::log_timestamp(event);
                 Ok(())
             }
             Some(&ILBPair::WithdrawnFromBins::SIGNATURE_HASH) => {
@@ -560,7 +568,7 @@ impl EventApplicable for LBPool {
                         self.update_bin(id, rx.saturating_sub(sub_x), ry.saturating_sub(sub_y));
                     }
                 }
-                self.last_updated = chrono::Utc::now().timestamp() as u64;
+                self.last_updated = Self::log_timestamp(event);
                 Ok(())
             }
             Some(&ILBPair::StaticFeeParametersSet::SIGNATURE_HASH) => {
@@ -621,5 +629,69 @@ impl fmt::Display for LBPool {
             self.active_id,
             self.bins.len(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::ILBPair;
+    use alloy::primitives::{Address, B256};
+    use alloy::rpc::types::Log;
+    use alloy::sol_types::SolEvent;
+
+    fn pool_with_time(t: u64) -> LBPool {
+        let mut p = LBPool::new(
+            Address::ZERO, Address::ZERO, Address::ZERO,
+            20, 8_388_608, BTreeMap::new(),
+            5_000, 30, 600, 5_000, 40_000, 1_000, 350_000,
+            0, 0, 8_388_608, t,
+        );
+        p.update_bin(8_388_608, 1_000_000, 1_000_000);
+        p
+    }
+
+    /// Build a v2.1 Swap log with a known block timestamp.
+    fn swap_log(block_timestamp: Option<u64>) -> Log {
+        let event = ILBPair::Swap {
+            sender: Address::ZERO,
+            to: Address::ZERO,
+            id: 8_388_608u32.try_into().unwrap(),
+            amountsIn: B256::ZERO,
+            amountsOut: B256::ZERO,
+            volatilityAccumulator: 0u32.try_into().unwrap(),
+            totalFees: B256::ZERO,
+            protocolFees: B256::ZERO,
+        };
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_timestamp,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_log_uses_block_timestamp_not_wall_clock() {
+        let mut pool = pool_with_time(1_700_000_000);
+        pool.apply_log(&swap_log(Some(1_700_000_500))).unwrap();
+        assert_eq!(
+            pool.time_of_last_update, 1_700_000_500,
+            "apply_log must take chain time from the log, not the wall clock"
+        );
+    }
+
+    #[test]
+    fn apply_log_falls_back_to_wall_clock_when_log_has_no_timestamp() {
+        let mut pool = pool_with_time(1_700_000_000);
+        pool.apply_log(&swap_log(None)).unwrap();
+        let now = chrono::Utc::now().timestamp() as u64;
+        assert!(
+            pool.time_of_last_update.abs_diff(now) < 60,
+            "expected a wall-clock fallback near now, got {}",
+            pool.time_of_last_update
+        );
     }
 }
