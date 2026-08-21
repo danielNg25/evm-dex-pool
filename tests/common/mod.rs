@@ -15,9 +15,9 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::primitives::{address, Address};
+use alloy::primitives::{address, Address, B256};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::rpc::types::Filter;
+use alloy::rpc::types::{Filter, Log};
 use anyhow::Result;
 
 use evm_dex_pool::collector::enrich_log_timestamps;
@@ -150,12 +150,38 @@ pub fn assert_lb_pools_converge(replayed: &LBPool, fetched: &LBPool, label: &str
     }
 }
 
+/// Assert the replayed range actually contains every event kind named.
+///
+/// Without this a quiet or drifted range yields a green test that exercised
+/// nothing — which has already happened twice on this branch. Prints the
+/// per-topic counts so a shrinking fixture is visible before it hits zero.
+pub fn assert_range_covers(logs: &[Log], required: &[(&str, B256)], label: &str) {
+    for (name, topic) in required {
+        let n = logs.iter().filter(|l| l.topic0() == Some(topic)).count();
+        println!("[{label}] coverage: {name} = {n}");
+        assert!(
+            n > 0,
+            "{label}: pinned range contains no {name} event, so this test \
+             would pass without ever exercising it. Re-pin the range."
+        );
+    }
+}
+
 /// `pinned` selects the block range. `None` derives it from the chain head,
 /// which suits busy pools but makes the test a canary, not a gate — see
 /// each caller's doc comment for why. `Some((a, b))` uses a fixed historical
-/// range. Archive `eth_call` is verified working at 50,000 blocks back on
+/// range. Archive `eth_call` is verified working 10,000,000 blocks back on
 /// this endpoint, so pinned ranges resolve.
-pub async fn converge_one(pool_address: Address, label: &str, pinned: Option<(u64, u64)>) -> Result<()> {
+///
+/// `required` names the event topics the replayed range must contain — see
+/// `assert_range_covers`. Taken as a parameter rather than hardcoded so
+/// different fixture generations (e.g. v2.0) can name their own set.
+pub async fn converge_one(
+    pool_address: Address,
+    label: &str,
+    pinned: Option<(u64, u64)>,
+    required: &[(&str, B256)],
+) -> Result<()> {
     let provider = Arc::new(ProviderBuilder::new().connect_http(RPC_URL.parse()?));
     let token_info = CachingTokenInfo::new();
 
@@ -180,18 +206,29 @@ pub async fn converge_one(pool_address: Address, label: &str, pinned: Option<(u6
     )
     .await?;
 
-    // 2. Replay every LB log in (A, B].
-    let filter = Filter::new()
-        .from_block(block_a + 1)
-        .to_block(block_b)
-        .address(pool_address)
-        .event_signature(LBPool::topics());
-    let mut logs = provider.get_logs(&filter).await?;
+    // 2. Replay every LB log in (A, B], fetched in <=2000-block chunks — this
+    // endpoint rejects eth_getLogs ranges wider than 2048 blocks, and pinned
+    // ranges here run up to 11,000.
+    const CHUNK: u64 = 2000;
+    let mut logs = Vec::new();
+    let mut from = block_a + 1;
+    while from <= block_b {
+        let to = (from + CHUNK - 1).min(block_b);
+        let filter = Filter::new()
+            .from_block(from)
+            .to_block(to)
+            .address(pool_address)
+            .event_signature(LBPool::topics());
+        logs.extend(provider.get_logs(&filter).await?);
+        from = to + 1;
+    }
     println!("[{label}] applying {} logs", logs.len());
     assert!(
         !logs.is_empty(),
         "{label}: no logs in range — widen REPLAY_BLOCKS"
     );
+
+    assert_range_covers(&logs, required, label);
 
     // Required, not optional: `eth_getLogs` does not return `blockTimestamp`,
     // so every log arrives with `block_timestamp: None` and `apply_log` would

@@ -770,6 +770,41 @@ mod tests {
         );
     }
 
+    /// StaticFeeParametersSet never fires on any live fixture pool — 120,000
+    /// blocks scanned, zero occurrences — so no convergence range can cover
+    /// this arm. Unit-tested instead, or it would ship unexercised.
+    #[test]
+    fn apply_log_updates_static_fee_parameters() {
+        let mut pool = pool_with_time(1_700_000_000);
+        let event = ILBPair::StaticFeeParametersSet {
+            sender: Address::ZERO,
+            baseFactor: 7777,
+            filterPeriod: 44,
+            decayPeriod: 888,
+            reductionFactor: 4444,
+            variableFeeControl: 55555u32.try_into().unwrap(),
+            protocolShare: 1234,
+            maxVolatilityAccumulator: 222222u32.try_into().unwrap(),
+        };
+        let log = Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_timestamp: Some(1_700_000_500),
+            ..Default::default()
+        };
+        pool.apply_log(&log).unwrap();
+
+        assert_eq!(pool.base_factor, 7777);
+        assert_eq!(pool.filter_period, 44);
+        assert_eq!(pool.decay_period, 888);
+        assert_eq!(pool.reduction_factor, 4444);
+        assert_eq!(pool.variable_fee_control, 55555);
+        assert_eq!(pool.protocol_share, 1234);
+        assert_eq!(pool.max_volatility_accumulator, 222222);
+    }
+
     use crate::pool::base::QuoteContext;
 
     /// A later timestamp decays the volatility accumulator, so quoting the
