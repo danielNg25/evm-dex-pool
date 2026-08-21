@@ -966,16 +966,29 @@ In `apply_log`, replace every `let now = chrono::Utc::now().timestamp() as u64;`
         let now = Self::log_timestamp(event);
 ```
 
-There are exactly **three** such sites inside `apply_log` — `src/lb/pool.rs:505` (the `now` binding in the `Swap` arm), `:521` (`DepositedToBins`), and `:534` (`WithdrawnFromBins`). The `StaticFeeParametersSet` arm sets no timestamp and needs no change.
+**Locate these by pattern, not by line number** — earlier tasks have already
+shifted `src/lb/pool.rs` and will shift it again. Run
+`grep -n "chrono::Utc::now()" src/lb/pool.rs` and `grep -n "fn apply_log"` first,
+then classify each hit by which function encloses it.
 
-**Leave the other four `chrono::Utc::now()` sites alone.** They are legitimate wall-clock uses, not bugs:
+There are exactly **three** in-scope sites, all inside `apply_log`: the `now`
+binding in the `Swap` arm, and the `self.last_updated = …` assignments in the
+`DepositedToBins` and `WithdrawnFromBins` arms. The `StaticFeeParametersSet` arm
+sets no timestamp and needs no change.
 
-| Line | Site | Why wall clock is correct |
-|---|---|---|
-| 75 | `LBPool::new` | `created_at` / `last_updated` are local bookkeeping |
-| 179 | `simulate_swap_out` | the deliberately timeless convenience wrapper |
-| 279 | `simulate_swap_in` | same |
-| 415 | `apply_swap` | mutates after a simulated swap, not driven by a log |
+**Leave every `chrono::Utc::now()` outside `apply_log` alone.** They are
+legitimate wall-clock uses, not bugs:
+
+| Enclosing function | Why wall clock is correct |
+|---|---|
+| `LBPool::new` | `created_at` / `last_updated` are local bookkeeping |
+| `simulate_swap_out` | the deliberately timeless convenience wrapper |
+| `simulate_swap_in` | same |
+| `apply_swap` (`PoolInterface`) | mutates after a simulated swap, not driven by a log |
+
+As of this writing the in-scope hits are at lines 534, 550, and 563, and the
+do-not-touch hits at 90, 208, 308, and 444 — but verify with grep rather than
+trusting those numbers.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -2060,14 +2073,25 @@ additive and 1.4.0 consumers are unaffected."
 | 1.4.0 snapshots still deserialize | `pool_without_version_field_deserializes_as_v21` | 1 |
 | ABI matches deployed contracts | `v20_selectors_match_deployed_contracts` | 2 |
 
-## Known Coverage Gap
+## Coverage Gap — CLOSED
 
-Spec §7.2 says v2.2 pools with hooks are held out of the convergence test and
-"asserted separately to be flagged". **No such assertion exists in this plan**,
-because no hooked v2.2 pair address was identified during research. Task 4
-implements the detection and the `warn!`, but nothing proves it fires.
+This plan originally recorded that no hooked v2.2 pair was known, so nothing
+proved the hooks detection in Task 4 ever fired.
 
-Close this by finding a v2.2 pair with non-zero `getLBHooksParameters()` — scan
-`HooksParametersSet` logs from the v2.2 factory — and adding a fixture asserting
-`pool.hooks_parameters.is_some()`. Do not fabricate an address; an assertion
-against a pool with no hooks would pass vacuously and prove nothing.
+Measurement closed it. Both v2.2 fixtures already in use carry hooks, confirmed
+by live `eth_call` on `getLBHooksParameters()` (`0x781a8915`):
+
+| Pool | `getLBHooksParameters()` |
+|---|---|
+| `0x8573f98175d816d520248b5facf40d309b1c9cee` | `0x…0151e104964852be626ee27762712e4de521066859c9` |
+| `0xcec377285abf370fdf872625d2742252656d631a` | `0x…015172ed0b6acb5c585873b3f644f99fc167c7601256` |
+
+Low 160 bits are the hook contract address; the `0x0151` above them are the
+capability flags. Task 4's live test already exercises the `warn!` path through
+the first of these, so the detection is proven rather than merely written.
+
+Two consequences, both handled in spec §7.2: hooked pools **stay in** the
+convergence test (excluding them would leave v2.2 with no coverage, and hooks do
+not alter the pair's own storage or events), and the apparent prevalence of
+hooks on v2.2 is itself worth reporting — it makes hooked pools the norm rather
+than an edge case for the downstream consumer.

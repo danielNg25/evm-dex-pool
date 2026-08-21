@@ -335,9 +335,28 @@ currently invisible — none is a reason to loosen the assertion.
 *Possible:*
 - Flash-loan fees credited to bins with no event this implementation observes.
 
-*Excluded rather than failed:*
-- v2.2 pools with non-zero `hooks_parameters`, whose state may move outside LB math. Held out of
-  this test and asserted separately to be flagged.
+*Hooked v2.2 pools are NOT excluded — an earlier draft said they were:*
+
+Measurement changed this. Both known v2.2 fixtures on Avalanche carry hooks:
+`0x8573f981…` → hook `0xe104964852be626ee27762712e4de521066859c9`, and `0xcec37728…` → hook
+`0x72ed0b6acb5c585873b3f644f99fc167c7601256`, both with capability flags `0x0151`. Excluding
+hooked pools would therefore leave v2.2 with **no convergence coverage at all**, which is worse
+than the risk it avoids.
+
+It is also the wrong risk. Convergence compares bin state rebuilt from events against bin state
+refetched from the pair — both derive from the pair's own storage and its own emitted logs. LB
+hooks are callbacks into a separate contract; they do not change what the pair stores in a bin or
+what it emits. The place hooks genuinely matter is **quote-versus-execution fidelity downstream**:
+`getSwapOut` is a view on the pair and does not consult hooks, so a hooked pool can quote
+correctly here and still execute differently in the bot. That is a consumer concern, not a
+convergence concern.
+
+So hooked pools stay in the test. If v2.2 convergence fails in a way traceable to hooks, that
+failure is itself the finding and this decision gets revisited.
+
+The prevalence is worth flagging on its own: if hooks are the norm on v2.2 rather than the
+exception, the `hooks_parameters` warning will fire constantly, and the downstream bot needs a
+policy for hooked pools rather than treating them as a rare edge case.
 
 Zero-reserve bins are **not** a source of divergence: `update_bin` removes bins that drain to
 `(0, 0)` (`pool.rs:128-132`) and `fetch` only inserts bins with non-zero reserves
