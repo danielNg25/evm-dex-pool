@@ -404,7 +404,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
         let latest_block = self.provider.get_block_number().await?;
         info!("[Chain {}] Latest block: {}", self.chain_id, latest_block);
 
-        let events = self.event_queue.get_all_available_events().await;
+        let mut events = self.event_queue.get_all_available_events().await;
         info!(
             "[Chain {}] Found {} events in EventQueue",
             self.chain_id,
@@ -447,7 +447,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             )
             .await
             {
-                Ok(fetched_events) => {
+                Ok(mut fetched_events) => {
                     info!(
                         "[Chain {}] Fetched {} events in batch {} - {}",
                         self.chain_id,
@@ -455,6 +455,13 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                         start_block,
                         end_block
                     );
+
+                    enrich_if_lb_pools_present(
+                        &self.provider,
+                        &self.pool_registry,
+                        &mut fetched_events,
+                    )
+                    .await?;
 
                     let mut should_break = false;
                     for event in fetched_events {
@@ -504,6 +511,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
         }
 
         // Apply the initial websocket events that were buffered
+        enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events).await?;
         let max_ws_block = events.iter().filter_map(|e| e.block_number).max();
         for event in events {
             if let Some(pool) = self.pool_registry.get_pool(&event.address()) {
