@@ -318,15 +318,30 @@ Excluded: `last_updated` and `created_at` — local bookkeeping, not chain state
 
 Fixtures span all three versions so the v2.0 accounting question in §6.3 is actually exercised.
 
-**Known reasons this can legitimately fail, each a real bug to fix rather than a reason to loosen
-the assertion:**
-- Wall-clock vs block timestamp (§5.5) — fails until fixed.
-- Unhandled `CompositionFee(s)` (§6.3).
-- Bins drained to `(0, 0)` by replay but simply absent from a fresh fetch, which only stores
-  non-empty bins — normalise by dropping zero-reserve entries before comparing.
+**Expected first-run failures.** This test asserts an invariant the current code does not satisfy,
+so it fails before it passes. Each failure is a pre-existing defect in shipped 1.4.0 that is
+currently invisible — none is a reason to loosen the assertion.
+
+*Certain — fix before the test can pass:*
+- Wall-clock vs block timestamp (§5.5). `apply_log` stamps `time_of_last_update` with
+  `chrono::Utc::now()` while `fetch` reads it from chain, and `update_references` decays volatility
+  on `dt = timestamp - time_of_last_update` (`pool.rs:139`). The two sources essentially never
+  agree, and the error propagates into fee and quote output.
+
+*Likely — hypotheses the test adjudicates:*
+- Unhandled `CompositionFee(s)` (§6.3), credited to the active bin.
+- v2.0 bin accounting (§6.3), once v2.0 fixtures exist.
+
+*Possible:*
 - Flash-loan fees credited to bins with no event this implementation observes.
-- v2.2 pools with non-zero `hooks_parameters`, whose state may move outside LB math. Excluded from
+
+*Excluded rather than failed:*
+- v2.2 pools with non-zero `hooks_parameters`, whose state may move outside LB math. Held out of
   this test and asserted separately to be flagged.
+
+Zero-reserve bins are **not** a source of divergence: `update_bin` removes bins that drain to
+`(0, 0)` (`pool.rs:128-132`) and `fetch` only inserts bins with non-zero reserves
+(`fetcher.rs:306`). Both sides already normalise symmetrically.
 
 ## 8. Backward compatibility
 
