@@ -538,11 +538,17 @@ impl EventApplicable for LBPool {
                 // the post-swap state. The contract calls updateReferences()
                 // before the swap loop, so after the swap completes these
                 // values are current.
+                //
+                // time_of_last_update mirrors chain state (feeds the on-chain
+                // volatility decay in update_references) and must come from
+                // the log's block time. last_updated is local bookkeeping —
+                // "when this process last touched the pool" — and stays wall
+                // clock, same as every other pool type and as apply_swap.
+                // Do not collapse these back into one `now`.
                 self.id_reference = id;
-                let now = Self::log_timestamp(event);
-                self.time_of_last_update = now;
+                self.time_of_last_update = Self::log_timestamp(event);
 
-                self.last_updated = now;
+                self.last_updated = chrono::Utc::now().timestamp() as u64;
                 Ok(())
             }
             Some(&ILBPair::DepositedToBins::SIGNATURE_HASH) => {
@@ -555,7 +561,7 @@ impl EventApplicable for LBPool {
                         self.update_bin(id, rx.saturating_add(add_x), ry.saturating_add(add_y));
                     }
                 }
-                self.last_updated = Self::log_timestamp(event);
+                self.last_updated = chrono::Utc::now().timestamp() as u64;
                 Ok(())
             }
             Some(&ILBPair::WithdrawnFromBins::SIGNATURE_HASH) => {
@@ -568,7 +574,7 @@ impl EventApplicable for LBPool {
                         self.update_bin(id, rx.saturating_sub(sub_x), ry.saturating_sub(sub_y));
                     }
                 }
-                self.last_updated = Self::log_timestamp(event);
+                self.last_updated = chrono::Utc::now().timestamp() as u64;
                 Ok(())
             }
             Some(&ILBPair::StaticFeeParametersSet::SIGNATURE_HASH) => {
