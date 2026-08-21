@@ -55,3 +55,43 @@ async fn test_v20_pair_is_not_misclassified() -> Result<()> {
     assert_eq!(got, PoolType::TraderJoeLB);
     Ok(())
 }
+
+use evm_dex_pool::lb::fetch_lb_pool;
+use evm_dex_pool::TokenInfo;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Mutex;
+
+struct NoopTokenInfo;
+
+impl TokenInfo for NoopTokenInfo {
+    fn get_or_fetch_token<P: alloy::providers::Provider + Send + Sync>(
+        &self,
+        _provider: &Arc<P>,
+        address: Address,
+        _multicall_address: Address,
+    ) -> impl Future<Output = Result<(Address, u8)>> + Send {
+        async move { Ok((address, 18u8)) }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_fetch_stamps_version_and_finds_bins() -> Result<()> {
+    let provider = Arc::new(ProviderBuilder::new().connect_http(RPC_URL.parse()?));
+    let block = BlockId::latest();
+
+    for (addr, expected) in [(V22_POOL, LBVersion::V2_2), (V21_POOL, LBVersion::V2_1)] {
+        let pool = fetch_lb_pool(&provider, addr, block, &NoopTokenInfo, MULTICALL, 43114).await?;
+
+        assert_eq!(pool.version, expected, "version not stamped for {addr}");
+        // A live WAVAX pair always has far more than one non-empty bin. One
+        // bin means bin discovery silently degraded to the walk fallback.
+        assert!(
+            pool.bins.len() > 1,
+            "{addr}: only {} bin(s) discovered — discovery degraded",
+            pool.bins.len()
+        );
+    }
+    Ok(())
+}

@@ -1,14 +1,14 @@
 //! RPC-based fetcher for TraderJoe Liquidity Book pools.
 
 use crate::contracts_rpc::RpcILBPair as ILBPair;
-use crate::lb::LBPool;
+use crate::lb::{detect_lb_version, LBPool, LBVersion};
 use crate::TokenInfo;
 use alloy::eips::BlockId;
 use alloy::primitives::aliases::U24;
 use alloy::primitives::{keccak256, Address, B256, U256};
 use alloy::providers::{MulticallBuilder, Provider};
 use anyhow::Result;
-use log::info;
+use log::{info, warn};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -59,7 +59,6 @@ async fn discover_bins_from_tree<P: Provider + Send + Sync>(
     block_number: BlockId,
     base: u64,
 ) -> Result<Vec<u32>> {
-
     // Step 1: Read level0 (1 RPC call)
     let level0: U256 = provider
         .get_storage_at(pool_address, U256::from(base))
@@ -172,6 +171,21 @@ async fn discover_bins_by_walking<P: Provider + Send + Sync>(
     Ok(bin_ids)
 }
 
+/// Storage slot of `_tree.level0` for a given LB version.
+///
+/// v2.1 carries a `uint256 private _status` from ReentrancyGuard that shifts
+/// every subsequent slot by one; v2.2 uses ERC-7201 namespaced storage and
+/// has no such slot.
+fn tree_base_slot(version: LBVersion) -> Option<u64> {
+    match version {
+        LBVersion::V2_2 => Some(LB_TREE_BASE_SLOT_V22),
+        LBVersion::V2_1 => Some(LB_TREE_BASE_SLOT_V21),
+        // v2.0's bin tree is a different on-chain structure whose layout is
+        // not corroborated; it uses the findFirstNonEmptyBinId walk instead.
+        LBVersion::V2_0 => None,
+    }
+}
+
 /// Fetch a TraderJoe Liquidity Book pool from chain.
 ///
 /// Discovers all non-empty bins via storage bitmap reads of the on-chain TreeMath structure.
@@ -184,9 +198,14 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
     multicall_address: Address,
     chain_id: u64,
 ) -> Result<LBPool> {
+    info!("[Chain {}] Fetching LB pool: {}", chain_id, pool_address);
+
+    let version = detect_lb_version(provider, pool_address, multicall_address, block_number)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("{} is not a Trader Joe LB pair", pool_address))?;
     info!(
-        "[Chain {}] Fetching LB pool: {}",
-        chain_id, pool_address
+        "[Chain {}] LB pool {} detected as {:?}",
+        chain_id, pool_address, version
     );
 
     let lb_instance = ILBPair::new(pool_address, provider);
@@ -212,6 +231,25 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
     let static_fees = multicall_result.4?;
     let var_fees = multicall_result.5?;
 
+    let hooks_parameters = if version == LBVersion::V2_2 {
+        lb_instance
+            .getLBHooksParameters()
+            .block(block_number)
+            .call()
+            .await
+            .ok()
+            .filter(|h| !h.is_zero())
+    } else {
+        None
+    };
+    if let Some(h) = hooks_parameters {
+        warn!(
+            "[Chain {}] LB pool {} has hooks installed ({}); observed behaviour \
+             may deviate from pure LB math",
+            chain_id, pool_address, h
+        );
+    }
+
     // ── Resolve tokens ──────────────────────────────────────────────────
     let (token_x, _) = token_info
         .get_or_fetch_token(provider, token_x_raw, multicall_address)
@@ -226,66 +264,54 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
     );
 
     // ── Batch 2: Discover non-empty bins ─────────────────────────────────
-    // Try tree bitmap at v2.2 slot (7), then v2.1 slot (8), then walk fallback
-    let bin_ids = 'discover: {
-        // Try v2.2 storage layout (tree at slot 7)
-        if let Ok(ids) =
-            discover_bins_from_tree(provider, pool_address, block_number, LB_TREE_BASE_SLOT_V22)
+    let bin_ids = match tree_base_slot(version) {
+        Some(base) => {
+            let ids = discover_bins_from_tree(provider, pool_address, block_number, base)
                 .await
-        {
-            if !ids.is_empty() {
-                info!(
-                    "[Chain {}] LB tree bitmap (v2.2, slot 7): discovered {} non-empty bins",
-                    chain_id,
-                    ids.len()
-                );
-                break 'discover ids;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "LB bin tree read failed for {} ({:?}, slot {}): {}",
+                        pool_address,
+                        version,
+                        base,
+                        e
+                    )
+                })?;
+            if ids.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "LB bin tree at slot {} for {} ({:?}) yielded no bins — \
+                     storage layout may have changed",
+                    base,
+                    pool_address,
+                    version
+                ));
             }
+            info!(
+                "[Chain {}] LB tree bitmap ({:?}, slot {}): discovered {} non-empty bins",
+                chain_id,
+                version,
+                base,
+                ids.len()
+            );
+            ids
         }
-
-        // Try v2.1 storage layout (tree at slot 8, shifted by ReentrancyGuard._status)
-        if let Ok(ids) =
-            discover_bins_from_tree(provider, pool_address, block_number, LB_TREE_BASE_SLOT_V21)
-                .await
-        {
-            if !ids.is_empty() {
-                info!(
-                    "[Chain {}] LB tree bitmap (v2.1, slot 8): discovered {} non-empty bins",
-                    chain_id,
-                    ids.len()
-                );
-                break 'discover ids;
+        None => {
+            let ids =
+                discover_bins_by_walking(provider, pool_address, active_id, block_number).await?;
+            if ids.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "LB bin walk for {} ({:?}) yielded no bins",
+                    pool_address,
+                    version
+                ));
             }
-        }
-
-        // Fallback: walk using getNextNonEmptyBin
-        info!(
-            "[Chain {}] LB tree bitmap failed for both v2.2/v2.1, falling back to getNextNonEmptyBin walk",
-            chain_id
-        );
-        match discover_bins_by_walking(provider, pool_address, active_id, block_number).await {
-            Ok(ids) if !ids.is_empty() => {
-                info!(
-                    "[Chain {}] LB walk: discovered {} non-empty bins",
-                    chain_id,
-                    ids.len()
-                );
-                ids
-            }
-            Ok(_) => {
-                info!(
-                    "[Chain {}] LB walk returned empty, using active_id only",
-                    chain_id
-                );
-                vec![active_id]
-            }
-            Err(e) => {
-                info!(
-                    "[Chain {}] LB walk failed ({}), using active_id only",
-                    chain_id, e
-                );
-                vec![active_id]
-            }
+            info!(
+                "[Chain {}] LB bin walk ({:?}): discovered {} non-empty bins",
+                chain_id,
+                version,
+                ids.len()
+            );
+            ids
         }
     };
 
@@ -336,5 +362,7 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
         var_fees.timeOfLastUpdate.to(),
     );
 
-    Ok(pool)
+    Ok(pool
+        .with_version(version)
+        .with_hooks_parameters(hooks_parameters))
 }
