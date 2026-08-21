@@ -296,7 +296,7 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test --features rpc --lib contracts_rpc`
+Run: `cargo test --features collector --lib contracts_rpc`
 Expected: FAIL — `RpcILBPairV20` not found.
 
 - [ ] **Step 3: Create the v2.0 ABI**
@@ -409,7 +409,7 @@ sol! {
 
 - [ ] **Step 6: Run tests to verify they pass**
 
-Run: `cargo test --features rpc --lib contracts_rpc`
+Run: `cargo test --features collector --lib contracts_rpc`
 Expected: PASS — 4 tests.
 
 If `v20_selectors_match_deployed_contracts` fails, the ABI parameter types are wrong — fix the JSON to match the selector, do not change the expected selector. The selectors were read from deployed contracts and are ground truth.
@@ -1303,12 +1303,26 @@ pub fn assert_lb_pools_converge(replayed: &LBPool, fetched: &LBPool, label: &str
     }
 }
 
-async fn converge_one(pool_address: Address, label: &str) -> Result<()> {
+/// `pinned` selects the block range. `None` derives it from the chain head,
+/// which suits busy pools. `Some((a, b))` uses a fixed historical range —
+/// required for pools too quiet to guarantee logs near the head (see the
+/// v2.0 fixture in Task 11). Archive `eth_call` is verified working at
+/// 50,000 blocks back on this endpoint, so pinned ranges resolve.
+async fn converge_one(
+    pool_address: Address,
+    label: &str,
+    pinned: Option<(u64, u64)>,
+) -> Result<()> {
     let provider = Arc::new(ProviderBuilder::new().connect_http(RPC_URL.parse()?));
     let token_info = CachingTokenInfo::new();
 
-    let block_b = provider.get_block_number().await?;
-    let block_a = block_b - REPLAY_BLOCKS;
+    let (block_a, block_b) = match pinned {
+        Some(range) => range,
+        None => {
+            let head = provider.get_block_number().await?;
+            (head - REPLAY_BLOCKS, head)
+        }
+    };
 
     println!("[{label}] replaying {pool_address} from {block_a} to {block_b}");
 
@@ -1357,15 +1371,22 @@ async fn converge_one(pool_address: Address, label: &str) -> Result<()> {
 #[tokio::test]
 #[ignore]
 async fn test_lb_convergence_v22() -> Result<()> {
-    converge_one(V22_POOL, "v2.2").await
+    // Busy pool: ~20 logs per 2000 blocks. Head-derived range is fine.
+    converge_one(V22_POOL, "v2.2", None).await
 }
 
 #[tokio::test]
 #[ignore]
 async fn test_lb_convergence_v21() -> Result<()> {
-    converge_one(V21_POOL, "v2.1").await
+    // Busy pool: ~49 logs per 2000 blocks.
+    converge_one(V21_POOL, "v2.1", None).await
 }
 ```
+
+**Note the `eth_getLogs` block-range cap.** This endpoint rejects ranges wider
+than 2048 blocks (`requested too many blocks ... maximum is set to 2048`), and
+`REPLAY_BLOCKS` is 500, so a single call is fine. If you ever widen the window
+past 2048, the log fetch must be chunked.
 
 - [ ] **Step 2: Run the test and record what fails**
 
@@ -1884,12 +1905,24 @@ Append to `tests/lb_convergence.rs`:
 ```rust
 const V20_POOL: Address = address!("18332988456C4Bd9ABa6698ec748b331516F5A14");
 
+/// The v2.0 pool is nearly dormant — measured at 12 logs across 20,000
+/// blocks, with none at all in the most recent 12,000. A head-derived range
+/// would find zero logs and trip the test's own `!logs.is_empty()` assertion
+/// every run, so this fixture pins a historical window known to contain
+/// Swaps. Re-pin if archive retention ever drops it; the failure is loud.
+const V20_RANGE: (u64, u64) = (93_327_570, 93_335_570);
+
 #[tokio::test]
 #[ignore]
 async fn test_lb_convergence_v20() -> Result<()> {
-    converge_one(V20_POOL, "v2.0").await
+    converge_one(V20_POOL, "v2.0", Some(V20_RANGE)).await
 }
 ```
+
+`V20_RANGE` spans 8,000 blocks, which exceeds this endpoint's 2048-block
+`eth_getLogs` cap — the log fetch for a pinned range must be **chunked into
+2048-block windows** and concatenated in order. Apply the same chunking in
+`converge_one` so the head-derived path stays correct if `REPLAY_BLOCKS` grows.
 
 - [ ] **Step 2: Run it and interpret the result**
 
