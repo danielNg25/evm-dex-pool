@@ -146,10 +146,29 @@ mod tests {
         assert_eq!(RpcILBPair::getVariableFeeParametersCall::SELECTOR, hex!("8d7024e5"));
     }
 
-    /// The two generations' Swap events must be distinguishable by topic0,
-    /// because apply_log dispatches on topic0 alone.
+    /// getLBHooksParameters() is the sole discriminator Task 3 uses to detect v2.2:
+    /// it answers on v2.2 pairs and reverts on v2.1 pairs. Selector verified via
+    /// eth_call against both a live v2.2 pair (returns data) and a live v2.1 pair
+    /// (reverts) on Avalanche C-Chain -- see the fix report for the raw responses.
     #[test]
-    fn swap_topics_differ_between_generations() {
+    fn get_lb_hooks_parameters_selector_matches_deployed_contract() {
+        assert_eq!(RpcILBPair::getLBHooksParametersCall::SELECTOR, hex!("781a8915"));
+    }
+
+    /// Real topic0 values observed on deployed LB pairs via eth_getLogs. Asserting
+    /// equality (not just inequality) means a mistyped parameter -- e.g. v2.0's `id`
+    /// accidentally narrowed to `uint24` to match v2.1's analogous field -- is caught
+    /// here instead of silently producing a topic0 that merely happens to differ.
+    #[test]
+    fn swap_topics_match_deployed_contracts() {
+        assert_eq!(
+            crate::contracts::ILBPair::Swap::SIGNATURE_HASH,
+            hex!("ad7d6f97abf51ce18e17a38f4d70e975be9c0708474987bb3e26ad21bd93ca70")
+        );
+        assert_eq!(
+            crate::contracts::ILBPairV20::Swap::SIGNATURE_HASH,
+            hex!("c528cda9e500228b16ce84fadae290d9a49aecb17483110004c5af0a07f6fd73")
+        );
         assert_ne!(
             crate::contracts::ILBPair::Swap::SIGNATURE_HASH,
             crate::contracts::ILBPairV20::Swap::SIGNATURE_HASH
@@ -161,6 +180,18 @@ mod tests {
         assert_eq!(
             crate::contracts::ILBPair::CompositionFees::SIGNATURE,
             "CompositionFees(address,uint24,bytes32,bytes32)"
+        );
+        assert_eq!(
+            crate::contracts::ILBPair::CompositionFees::SIGNATURE_HASH,
+            hex!("3f0b46725027bb418b2005f4683538eccdbcdf1de2b8649a29dbd9c507d16ff4")
+        );
+    }
+
+    #[test]
+    fn v21_withdrawn_from_bins_topic_matches_deployed_contract() {
+        assert_eq!(
+            crate::contracts::ILBPair::WithdrawnFromBins::SIGNATURE_HASH,
+            hex!("a32e146844d6144a22e94c586715a1317d58a8aa3581ec33d040113ddcb24350")
         );
     }
 }
