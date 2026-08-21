@@ -1745,107 +1745,187 @@ against a fetched 6250."
 
 ---
 
-### Task 8: Composition fee handling
+### Task 8: Pin every convergence range and assert event coverage
 
 **Files:**
-- Modify: `src/lb/pool.rs`
-- Test: `tests/lb_convergence.rs` (rerun)
+- Modify: `tests/common/mod.rs`, `tests/lb_convergence.rs`
+- Test: itself, plus a new unit test in `src/lb/pool.rs`
 
 **Interfaces:**
-- Consumes: `ILBPair::CompositionFees` binding (Task 2).
-- Produces: `LBPool::topics()` includes `CompositionFees`; `apply_log` handles it.
+- Consumes: `converge_one`, `assert_lb_pools_converge` (Task 7).
+- Produces: `converge_one` chunks its log fetch; `assert_range_covers` in `tests/common/mod.rs`.
 
-**Status after Task 7: not settled either way — validate it, do not assume.**
+**Composition fees need no handler — settled, do not implement one.** The
+previous pinned range contained two `CompositionFees` events. `converge_one`
+filters by `LBPool::topics()`, which excludes them, so they were never applied
+— and bins still matched exactly across all 1423 under `u128` equality. Each
+fires in the same transaction as a `DepositedToBins`, so the deposit event
+already reports amounts inclusive of the fee. **Adding a handler would
+double-count and turn a passing gate into a failing one.**
 
-Task 7's convergence run showed bins matching exactly (158/158 and 1423/1423),
-which might look like evidence that composition fees need no handling. It is
-not. Those windows contained **no `CompositionFees` events at all**, so they
-say nothing about the case.
+**Why this task exists.** A green convergence test proves nothing if its range
+never contained the events it claims to exercise. That is not hypothetical
+here — a head-derived range passed against known-broken code because it
+happened to hold no swap pair far enough apart to trigger the bug, and a
+v2.2 run "converged" on 9 logs that were all Swaps.
 
-Measured separately: `CompositionFees` (topic0 `0x3f0b4672…`) fires **7 times
-in 30,000 blocks** on the v2.1 fixture `0x4224f6f4…`, at blocks 93345318,
-93346900, 93343919, 93343044, 93340472, 93336667 and 93333307. Roughly one per
-4,300 blocks — sparse enough that a random 500–2000 block window usually misses
-it, which is exactly what happened.
+Archive access is confirmed: the endpoint serves `eth_call` 10,000,000 blocks
+back, so any historical range is reachable. Live head-derived ranges are
+replaced entirely by fixed ones.
 
-So this task must be validated against a **pinned range containing real
-events**, not a head-derived one:
+- [ ] **Step 1: Chunk the log fetch**
+
+Ranges below span up to 11,000 blocks and `eth_getLogs` rejects anything wider
+than 2048 on this endpoint. In `tests/common/mod.rs`, replace the single
+`provider.get_logs(&filter)` call in `converge_one` with a loop over
+2000-block windows, concatenating in order:
 
 ```rust
-/// Contains two real CompositionFees events (blocks 93345318 and 93346900),
-/// located by scanning the v2.1 pool's logs. A head-derived range almost
-/// always misses them — they occur roughly once per 4,300 blocks.
-const V21_COMPOSITION_FEE_RANGE: (u64, u64) = (93_345_191, 93_347_191);
+    const CHUNK: u64 = 2000;
+    let mut logs = Vec::new();
+    let mut from = block_a + 1;
+    while from <= block_b {
+        let to = (from + CHUNK - 1).min(block_b);
+        let filter = Filter::new()
+            .from_block(from)
+            .to_block(to)
+            .address(pool_address)
+            .event_signature(LBPool::topics());
+        logs.extend(provider.get_logs(&filter).await?);
+        from = to + 1;
+    }
+```
 
-#[tokio::test]
-#[ignore]
-async fn test_lb_convergence_v21_with_composition_fees() -> Result<()> {
-    converge_one(V21_POOL, "v2.1+compfees", Some(V21_COMPOSITION_FEE_RANGE)).await
+- [ ] **Step 2: Add the coverage assertion**
+
+Also in `tests/common/mod.rs`. This is the point of the task — a range that
+stops covering an event must fail loudly rather than pass quietly:
+
+```rust
+/// Assert the replayed range actually contains every event kind named.
+///
+/// Without this a quiet or drifted range yields a green test that exercised
+/// nothing — which has already happened twice on this branch. Prints the
+/// per-topic counts so a shrinking fixture is visible before it hits zero.
+pub fn assert_range_covers(logs: &[Log], required: &[(&str, B256)], label: &str) {
+    for (name, topic) in required {
+        let n = logs.iter().filter(|l| l.topic0() == Some(topic)).count();
+        println!("[{label}] coverage: {name} = {n}");
+        assert!(
+            n > 0,
+            "{label}: pinned range contains no {name} event, so this test \
+             would pass without ever exercising it. Re-pin the range."
+        );
+    }
 }
 ```
 
-Add that test **first**, before touching `apply_log`. If it passes without any
-`CompositionFees` handling, then `DepositedToBins` already reports amounts net
-of the fee and this task's premise is wrong — record that and skip the handler.
-If it fails on bin reserves, implement the handler below and confirm it closes
-the gap. Either outcome is a successful task; assuming is the only failure.
+Call it in `converge_one` immediately after the fetch and before replay.
+The required set for v2.1/v2.2 is every topic `apply_log` handles and that
+occurs on-chain: `ILBPair::Swap`, `ILBPair::DepositedToBins`,
+`ILBPair::WithdrawnFromBins`. Take it as a parameter so Task 11 can pass
+v2.0's set.
 
-Composition fees are charged when liquidity is added to the active bin at a ratio different from the bin's current composition. The fee is credited to that bin's reserves, so ignoring the event leaves replayed reserves short.
+- [ ] **Step 3: Pin every range**
 
-- [ ] **Step 1: Register the topic**
-
-In `impl TopicList for LBPool` in `src/lb/pool.rs`, add to the `topics()` vector:
-
-```rust
-            ILBPair::CompositionFees::SIGNATURE_HASH,
-```
-
-Leave `profitable_topics()` unchanged — a composition fee is not a trade opportunity.
-
-- [ ] **Step 2: Handle the event**
-
-Add an arm to `apply_log`, before the catch-all `_ =>`:
+Replace the head-derived tests. All values below were verified live by
+chunked `eth_getLogs` over the exact ranges given.
 
 ```rust
-            Some(&ILBPair::CompositionFees::SIGNATURE_HASH) => {
-                let data: ILBPair::CompositionFees = event.log_decode()?.inner.data;
-                let id: u32 = data.id.to();
-                // totalFees are credited to the bin; protocolFees are carved
-                // out of them and are not part of the bin's reserves.
-                let (total_x, total_y) = decode_amounts(data.totalFees);
-                let (proto_x, proto_y) = decode_amounts(data.protocolFees);
-                let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
-                self.update_bin(
-                    id,
-                    rx.saturating_add(total_x).saturating_sub(proto_x),
-                    ry.saturating_add(total_y).saturating_sub(proto_y),
-                );
-                self.last_updated = Self::log_timestamp(event);
-                Ok(())
-            }
+/// v2.1. Verified: 302 logs — 282 Swap, 4 DepositedToBins, 4
+/// WithdrawnFromBins, 4 CompositionFees, 8 TransferBatch. Also contains swap
+/// gaps both above and below the pool's 30s filterPeriod, so it exercises
+/// both branches of update_references.
+const V21_RANGE: (u64, u64) = (93_341_000, 93_348_000);
+
+/// v2.2. Verified: 164 logs — 159 Swap, 1 DepositedToBins, 1
+/// WithdrawnFromBins, 1 CompositionFees, 2 TransferBatch. Deliberately
+/// 11,000 blocks wide: this pool's non-Swap events are sparse enough that a
+/// narrow window catches only Swaps, which is how an earlier run "converged"
+/// on 9 logs while exercising one code path.
+const V22_RANGE: (u64, u64) = (93_271_000, 93_282_000);
 ```
 
-- [ ] **Step 3: Rerun the convergence test**
+Point `test_lb_convergence_v21` and `test_lb_convergence_v22` at these.
+**Delete `test_lb_convergence_v21_head`** — head-derived ranges are being
+retired, and it is the specific construct that passed against broken code.
+
+- [ ] **Step 4: Cover `StaticFeeParametersSet` with a unit test**
+
+`apply_log` handles this event, but it **never occurs** — a scan of 120,000
+blocks across all three fixture pools found zero. No pinned range can cover
+it, so the coverage assertion must not require it, and it needs a unit test
+instead. Add to `mod tests` in `src/lb/pool.rs`, following the existing
+`swap_log` helper's construction:
+
+```rust
+    /// StaticFeeParametersSet never fires on any live fixture pool — 120,000
+    /// blocks scanned, zero occurrences — so no convergence range can cover
+    /// this arm. Unit-tested instead, or it would ship unexercised.
+    #[test]
+    fn apply_log_updates_static_fee_parameters() {
+        let mut pool = pool_with_time(1_700_000_000);
+        let event = ILBPair::StaticFeeParametersSet {
+            sender: Address::ZERO,
+            baseFactor: 7777,
+            filterPeriod: 44,
+            decayPeriod: 888,
+            reductionFactor: 4444,
+            variableFeeControl: 55555u32.try_into().unwrap(),
+            protocolShare: 1234,
+            maxVolatilityAccumulator: 222222u32.try_into().unwrap(),
+        };
+        let log = Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_timestamp: Some(1_700_000_500),
+            ..Default::default()
+        };
+        pool.apply_log(&log).unwrap();
+
+        assert_eq!(pool.base_factor, 7777);
+        assert_eq!(pool.filter_period, 44);
+        assert_eq!(pool.decay_period, 888);
+        assert_eq!(pool.reduction_factor, 4444);
+        assert_eq!(pool.variable_fee_control, 55555);
+        assert_eq!(pool.protocol_share, 1234);
+        assert_eq!(pool.max_volatility_accumulator, 222222);
+    }
+```
+
+Check the field names against `contracts/ABI/ILBPair.json` before writing —
+adapt to what `sol!` actually generates, keeping every field asserted.
+
+- [ ] **Step 5: Run and verify coverage output**
 
 Run: `cargo test --features collector test_lb_convergence -- --ignored --nocapture`
-Expected: PASS.
 
-If bins still diverge, the remaining candidate is flash-loan fees, which are credited to bins via a `FlashLoan` event this implementation does not observe. Add that binding and handler the same way before loosening anything.
+Both tests must pass **and** print non-zero counts for all three required
+topics. Paste that coverage output in your report — it is the deliverable.
 
-- [ ] **Step 4: Verify both builds**
+Run: `cargo test --features collector --lib` — the new unit test included.
 
-Run: `cargo check && cargo check --features collector`
-Expected: both succeed.
+- [ ] **Step 6: Verify builds**
 
-- [ ] **Step 5: Commit**
+Run: `cargo check && cargo check --features collector && cargo check --features rpc`
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add src/lb/pool.rs
-git commit -m "fix(lb): apply composition fees to bin reserves
+git add tests/common/mod.rs tests/lb_convergence.rs src/lb/pool.rs
+git commit -m "test(lb): pin every convergence range and assert event coverage
 
-CompositionFees was neither registered as a topic nor handled, so fees
-credited to the active bin on unbalanced deposits were missing from
-replayed state."
+Head-derived ranges made the gate unreliable in both directions: one passed
+against known-broken code, and a v2.2 run converged on 9 logs that were all
+Swaps, exercising a single path. Both ranges are now fixed and verified to
+contain every event apply_log handles, the log fetch chunks to stay under the
+2048-block eth_getLogs cap, and the test asserts coverage rather than assuming
+it — a range that stops covering an event now fails loudly.
+
+StaticFeeParametersSet never occurs on any fixture pool (zero in 120,000
+blocks), so it is unit-tested rather than left unexercised."
 ```
 
 ---
