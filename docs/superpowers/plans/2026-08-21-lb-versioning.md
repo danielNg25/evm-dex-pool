@@ -1015,6 +1015,197 @@ with fetched state."
 
 ---
 
+### Task 5b: Stamp block timestamps onto collector logs
+
+**Files:**
+- Modify: `src/collector/utils.rs`, `src/collector/block_source.rs`, `src/collector/mod.rs`
+- Test: `tests/lb_convergence.rs` uses it (Task 7); unit test in `src/collector/utils.rs`
+
+**Interfaces:**
+- Produces: `pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(provider: &Arc<P>, logs: &mut [Log]) -> Result<()>`, re-exported from `crate::collector`.
+
+**Why this task exists.** Task 5 made `apply_log` read `Log::block_timestamp`,
+falling back to wall clock when absent. Measurement then showed the fallback is
+the *only* branch ever taken: **`blockTimestamp` is not part of a standard
+`eth_getLogs` response, and Avalanche's endpoint omits it entirely.** Confirmed
+by inspecting a live response — the returned keys are `address`, `blockHash`,
+`blockNumber`, `data`, `logIndex`, `removed`, `topics`, `transactionHash`,
+`transactionIndex`, and nothing else.
+
+Neither collector path repairs this: `src/collector/utils.rs` `fetch_events`
+hands `provider.get_logs(&filter)` output straight through, and
+`src/collector/websocket_listener.rs` does the same with `subscribe_logs`. So
+without this task, Task 5's fix is inert in production, `time_of_last_update`
+keeps drifting to wall clock, and **Task 7's convergence test cannot pass.**
+
+- [ ] **Step 1: Write the failing test**
+
+Add to `src/collector/utils.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::{Address, LogData};
+
+    fn log_at(block: u64) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: LogData::new_unchecked(vec![], Default::default()),
+            },
+            block_number: Some(block),
+            block_timestamp: None,
+            ..Default::default()
+        }
+    }
+
+    /// A log that already carries a timestamp must be left alone, and one
+    /// without a block number cannot be enriched — neither should panic.
+    #[test]
+    fn enrichment_targets_only_logs_that_need_it() {
+        let mut logs = vec![log_at(100), log_at(100), log_at(101)];
+        logs[0].block_timestamp = Some(1_700_000_000);
+
+        let need: Vec<u64> = blocks_needing_timestamps(&logs);
+        // Block 100 still needs it (logs[1]), 101 needs it, and the set is
+        // deduplicated so one header fetch serves both logs at block 100.
+        assert_eq!(need, vec![100, 101]);
+
+        let mut none_needed = vec![log_at(7)];
+        none_needed[0].block_timestamp = Some(42);
+        assert!(blocks_needing_timestamps(&none_needed).is_empty());
+    }
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `cargo test --features collector --lib collector::utils`
+Expected: FAIL — `blocks_needing_timestamps` not found.
+
+- [ ] **Step 3: Write the implementation**
+
+Add to `src/collector/utils.rs`:
+
+```rust
+use std::collections::{BTreeSet, HashMap};
+
+/// Distinct block numbers among logs that still lack a timestamp.
+///
+/// Deduplicated so one header fetch serves every log in that block.
+fn blocks_needing_timestamps(logs: &[Log]) -> Vec<u64> {
+    logs.iter()
+        .filter(|l| l.block_timestamp.is_none())
+        .filter_map(|l| l.block_number)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Populate `block_timestamp` on logs whose RPC response omitted it.
+///
+/// `blockTimestamp` is not part of a standard `eth_getLogs` response and many
+/// endpoints — Avalanche's among them — never send it, so logs arrive with
+/// `block_timestamp: None`. LB pools need chain time to reproduce the
+/// contract's volatility decay, and wall clock is not a substitute: it makes
+/// event-replayed state diverge from freshly-fetched state permanently.
+///
+/// Fetches one header per distinct block, concurrently. Logs whose block
+/// header cannot be read are left with `None`, so callers keep whatever
+/// fallback they already have rather than getting a wrong timestamp.
+pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    logs: &mut [Log],
+) -> Result<()> {
+    let wanted = blocks_needing_timestamps(logs);
+    if wanted.is_empty() {
+        return Ok(());
+    }
+
+    let futures = wanted.iter().map(|&n| {
+        let provider = provider.clone();
+        async move {
+            let block = provider
+                .get_block_by_number(BlockNumberOrTag::Number(n))
+                .await
+                .ok()
+                .flatten();
+            (n, block.map(|b| b.header.timestamp))
+        }
+    });
+    let fetched: HashMap<u64, u64> = futures_util::future::join_all(futures)
+        .await
+        .into_iter()
+        .filter_map(|(n, ts)| ts.map(|t| (n, t)))
+        .collect();
+
+    for log in logs.iter_mut() {
+        if log.block_timestamp.is_none() {
+            if let Some(n) = log.block_number {
+                log.block_timestamp = fetched.get(&n).copied();
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+Re-export from `src/collector/mod.rs` — `pub use utils::*;` already covers it,
+so verify rather than adding a duplicate export.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `cargo test --features collector --lib collector::utils`
+Expected: PASS.
+
+- [ ] **Step 5: Call it from every BlockSource**
+
+In `src/collector/block_source.rs`, enrich the log vector immediately before
+each `Ok(EventBatch { .. })` return that carries events — in
+`PendingBlockSource::next_batch`, `LatestBlockSource::next_batch`, and
+`WebsocketBlockSource::next_batch`.
+
+**Guard the cost.** This adds one `eth_getBlockByNumber` per distinct block
+with events, on the collector's hot path. Only LB pools need it, so skip the
+work entirely when the registry holds none:
+
+```rust
+if !self
+    .pool_registry
+    .get_addresses_by_type(PoolType::TraderJoeLB)
+    .is_empty()
+{
+    enrich_log_timestamps(&self.provider, &mut events).await?;
+}
+```
+
+A deployment with no LB pools therefore pays nothing, and a deployment with
+them pays a handful of extra calls per batch — the price of correct quotes.
+
+- [ ] **Step 6: Verify builds and regression**
+
+Run: `cargo check && cargo check --features collector && cargo check --features rpc`
+Run: `cargo test --features collector --lib`
+Expected: all pass.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/collector/utils.rs src/collector/block_source.rs src/collector/mod.rs
+git commit -m "fix(collector): stamp block timestamps onto logs
+
+blockTimestamp is not part of a standard eth_getLogs response and Avalanche
+omits it, so every log reached apply_log with block_timestamp: None and took
+the wall-clock fallback. That left the previous commit inert in production and
+made event-replayed state unable to converge with freshly-fetched state.
+
+Fetches one header per distinct block, concurrently, and only when the registry
+actually holds LB pools — no other pool type has time-dependent state."
+```
+
+---
+
 ### Task 6: `QuoteContext` and time-aware trait methods
 
 **Files:**
@@ -1237,6 +1428,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::Filter;
 use anyhow::Result;
 
+use evm_dex_pool::collector::enrich_log_timestamps;
 use evm_dex_pool::lb::{fetch_lb_pool, LBPool};
 use evm_dex_pool::{EventApplicable, TokenInfo, TopicList};
 
@@ -1356,9 +1548,20 @@ async fn converge_one(
         .to_block(block_b)
         .address(pool_address)
         .event_signature(LBPool::topics());
-    let logs = provider.get_logs(&filter).await?;
+    let mut logs = provider.get_logs(&filter).await?;
     println!("[{label}] applying {} logs", logs.len());
     assert!(!logs.is_empty(), "{label}: no logs in range — widen REPLAY_BLOCKS");
+
+    // Required, not optional: `eth_getLogs` does not return `blockTimestamp`,
+    // so every log arrives with `block_timestamp: None` and `apply_log` would
+    // fall back to wall clock — guaranteeing `time_of_last_update` diverges
+    // from the refetched value and failing this test for the wrong reason.
+    // This is the same helper the collector's BlockSource uses (Task 5b).
+    enrich_log_timestamps(&provider, &mut logs).await?;
+    assert!(
+        logs.iter().all(|l| l.block_timestamp.is_some()),
+        "{label}: some logs still lack a block timestamp after enrichment"
+    );
 
     for log in &logs {
         replayed.apply_log(log)?;
