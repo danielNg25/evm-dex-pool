@@ -591,6 +591,18 @@ impl EventApplicable for LBPool {
                 // the bin loop, using PRE-swap state. It reads self.active_id
                 // for id_ref and self.time_of_last_update for dt, so it must
                 // run before either is overwritten below.
+                //
+                // Invariant this relies on: one on-chain swap() that crosses N
+                // bins emits N Swap logs, so replay calls update_references()
+                // N times where the contract called it once. Logs 2..N are
+                // no-ops *only because* filter_period > 0 — the first log sets
+                // time_of_last_update to the block timestamp, so the rest see
+                // dt == 0 and fail the `dt >= self.filter_period` guard in
+                // update_references(). With filter_period == 0 that guard
+                // would fire on every log and corrupt both references. Every
+                // Trader Joe preset in use has filter_period in [10, 300]
+                // (30 for this pool), so it is unreachable today, but this
+                // call site is only correct while that holds.
                 let ts = Self::log_timestamp(event);
                 let (vol_ref, id_ref) = self.update_references(ts);
                 self.volatility_reference = vol_ref;

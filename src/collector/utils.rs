@@ -3,6 +3,7 @@ use alloy::primitives::{Address, FixedBytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use anyhow::Result;
+use log::warn;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 pub async fn fetch_events<P: Provider + Send + Sync>(
@@ -70,6 +71,21 @@ pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(
         .into_iter()
         .filter_map(|(n, ts)| ts.map(|t| (n, t)))
         .collect();
+
+    // A block whose header could not be read leaves every log in it on the
+    // caller's fallback (wall clock, for `LBPool::apply_log`). That fallback
+    // now feeds `update_references`'s `dt` calculation directly, so silent
+    // degradation here can zero out `volatility_reference` mid-replay. Loud
+    // by design: this is exactly the failure mode the timestamp-enrichment
+    // path exists to prevent.
+    if fetched.len() < wanted.len() {
+        warn!(
+            "enrich_log_timestamps: resolved {} of {} requested block headers; \
+             logs in unresolved blocks keep their wall-clock fallback timestamp",
+            fetched.len(),
+            wanted.len()
+        );
+    }
 
     for log in logs.iter_mut() {
         if log.block_timestamp.is_none() {
