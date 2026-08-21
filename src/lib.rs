@@ -19,7 +19,8 @@ pub use utils::create_fallback_provider;
 // Core traits and types
 pub use pool::MockPool;
 pub use pool::{
-    EventApplicable, PoolInterface, PoolType, PoolTypeTrait, Topic, TopicList, POOL_CREATED_TOPICS,
+    EventApplicable, PoolInterface, PoolType, PoolTypeTrait, QuoteContext, Topic, TopicList,
+    POOL_CREATED_TOPICS,
 };
 
 // V2

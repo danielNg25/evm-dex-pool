@@ -4,7 +4,7 @@ use crate::contracts::ILBPair;
 use crate::lb::math::*;
 use crate::lb::version::LBVersion;
 use crate::pool::base::{
-    EventApplicable, PoolInterface, PoolType, PoolTypeTrait, Topic, TopicList,
+    EventApplicable, PoolInterface, PoolType, PoolTypeTrait, QuoteContext, Topic, TopicList,
 };
 use alloy::primitives::{Address, B256, U256};
 use alloy::rpc::types::Log;
@@ -442,6 +442,66 @@ impl PoolInterface for LBPool {
         Ok(U256::from(amount_in))
     }
 
+    fn calculate_output_at(
+        &self,
+        token_in: &Address,
+        amount_in: U256,
+        ctx: &QuoteContext,
+    ) -> Result<U256> {
+        let swap_for_y = if token_in == &self.token_x {
+            true
+        } else if token_in == &self.token_y {
+            false
+        } else {
+            return Err(anyhow!("Token {} not in LB pool {}", token_in, self.address));
+        };
+
+        let amount_in_128: u128 = amount_in
+            .try_into()
+            .map_err(|_| anyhow!("Amount too large for LB pool (exceeds u128)"))?;
+
+        let (amount_in_left, amount_out, _fee) =
+            self.simulate_swap_out_at(amount_in_128, swap_for_y, ctx.timestamp)?;
+        if amount_in_left > 0 {
+            return Err(anyhow!(
+                "Insufficient liquidity in LB pool: {} of {} input remaining",
+                amount_in_left,
+                amount_in_128
+            ));
+        }
+        Ok(U256::from(amount_out))
+    }
+
+    fn calculate_input_at(
+        &self,
+        token_out: &Address,
+        amount_out: U256,
+        ctx: &QuoteContext,
+    ) -> Result<U256> {
+        let swap_for_y = if token_out == &self.token_y {
+            true
+        } else if token_out == &self.token_x {
+            false
+        } else {
+            return Err(anyhow!("Token {} not in LB pool {}", token_out, self.address));
+        };
+
+        let amount_out_128: u128 = amount_out
+            .try_into()
+            .map_err(|_| anyhow!("Amount too large for LB pool (exceeds u128)"))?;
+
+        let (amount_in, amount_out_left, _fee) =
+            self.simulate_swap_in_at(amount_out_128, swap_for_y, ctx.timestamp)?;
+        if amount_out_left > 0 {
+            return Err(anyhow!(
+                "Insufficient liquidity in LB pool: {} of {} output remaining",
+                amount_out_left,
+                amount_out_128
+            ));
+        }
+        Ok(U256::from(amount_in))
+    }
+
     fn apply_swap(
         &mut self,
         _token_in: &Address,
@@ -699,5 +759,33 @@ mod tests {
             "expected a wall-clock fallback near now, got {}",
             pool.time_of_last_update
         );
+    }
+
+    use crate::pool::base::QuoteContext;
+
+    /// A later timestamp decays the volatility accumulator, so quoting the
+    /// same input at two different times must be able to differ.
+    #[test]
+    fn calculate_output_at_honours_the_supplied_timestamp() {
+        let mut pool = pool_with_time(1_700_000_000);
+        pool.volatility_accumulator = 300_000;
+        pool.volatility_reference = 300_000;
+
+        let early = pool
+            .calculate_output_at(
+                &pool.token_x.clone(),
+                U256::from(1_000u64),
+                &QuoteContext { timestamp: 1_700_000_000 },
+            )
+            .unwrap();
+        let late = pool
+            .calculate_output_at(
+                &pool.token_x.clone(),
+                U256::from(1_000u64),
+                &QuoteContext { timestamp: 1_700_100_000 },
+            )
+            .unwrap();
+
+        assert!(early <= late, "decayed volatility should not raise the fee");
     }
 }

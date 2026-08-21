@@ -20,12 +20,45 @@ pub trait PoolTypeTrait: Send + Sync {
     fn pool_type(&self) -> PoolType;
 }
 
+/// Context for a quote whose result depends on when the swap executes.
+///
+/// Only pool types with time-dependent state consult this — currently only
+/// Trader Joe LB, whose variable fee decays against `timeOfLastUpdate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuoteContext {
+    /// Block timestamp the swap is expected to execute at, in seconds.
+    pub timestamp: u64,
+}
+
 pub trait PoolInterface: std::fmt::Debug + Send + Sync + PoolTypeTrait + EventApplicable {
     /// Calculate output amount for a swap given an input amount and token
     fn calculate_output(&self, token_in: &Address, amount_in: U256) -> Result<U256>;
 
     /// Calculate input amount for a swap given an output amount and token
     fn calculate_input(&self, token_out: &Address, amount_out: U256) -> Result<U256>;
+
+    /// Time-aware variant of [`calculate_output`].
+    ///
+    /// Defaults to the timeless form, which is correct for every pool type
+    /// with no time-dependent state (V2, V3, ERC4626).
+    fn calculate_output_at(
+        &self,
+        token_in: &Address,
+        amount_in: U256,
+        _ctx: &QuoteContext,
+    ) -> Result<U256> {
+        self.calculate_output(token_in, amount_in)
+    }
+
+    /// Time-aware variant of [`calculate_input`].
+    fn calculate_input_at(
+        &self,
+        token_out: &Address,
+        amount_out: U256,
+        _ctx: &QuoteContext,
+    ) -> Result<U256> {
+        self.calculate_input(token_out, amount_out)
+    }
 
     /// Apply a swap to the pool state
     fn apply_swap(&mut self, token_in: &Address, amount_in: U256, amount_out: U256) -> Result<()>;
