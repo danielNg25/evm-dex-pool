@@ -64,6 +64,19 @@
     },
     {
         "type": "function",
+        "name": "getLBHooksParameters",
+        "inputs": [],
+        "outputs": [
+            {
+                "name": "",
+                "type": "bytes32",
+                "internalType": "bytes32"
+            }
+        ],
+        "stateMutability": "view"
+    },
+    {
+        "type": "function",
         "name": "getNextNonEmptyBin",
         "inputs": [
             {
@@ -268,6 +281,37 @@
             }
         ],
         "stateMutability": "view"
+    },
+    {
+        "type": "event",
+        "name": "CompositionFees",
+        "inputs": [
+            {
+                "name": "sender",
+                "type": "address",
+                "indexed": true,
+                "internalType": "address"
+            },
+            {
+                "name": "id",
+                "type": "uint24",
+                "indexed": false,
+                "internalType": "uint24"
+            },
+            {
+                "name": "totalFees",
+                "type": "bytes32",
+                "indexed": false,
+                "internalType": "bytes32"
+            },
+            {
+                "name": "protocolFees",
+                "type": "bytes32",
+                "indexed": false,
+                "internalType": "bytes32"
+            }
+        ],
+        "anonymous": false
     },
     {
         "type": "event",

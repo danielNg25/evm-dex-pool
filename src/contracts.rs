@@ -39,6 +39,12 @@ sol! {
     "contracts/ABI/ILBPair.json"
 }
 
+// LB v2.0 event contracts (distinct ABI from v2.1+)
+sol! {
+    ILBPairV20,
+    "contracts/ABI/ILBPairV20.json"
+}
+
 // Factory event contracts (for POOL_CREATED_TOPICS)
 sol! {
     IUniswapV2Factory,
