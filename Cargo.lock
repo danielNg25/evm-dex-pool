@@ -1713,6 +1713,7 @@ dependencies = [
  "log",
  "num-traits",
  "serde",
+ "serde_json",
  "tokio",
  "tower",
  "uniswap_v3_math",

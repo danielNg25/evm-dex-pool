@@ -2,10 +2,11 @@
 
 use crate::contracts::ILBPair;
 use crate::lb::math::*;
+use crate::lb::version::LBVersion;
 use crate::pool::base::{
     EventApplicable, PoolInterface, PoolType, PoolTypeTrait, Topic, TopicList,
 };
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{anyhow, Result};
@@ -22,6 +23,10 @@ use std::fmt;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LBPool {
     pub address: Address,
+    /// LB protocol generation. Defaults to v2.1 for snapshots persisted
+    /// before v2.0 support existed.
+    #[serde(default)]
+    pub version: LBVersion,
     pub token_x: Address,
     pub token_y: Address,
     pub bin_step: u16,
@@ -49,6 +54,11 @@ pub struct LBPool {
 
     pub last_updated: u64,
     pub created_at: u64,
+
+    /// v2.2 only. `Some(non-zero)` means the pair has hooks installed and its
+    /// observable behaviour may deviate from pure LB math.
+    #[serde(default)]
+    pub hooks_parameters: Option<B256>,
 }
 
 impl LBPool {
@@ -75,6 +85,7 @@ impl LBPool {
         let now = chrono::Utc::now().timestamp() as u64;
         Self {
             address,
+            version: LBVersion::default(),
             token_x,
             token_y,
             bin_step,
@@ -93,7 +104,20 @@ impl LBPool {
             time_of_last_update,
             last_updated: now,
             created_at: now,
+            hooks_parameters: None,
         }
+    }
+
+    /// Set the protocol version. Chainable after `new`.
+    pub fn with_version(mut self, version: LBVersion) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// Set the v2.2 hooks parameters. Chainable after `new`.
+    pub fn with_hooks_parameters(mut self, hooks: Option<B256>) -> Self {
+        self.hooks_parameters = hooks;
+        self
     }
 
     /// Current total fee in 1e18 precision.
