@@ -47,11 +47,12 @@ const REQUIRED_TOPICS: [(&str, B256); 3] = [
 /// v2.0 pools. Deliberately just two.
 ///
 /// `DepositedToBin` and `CompositionFee` are excluded because they fire
-/// **zero** times in 500,000 blocks on the v2.0 fixture — this pool is
-/// deprecated and holders are only exiting it, never adding. Naming them
-/// here would make the coverage assertion fail correctly and permanently,
-/// with no range able to satisfy it. Those two arms are unit-tested instead,
-/// in `v20_liquidity_events_update_bins` in `src/lb/pool.rs`.
+/// **zero** times in the most recent 500,000 blocks on the v2.0 fixture —
+/// this pool is deprecated and holders are only exiting it, never adding.
+/// Its mint traffic is all from 2022 (blocks ~22.45M), far outside any range
+/// this suite would pin, so naming them here would make the coverage
+/// assertion fail correctly and permanently. Those two arms are unit-tested
+/// instead, in `v20_liquidity_events_update_bins` in `src/lb/pool.rs`.
 const V20_REQUIRED_TOPICS: [(&str, B256); 2] = [
     ("Swap", ILBPairV20::Swap::SIGNATURE_HASH),
     (
@@ -116,8 +117,8 @@ async fn test_lb_convergence_v21() -> Result<()> {
 ///
 /// This is the ONLY 2,000-block window in 300,000 containing both a Swap and
 /// a WithdrawnFromBin. `DepositedToBin` and `CompositionFee` do not occur at
-/// all in 500,000 blocks — see `v20_liquidity_events_update_bins` in
-/// `src/lb/pool.rs` for their coverage.
+/// all in the most recent 500,000 blocks — see `v20_liquidity_events_update_bins`
+/// in `src/lb/pool.rs` for their coverage.
 ///
 /// Expect this test to take ~40s: v2.0 has no corroborated bin-tree layout,
 /// so each of the two fetches walks bins sequentially (~19s for 68 bins).

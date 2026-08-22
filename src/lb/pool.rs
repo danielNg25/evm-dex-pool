@@ -666,10 +666,16 @@ impl EventApplicable for LBPool {
             }
             Some(&ILBPairV20::Swap::SIGNATURE_HASH) => {
                 let d: ILBPairV20::Swap = event.log_decode()?.inner.data;
-                let id: u32 = d.id.to();
-                // Fail loudly rather than saturating: an amount that does not
-                // fit u128 is malformed, and clamping to u128::MAX would
-                // corrupt the bin silently.
+                // v2.0's event ABI widens every one of these to uint256, so the
+                // narrowing is only safe by contract invariant (uint24 ids,
+                // uint112 reserves, uint24 accumulators). Fail loudly rather
+                // than truncating, clamping or panicking: `U256::to()` here
+                // would panic inside the collector task while holding the pool
+                // write lock, which stops every pool update process-wide.
+                // Returning `Err` is what every caller already handles.
+                let id: u32 =
+                    d.id.try_into()
+                        .map_err(|_| anyhow!("v2.0 Swap bin id exceeds u32"))?;
                 let amount_in: u128 = d
                     .amountIn
                     .try_into()
@@ -701,61 +707,55 @@ impl EventApplicable for LBPool {
                 self.id_reference = id_ref;
 
                 self.active_id = id;
-                self.volatility_accumulator = d.volatilityAccumulated.to();
+                self.volatility_accumulator = d
+                    .volatilityAccumulated
+                    .try_into()
+                    .map_err(|_| anyhow!("v2.0 Swap volatilityAccumulated exceeds u32"))?;
                 self.time_of_last_update = ts;
                 // last_updated is local bookkeeping and stays wall clock.
                 self.last_updated = chrono::Utc::now().timestamp() as u64;
                 Ok(())
             }
             Some(&ILBPairV20::DepositedToBin::SIGNATURE_HASH) => {
+                // These amounts are already NET of the mint composition fee and
+                // are exactly the delta applied to the bin's reserves, so this
+                // arm alone reproduces the mint. v2.0's `CompositionFee` is
+                // deliberately unhandled — see `topics()`.
                 let d: ILBPairV20::DepositedToBin = event.log_decode()?.inner.data;
-                let id: u32 = d.id.to();
+                let id: u32 =
+                    d.id.try_into()
+                        .map_err(|_| anyhow!("v2.0 DepositedToBin bin id exceeds u32"))?;
+                let add_x: u128 = d
+                    .amountX
+                    .try_into()
+                    .map_err(|_| anyhow!("v2.0 DepositedToBin amountX exceeds u128"))?;
+                let add_y: u128 = d
+                    .amountY
+                    .try_into()
+                    .map_err(|_| anyhow!("v2.0 DepositedToBin amountY exceeds u128"))?;
                 let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
-                self.update_bin(
-                    id,
-                    rx.saturating_add(d.amountX.try_into().unwrap_or(0)),
-                    ry.saturating_add(d.amountY.try_into().unwrap_or(0)),
-                );
+                self.update_bin(id, rx.saturating_add(add_x), ry.saturating_add(add_y));
                 self.last_updated = Self::log_timestamp(event);
                 Ok(())
             }
             Some(&ILBPairV20::WithdrawnFromBin::SIGNATURE_HASH) => {
                 let d: ILBPairV20::WithdrawnFromBin = event.log_decode()?.inner.data;
-                let id: u32 = d.id.to();
+                let id: u32 =
+                    d.id.try_into()
+                        .map_err(|_| anyhow!("v2.0 WithdrawnFromBin bin id exceeds u32"))?;
+                // `unwrap_or(0)` would subtract nothing and leave liquidity in
+                // the bin that was actually withdrawn — an over-quote. Reject
+                // the log instead.
+                let sub_x: u128 = d
+                    .amountX
+                    .try_into()
+                    .map_err(|_| anyhow!("v2.0 WithdrawnFromBin amountX exceeds u128"))?;
+                let sub_y: u128 = d
+                    .amountY
+                    .try_into()
+                    .map_err(|_| anyhow!("v2.0 WithdrawnFromBin amountY exceeds u128"))?;
                 let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
-                self.update_bin(
-                    id,
-                    rx.saturating_sub(d.amountX.try_into().unwrap_or(0)),
-                    ry.saturating_sub(d.amountY.try_into().unwrap_or(0)),
-                );
-                self.last_updated = Self::log_timestamp(event);
-                Ok(())
-            }
-            Some(&ILBPairV20::CompositionFee::SIGNATURE_HASH) => {
-                // UNSETTLED, and deliberately left so. Adding the fee assumes
-                // DepositedToBin reports amounts NET of the composition fee,
-                // making this the separate accounting entry that puts the fee
-                // into the bin. That is wrong if v2.0 instead routes the
-                // composition fee down its claimable-fee path — v2.0 has
-                // collectFees/pendingFees, where v2.1+ auto-compounds — in
-                // which case the deposit already covered it and this
-                // double-counts.
-                //
-                // Nothing decides it today: CompositionFee fires zero times in
-                // 500,000 blocks on the v2.0 fixture pool, so no convergence
-                // range exercises this arm. The v2.1+ side of the question is
-                // settled the other way (its CompositionFees rides the same tx
-                // as a fee-INCLUSIVE DepositedToBins, so it gets no handler at
-                // all); v2.0 may or may not match. If a widened v2.0 range ever
-                // fails on bin reserves, look here first.
-                let d: ILBPairV20::CompositionFee = event.log_decode()?.inner.data;
-                let id: u32 = d.id.to();
-                let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
-                self.update_bin(
-                    id,
-                    rx.saturating_add(d.feesX.try_into().unwrap_or(0)),
-                    ry.saturating_add(d.feesY.try_into().unwrap_or(0)),
-                );
+                self.update_bin(id, rx.saturating_sub(sub_x), ry.saturating_sub(sub_y));
                 self.last_updated = Self::log_timestamp(event);
                 Ok(())
             }
@@ -770,6 +770,44 @@ impl EventApplicable for LBPool {
 // ─── TopicList ───────────────────────────────────────────────────────────────
 
 impl TopicList for LBPool {
+    /// Neither generation's mint-composition-fee event is subscribed to, and
+    /// for the same reason: the deposit event alone already carries the bin's
+    /// full reserve delta.
+    ///
+    /// SETTLED for v2.0, from source and from chain. On an unbalanced mint into
+    /// the active bin, joe-v2 v2.0.0 `LBPair.sol` computes the composition fee,
+    /// then:
+    ///
+    /// ```text
+    /// _mintInfo.amountX -= _fees.total;              // fee taken off the deposit
+    /// _bin.updateFees(_pair.feesX, _fees, ...);      // fee -> bin.accTokenXPerShare
+    /// ...
+    /// _bin.reserveX += uint112(_mintInfo.amountX);   // NET amount hits the reserve
+    /// emit DepositedToBin(..., _mintInfo.amountX, _mintInfo.amountY);
+    /// ```
+    ///
+    /// `updateFees` touches only `accTokenXPerShare`/`accTokenYPerShare` — the
+    /// claimable-fee accumulator behind `pendingFees`/`collectFees` — never
+    /// `reserveX`/`reserveY`, which is all `getBin()` reads. So `DepositedToBin`
+    /// reports precisely the reserve change, and a `CompositionFee` handler
+    /// that added the fee on top would credit the bin twice, permanently and
+    /// compounding on every unbalanced mint, overstating the active bin and
+    /// making `calculate_output` promise more than the pair can deliver.
+    ///
+    /// Confirmed on Avalanche against the v2.0 fixture pair
+    /// `0x18332988456C4Bd9ABa6698ec748b331516F5A14`, on four mint blocks each
+    /// holding exactly one transaction and no swap or burn. The clearest:
+    /// tx `0xf2487ef13cac53fd66f0b80388a1d266d85f76b72110de3524edfac6f00eb377`
+    /// (block 22_456_848, bin 8_388_609) emits `DepositedToBin(4_639_080,
+    /// 4_641_008)` and `CompositionFee(609, 0)`, while `getBin(8_388_609)`
+    /// moves (392_057_754, 1_901_436_162) → (396_696_834, 1_906_077_170), a
+    /// delta of exactly (4_639_080, 4_641_008). Adding the fee would have
+    /// predicted (4_639_689, 4_641_008). Blocks 22_454_911, 22_456_447 and
+    /// 22_457_012 agree.
+    ///
+    /// v2.1+ reaches the same conclusion from the other direction: its
+    /// `CompositionFees` rides the same transaction as a fee-INCLUSIVE
+    /// `DepositedToBins`, so handling it would double-count too.
     fn topics() -> Vec<Topic> {
         vec![
             ILBPair::Swap::SIGNATURE_HASH,
@@ -779,7 +817,6 @@ impl TopicList for LBPool {
             ILBPairV20::Swap::SIGNATURE_HASH,
             ILBPairV20::DepositedToBin::SIGNATURE_HASH,
             ILBPairV20::WithdrawnFromBin::SIGNATURE_HASH,
-            ILBPairV20::CompositionFee::SIGNATURE_HASH,
         ]
     }
 
@@ -1039,17 +1076,24 @@ mod tests {
         assert_eq!(pool.bins.get(&8_388_610).copied(), Some((1_000, 500)));
     }
 
-    /// v2.0 deposit/withdraw/composition-fee arms move the right bin.
+    /// v2.0 deposit/withdraw move the right bin, and `CompositionFee` moves
+    /// nothing.
     ///
     /// Unit-tested rather than covered by `test_lb_convergence_v20`, because
-    /// `DepositedToBin` and `CompositionFee` fire **zero** times in 500,000
-    /// blocks on the only reachable v2.0 fixture — that pool is deprecated and
-    /// holders only ever exit it. No pinned range can exercise these two arms,
-    /// so do not read the convergence test as covering them; this is their only
+    /// `DepositedToBin` and `CompositionFee` fire **zero** times in the most
+    /// recent 500,000 blocks on the only reachable v2.0 fixture — that pool is
+    /// deprecated and holders only ever exit it. Its mint traffic is all from
+    /// 2022 (blocks ~22.45M), far outside any range that suite pins, so do not
+    /// read the convergence test as covering these arms; this is their only
     /// coverage. `WithdrawnFromBin` is covered both here and there.
     ///
-    /// Every assertion starts from a bin that already holds 1_000_000/1_000_000
-    /// and checks both reserves, so an arm that silently no-ops cannot pass.
+    /// The deposit/withdraw assertions start from a bin that already holds
+    /// 1_000_000/1_000_000 and check both reserves, so an arm that silently
+    /// no-ops cannot pass. The `CompositionFee` assertion is the inverse: v2.0
+    /// takes the composition fee *out* of the amount it then adds to
+    /// `_bin.reserveX` and emits in `DepositedToBin`, routing it to
+    /// `accTokenXPerShare` instead, so crediting the bin again here would
+    /// double-count. See `LBPool::topics()`.
     #[test]
     fn v20_liquidity_events_update_bins() {
         use crate::contracts::ILBPairV20;
@@ -1103,7 +1147,18 @@ mod tests {
         .unwrap();
         assert_eq!(
             pool.bins.get(&8_388_608).copied(),
-            Some((1_000_003, 1_000_004))
+            Some((1_000_000, 1_000_000)),
+            "CompositionFee must not touch bin reserves — DepositedToBin \
+             already carries the full (fee-net) reserve delta"
         );
+    }
+
+    /// v2.0's `CompositionFee` topic must stay out of the subscription: it is
+    /// unhandled by design, and a `topics()` entry would suggest otherwise.
+    #[test]
+    fn v20_composition_fee_is_not_subscribed() {
+        use crate::contracts::ILBPairV20;
+        assert!(!LBPool::topics().contains(&ILBPairV20::CompositionFee::SIGNATURE_HASH));
+        assert_eq!(LBPool::topics().len(), 7);
     }
 }

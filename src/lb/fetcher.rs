@@ -53,12 +53,21 @@ fn set_bits(word: U256) -> Vec<u16> {
 /// - `level2` (mapping(bytes32 => bytes32)): 256 bits per entry (leaf level)
 ///
 /// Bin ID = `(level0_bit << 16) | (level1_bit << 8) | level2_bit`
+///
+/// `Ok(None)` and `Ok(Some(vec![]))` are deliberately different answers:
+/// - `None` — the root bitmap is zero, so the tree is *empty*. That is the
+///   ordinary storage state of a fully-drained or never-funded pair (LBPair's
+///   `_burn` calls `_tree.remove(id)` as each bin empties), and it is a
+///   complete, accurate answer: this pair has no non-empty bins.
+/// - `Some(vec![])` — the root says some level1 group is populated, yet no
+///   leaf was reachable underneath it. The tree contradicts itself, which
+///   points at the storage layout rather than at the pool's liquidity.
 async fn discover_bins_from_tree<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     pool_address: Address,
     block_number: BlockId,
     base: u64,
-) -> Result<Vec<u32>> {
+) -> Result<Option<Vec<u32>>> {
     // Step 1: Read level0 (1 RPC call)
     let level0: U256 = provider
         .get_storage_at(pool_address, U256::from(base))
@@ -66,7 +75,7 @@ async fn discover_bins_from_tree<P: Provider + Send + Sync>(
         .await?;
 
     if level0.is_zero() {
-        return Ok(vec![]);
+        return Ok(None);
     }
 
     let level0_bits = set_bits(level0);
@@ -118,7 +127,7 @@ async fn discover_bins_from_tree<P: Provider + Send + Sync>(
         }
     }
 
-    Ok(bin_ids)
+    Ok(Some(bin_ids))
 }
 
 /// Selector of v2.0's `TreeMath__ErrorDepthSearch()`.
@@ -437,38 +446,89 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
     );
 
     // ── Batch 2: Discover non-empty bins ─────────────────────────────────
-    let bin_ids = match tree_base_slot(version) {
+    let bin_ids: Vec<u32> = match tree_base_slot(version) {
         Some(base) => {
-            let ids = discover_bins_from_tree(provider, pool_address, block_number, base)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "LB bin tree read failed for {} ({:?}, slot {}): {}",
-                        pool_address,
+            match discover_bins_from_tree(provider, pool_address, block_number, base).await {
+                Ok(Some(ids)) => {
+                    if ids.is_empty() {
+                        // A non-zero root with no reachable leaves is the one
+                        // shape a real pool cannot take: a drained pair zeroes
+                        // its root (handled by the `None` arm below), so the
+                        // root and the leaves genuinely disagree here.
+                        return Err(anyhow::anyhow!(
+                            "LB bin tree at slot {} for {} ({:?}): root bitmap is non-zero \
+                             but no leaf bin was reachable under it — storage layout may \
+                             have changed",
+                            base,
+                            pool_address,
+                            version
+                        ));
+                    }
+                    info!(
+                        "[Chain {}] LB tree bitmap ({:?}, slot {}): discovered {} non-empty bins",
+                        chain_id,
                         version,
                         base,
-                        e
+                        ids.len()
+                    );
+                    ids
+                }
+                Ok(None) => {
+                    // Empty tree: a fully-drained or never-funded pair. Register
+                    // it with no bins — `calculate_output` then returns
+                    // "Insufficient liquidity in LB pool", which is the correct
+                    // quote. Erroring instead would fail every retry
+                    // deterministically and abandon every remaining pool in the
+                    // caller's fetch.
+                    info!(
+                        "[Chain {}] LB bin tree ({:?}, slot {}) for {} is empty; \
+                         registering pool with no bins",
+                        chain_id, version, base, pool_address
+                    );
+                    Vec::new()
+                }
+                Err(e) => {
+                    // The storage reads themselves failed. v2.1 and v2.2 both
+                    // expose `getNextNonEmptyBin`, so answer with the walk
+                    // rather than giving up on the pool.
+                    warn!(
+                        "[Chain {}] LB bin tree read failed for {} ({:?}, slot {}): {} — \
+                         falling back to the bin walk",
+                        chain_id, pool_address, version, base, e
+                    );
+                    let ids = discover_bins_by_walking(
+                        provider,
+                        pool_address,
+                        state.active_id,
+                        block_number,
+                        version,
                     )
-                })?;
-            if ids.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "LB bin tree at slot {} for {} ({:?}) yielded no bins — \
-                     storage layout may have changed",
-                    base,
-                    pool_address,
-                    version
-                ));
+                    .await
+                    .map_err(|walk_err| {
+                        anyhow::anyhow!(
+                            "LB bin discovery failed for {} ({:?}): tree read at slot {} \
+                             failed ({}), and the walk fallback also failed ({})",
+                            pool_address,
+                            version,
+                            base,
+                            e,
+                            walk_err
+                        )
+                    })?;
+                    info!(
+                        "[Chain {}] LB bin walk fallback ({:?}): discovered {} non-empty bins",
+                        chain_id,
+                        version,
+                        ids.len()
+                    );
+                    ids
+                }
             }
-            info!(
-                "[Chain {}] LB tree bitmap ({:?}, slot {}): discovered {} non-empty bins",
-                chain_id,
-                version,
-                base,
-                ids.len()
-            );
-            ids
         }
         None => {
+            // The walk seeds itself with `active_id`, so it never returns an
+            // empty vector; a pool whose active bin is empty simply drops out
+            // of `bins` in Batch 3 below.
             let ids = discover_bins_by_walking(
                 provider,
                 pool_address,
@@ -477,13 +537,6 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
                 version,
             )
             .await?;
-            if ids.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "LB bin walk for {} ({:?}) yielded no bins",
-                    pool_address,
-                    version
-                ));
-            }
             info!(
                 "[Chain {}] LB bin walk ({:?}): discovered {} non-empty bins",
                 chain_id,
