@@ -2226,8 +2226,13 @@ Add these arms to `apply_log`, before the catch-all. Note v2.0 carries separate 
             Some(&ILBPairV20::Swap::SIGNATURE_HASH) => {
                 let d: ILBPairV20::Swap = event.log_decode()?.inner.data;
                 let id: u32 = d.id.to();
-                let amount_in: u128 = d.amountIn.try_into().unwrap_or(u128::MAX);
-                let amount_out: u128 = d.amountOut.try_into().unwrap_or(u128::MAX);
+                // Fail loudly rather than saturating: an amount that does not
+                // fit u128 is malformed, and clamping to u128::MAX would
+                // corrupt the bin silently.
+                let amount_in: u128 = d.amountIn.try_into()
+                    .map_err(|_| anyhow!("v2.0 Swap amountIn exceeds u128"))?;
+                let amount_out: u128 = d.amountOut.try_into()
+                    .map_err(|_| anyhow!("v2.0 Swap amountOut exceeds u128"))?;
 
                 let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
                 // swapForY: X goes in, Y comes out.
@@ -2238,12 +2243,23 @@ Add these arms to `apply_log`, before the catch-all. Note v2.0 carries separate 
                 };
                 self.update_bin(id, new_rx, new_ry);
 
+                // Same updateReferences ordering as the v2.1+ arm — see the
+                // comment there. This MUST run on PRE-swap state, so before
+                // active_id / time_of_last_update are overwritten below.
+                // Writing `id_reference = id` here instead was the exact bug
+                // Task 7b found on v2.1: it sets the reference to the swap's
+                // FINAL bin rather than the pre-swap activeId, and never
+                // writes volatility_reference at all.
+                let ts = Self::log_timestamp(event);
+                let (vol_ref, id_ref) = self.update_references(ts);
+                self.volatility_reference = vol_ref;
+                self.id_reference = id_ref;
+
                 self.active_id = id;
                 self.volatility_accumulator = d.volatilityAccumulated.to();
-                self.id_reference = id;
-                let now = Self::log_timestamp(event);
-                self.time_of_last_update = now;
-                self.last_updated = now;
+                self.time_of_last_update = ts;
+                // last_updated is local bookkeeping and stays wall clock.
+                self.last_updated = chrono::Utc::now().timestamp() as u64;
                 Ok(())
             }
             Some(&ILBPairV20::DepositedToBin::SIGNATURE_HASH) => {
