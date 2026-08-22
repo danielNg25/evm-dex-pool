@@ -732,6 +732,22 @@ impl EventApplicable for LBPool {
                 Ok(())
             }
             Some(&ILBPairV20::CompositionFee::SIGNATURE_HASH) => {
+                // UNSETTLED, and deliberately left so. Adding the fee assumes
+                // DepositedToBin reports amounts NET of the composition fee,
+                // making this the separate accounting entry that puts the fee
+                // into the bin. That is wrong if v2.0 instead routes the
+                // composition fee down its claimable-fee path — v2.0 has
+                // collectFees/pendingFees, where v2.1+ auto-compounds — in
+                // which case the deposit already covered it and this
+                // double-counts.
+                //
+                // Nothing decides it today: CompositionFee fires zero times in
+                // 500,000 blocks on the v2.0 fixture pool, so no convergence
+                // range exercises this arm. The v2.1+ side of the question is
+                // settled the other way (its CompositionFees rides the same tx
+                // as a fee-INCLUSIVE DepositedToBins, so it gets no handler at
+                // all); v2.0 may or may not match. If a widened v2.0 range ever
+                // fails on bin reserves, look here first.
                 let d: ILBPairV20::CompositionFee = event.log_decode()?.inner.data;
                 let id: u32 = d.id.to();
                 let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
