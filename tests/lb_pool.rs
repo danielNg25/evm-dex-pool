@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
 use alloy::providers::{MulticallBuilder, Provider, ProviderBuilder};
 use alloy::sol;
 use anyhow::Result;
@@ -52,6 +52,34 @@ sol! {
     #[sol(rpc)]
     interface IERC20 {
         function decimals() external view returns (uint8);
+    }
+}
+
+/// LB v2.0 router on Avalanche. v2.0 pairs expose no on-pair quoter, so the
+/// on-chain reference for exact-in comes from the router.
+///
+/// Verified live before this test was written, rather than assumed: the
+/// deployed bytecode (22,857 bytes) contains selector `0x2004b724` —
+/// `getSwapOut(address,uint256,bool)`, the signature below — alongside
+/// `oldFactory()`, `wavax()` and `getSwapIn(address,uint256,bool)`, which
+/// together identify it as the v2.0 router rather than a later generation
+/// (v2.1's quoter is `getSwapOut(address,uint128,bool)` = `0xa0d376cf`,
+/// absent here).
+const V20_ROUTER: &str = "0xE3Ffc583dC176575eEA7FD9dF2A7c65F7E23f4C3";
+
+/// v2.0 pools to check quote parity on. This is USDC.e/USDC with binStep 1
+/// and **6-decimal** tokens on both sides — not the 18-decimal pair the name
+/// "WAVAX/USDC" would suggest — so amounts must be scaled by
+/// `fuzz_amounts(decimals)`, never by a hardcoded 1e18-shaped constant.
+const V20_TEST_POOLS: &[&str] = &[
+    "0x18332988456C4Bd9ABa6698ec748b331516F5A14", // USDC.e/USDC, binStep 1
+];
+
+sol! {
+    #[sol(rpc)]
+    interface ILBRouterV20 {
+        function getSwapOut(address lbPair, uint256 amountIn, bool swapForY)
+            external view returns (uint256 amountOut, uint256 feesIn);
     }
 }
 
@@ -251,15 +279,13 @@ async fn test_lb_fuzz() -> Result<()> {
         }
 
         // ── Step 2: Batch on-chain calls (separate multicall per return type) ──
-        let mut mc_out =
-            MulticallBuilder::new_dynamic(&provider).address(multicall_address);
+        let mut mc_out = MulticallBuilder::new_dynamic(&provider).address(multicall_address);
         for c in &out_cases {
             mc_out = mc_out.add_dynamic(lb_view.getSwapOut(c.amount, c.swap_for_y));
         }
         let chain_out_results = mc_out.block(block_id).aggregate().await?;
 
-        let mut mc_in =
-            MulticallBuilder::new_dynamic(&provider).address(multicall_address);
+        let mut mc_in = MulticallBuilder::new_dynamic(&provider).address(multicall_address);
         for c in &in_cases {
             mc_in = mc_in.add_dynamic(lb_view.getSwapIn(c.amount, c.swap_for_y));
         }
@@ -346,6 +372,158 @@ async fn test_lb_fuzz() -> Result<()> {
         total_errors, 0,
         "Fuzz test had {} mismatches out of {} checks",
         total_errors, total_checks
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v2.0 quote parity
+// ---------------------------------------------------------------------------
+
+/// Acceptance criterion "offchain quote == onchain quote at the same block",
+/// extended to LB v2.0.
+///
+/// Two structural differences from `test_lb_fuzz`, both forced by v2.0:
+///
+/// 1. The reference comes from the **router**, not the pair — v2.0 pairs have
+///    no `getSwapOut`. The router returns `(amountOut, feesIn)` with no
+///    `amountInLeft`, so only exact-in parity is checkable here; there is no
+///    v2.0 analogue of the `getSwapIn` half.
+/// 2. The router **reverts** (`TreeMath__ErrorDepthSearch()`, `0x10d64861`)
+///    instead of reporting a shortfall when the swap walks off the end of the
+///    bin tree, so the on-chain call is a `Result` that must be matched, not
+///    `?`-propagated. A revert is only accepted as a skip when our simulator
+///    independently agrees the input could not be fully consumed; a revert
+///    against a simulator that *did* consume everything is a real
+///    disagreement and is counted as a mismatch.
+///
+/// Expect several minutes: v2.0 has no corroborated bin-tree layout, so
+/// `fetch_lb_pool` walks bins sequentially.
+#[tokio::test]
+#[ignore]
+async fn test_lb_v20_fuzz() -> Result<()> {
+    let provider = Arc::new(ProviderBuilder::new().connect_http(RPC_URL.parse()?));
+    let token_info = SimpleTokenCache::new();
+    let multicall_address = parse_address(MULTICALL);
+
+    // Pin a block so the on-chain reference and the offline simulation see
+    // identical state, and read its timestamp for the volatility decay.
+    let block_number = provider.get_block_number().await?;
+    let block_id = BlockId::Number(BlockNumberOrTag::Number(block_number));
+    let block_timestamp = provider
+        .get_block_by_number(BlockNumberOrTag::Number(block_number))
+        .await?
+        .expect("block should exist")
+        .header
+        .timestamp;
+
+    let router = ILBRouterV20::new(parse_address(V20_ROUTER), &provider);
+
+    let mut total_checked = 0u32;
+    let mut total_skipped = 0u32;
+    let mut total_errors = 0u32;
+
+    for &pool_addr_str in V20_TEST_POOLS {
+        let pool_address = parse_address(pool_addr_str);
+        let pool = fetch_lb_pool(
+            &provider,
+            pool_address,
+            block_id,
+            &token_info,
+            multicall_address,
+            CHAIN_ID,
+        )
+        .await?;
+
+        let dec_x = get_decimals(&provider, pool.token_x).await;
+        let dec_y = get_decimals(&provider, pool.token_y).await;
+        println!(
+            "── v2.0 pool {} ── binStep {} activeId {} bins {} tokenX {}dec tokenY {}dec",
+            pool_address,
+            pool.bin_step,
+            pool.active_id,
+            pool.bins.len(),
+            dec_x,
+            dec_y
+        );
+
+        // swapForY spends token X, so scale by X's decimals, and vice versa.
+        for (swap_for_y, amounts) in [(true, fuzz_amounts(dec_x)), (false, fuzz_amounts(dec_y))] {
+            for amount_in in amounts {
+                let onchain = router
+                    .getSwapOut(pool_address, U256::from(amount_in), swap_for_y)
+                    .block(block_id)
+                    .call()
+                    .await;
+
+                let (amount_in_left, offchain_out, _fee) =
+                    match pool.simulate_swap_out_at(amount_in, swap_for_y, block_timestamp) {
+                        Ok(r) => r,
+                        // Our simulator gave up entirely — insufficient
+                        // liquidity, the same condition the router reverts on.
+                        Err(_) => {
+                            total_skipped += 1;
+                            continue;
+                        }
+                    };
+
+                let onchain = match onchain {
+                    Ok(r) => r,
+                    Err(_) if amount_in_left > 0 => {
+                        // Both sides agree the input cannot be fully consumed;
+                        // they just report it differently.
+                        total_skipped += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        total_errors += 1;
+                        println!(
+                            "  MISMATCH getSwapOut(amount={amount_in}, swap_for_y={swap_for_y}): \
+                             router reverted ({e}) but offchain consumed the full input for {offchain_out} out"
+                        );
+                        continue;
+                    }
+                };
+
+                if amount_in_left > 0 {
+                    // We ran out of bins and the router didn't — partial bin
+                    // coverage, same caveat as `test_lb_fuzz`.
+                    total_skipped += 1;
+                    continue;
+                }
+
+                if U256::from(offchain_out) == onchain.amountOut {
+                    total_checked += 1;
+                } else {
+                    total_errors += 1;
+                    println!(
+                        "  MISMATCH getSwapOut(amount={amount_in}, swap_for_y={swap_for_y}): \
+                         offchain {offchain_out} vs onchain {}",
+                        onchain.amountOut
+                    );
+                }
+            }
+        }
+
+        println!(
+            "  v2.0 {pool_address}: quote parity across {} bins",
+            pool.bins.len()
+        );
+    }
+
+    println!("  v2.0 results: {total_checked} matched, {total_skipped} skipped, {total_errors} mismatched");
+
+    assert_eq!(
+        total_errors, 0,
+        "v2.0 quote parity had {total_errors} mismatches"
+    );
+    // A run where every case was skipped would otherwise pass while proving
+    // nothing — the exact failure mode the pinned convergence ranges exist to
+    // prevent.
+    assert!(
+        total_checked > 0,
+        "v2.0 quote parity checked nothing: all {total_skipped} cases were skipped"
     );
 
     Ok(())

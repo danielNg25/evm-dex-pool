@@ -1040,6 +1040,16 @@ mod tests {
     }
 
     /// v2.0 deposit/withdraw/composition-fee arms move the right bin.
+    ///
+    /// Unit-tested rather than covered by `test_lb_convergence_v20`, because
+    /// `DepositedToBin` and `CompositionFee` fire **zero** times in 500,000
+    /// blocks on the only reachable v2.0 fixture — that pool is deprecated and
+    /// holders only ever exit it. No pinned range can exercise these two arms,
+    /// so do not read the convergence test as covering them; this is their only
+    /// coverage. `WithdrawnFromBin` is covered both here and there.
+    ///
+    /// Every assertion starts from a bin that already holds 1_000_000/1_000_000
+    /// and checks both reserves, so an arm that silently no-ops cannot pass.
     #[test]
     fn v20_liquidity_events_update_bins() {
         use crate::contracts::ILBPairV20;

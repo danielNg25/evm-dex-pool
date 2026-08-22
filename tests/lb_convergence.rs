@@ -25,6 +25,11 @@ alloy::sol! {
     "contracts/ABI/ILBPair.json"
 }
 
+alloy::sol! {
+    ILBPairV20,
+    "contracts/ABI/ILBPairV20.json"
+}
+
 /// Every topic `apply_log` handles and that actually occurs on-chain for
 /// v2.1/v2.2 pools. `StaticFeeParametersSet` is deliberately excluded — see
 /// `apply_log_updates_static_fee_parameters` in `src/lb/pool.rs` for why no
@@ -38,8 +43,28 @@ const REQUIRED_TOPICS: [(&str, B256); 3] = [
     ),
 ];
 
+/// Every topic `apply_log` handles and that actually occurs on-chain for
+/// v2.0 pools. Deliberately just two.
+///
+/// `DepositedToBin` and `CompositionFee` are excluded because they fire
+/// **zero** times in 500,000 blocks on the v2.0 fixture — this pool is
+/// deprecated and holders are only exiting it, never adding. Naming them
+/// here would make the coverage assertion fail correctly and permanently,
+/// with no range able to satisfy it. Those two arms are unit-tested instead,
+/// in `v20_liquidity_events_update_bins` in `src/lb/pool.rs`.
+const V20_REQUIRED_TOPICS: [(&str, B256); 2] = [
+    ("Swap", ILBPairV20::Swap::SIGNATURE_HASH),
+    (
+        "WithdrawnFromBin",
+        ILBPairV20::WithdrawnFromBin::SIGNATURE_HASH,
+    ),
+];
+
 const V22_POOL: Address = address!("8573f98175d816d520248b5facf40d309b1c9cee");
 const V21_POOL: Address = address!("4224f6f4c9280509724db2dbac314621e4465c29");
+/// LB v2.0 USDC.e/USDC on Avalanche, binStep 1. The only v2.0 pair with
+/// enough surviving event traffic to replay.
+const V20_POOL: Address = address!("18332988456C4Bd9ABa6698ec748b331516F5A14");
 
 /// v2.1. Verified live by chunked `eth_getLogs` over this exact range: 302
 /// logs — 282 Swap, 4 DepositedToBins, 4 WithdrawnFromBins, 4
@@ -82,4 +107,29 @@ async fn test_lb_convergence_v22() -> Result<()> {
 #[ignore]
 async fn test_lb_convergence_v21() -> Result<()> {
     converge_one(V21_POOL, "v2.1", Some(V21_RANGE), &REQUIRED_TOPICS).await
+}
+
+/// v2.0. Verified live: 2 Swap (blocks 93299096 and 93299113, 17s apart —
+/// above the pool's 10s filterPeriod, so `update_references` genuinely
+/// fires) and 5 WithdrawnFromBin, plus FeesCollected / TransferSingle /
+/// TransferBatch as unhandled bystanders.
+///
+/// This is the ONLY 2,000-block window in 300,000 containing both a Swap and
+/// a WithdrawnFromBin. `DepositedToBin` and `CompositionFee` do not occur at
+/// all in 500,000 blocks — see `v20_liquidity_events_update_bins` in
+/// `src/lb/pool.rs` for their coverage.
+///
+/// Expect this test to take ~40s: v2.0 has no corroborated bin-tree layout,
+/// so each of the two fetches walks bins sequentially (~19s for 68 bins).
+const V20_RANGE: (u64, u64) = (93_298_348, 93_300_348);
+
+/// The acceptance gate for v2.0 event replay, and the test that adjudicates
+/// whether v2.0's `bin += amountIn - amountOut` is right. v2.0's `Swap`
+/// reports `amountIn` net of fees where v2.1+ reports it gross, so if v2.0's
+/// `getBin()` includes fees the replayed bin will land *below* the fetched
+/// one. Nothing else settles this — do not soften the assertion to pass it.
+#[tokio::test]
+#[ignore]
+async fn test_lb_convergence_v20() -> Result<()> {
+    converge_one(V20_POOL, "v2.0", Some(V20_RANGE), &V20_REQUIRED_TOPICS).await
 }
