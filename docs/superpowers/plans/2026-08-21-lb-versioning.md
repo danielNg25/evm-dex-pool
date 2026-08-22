@@ -2356,41 +2356,72 @@ folding the fees field in."
 
 Runs last and alone, so that when the §6.3 v2.0 accounting question surfaces it is the only variable in play.
 
-- [ ] **Step 1: Add v2.0 convergence**
+- [ ] **Step 1: Add v2.0 convergence with an honest required set**
 
-Append to `tests/lb_convergence.rs`:
+The v2.0 fixture pool is severely dormant. Measured across 500,000 blocks:
+199 Swap, 16 `WithdrawnFromBin`, 18 `FeesCollected`, 16 `TransferSingle` —
+and **zero `DepositedToBin`, zero `CompositionFee`**. Nobody has added
+liquidity to this deprecated pool in the reachable window; they are only
+exiting. Exactly one 2,000-block window in 300,000 contains both a Swap and a
+`WithdrawnFromBin`.
+
+So the v2.0 required-topic set is `Swap` and `WithdrawnFromBin` only. The two
+uncovered arms get unit tests in Step 2 — the same treatment
+`StaticFeeParametersSet` received, and for the same reason: an arm no
+reachable range can exercise must be tested some other way, not quietly
+assumed.
 
 ```rust
-const V20_POOL: Address = address!("18332988456C4Bd9ABa6698ec748b331516F5A14");
-
-/// The v2.0 pool is nearly dormant — measured at 12 logs across 20,000
-/// blocks, with none at all in the most recent 12,000. A head-derived range
-/// would find zero logs and trip the test's own `!logs.is_empty()` assertion
-/// every run, so this fixture pins a historical window known to contain
-/// Swaps. Re-pin if archive retention ever drops it; the failure is loud.
-const V20_RANGE: (u64, u64) = (93_327_570, 93_335_570);
+/// v2.0. Verified: 2 Swap (blocks 93299096 and 93299113, 17s apart — above
+/// the pool's 10s filterPeriod, so update_references fires) and 5
+/// WithdrawnFromBin, plus FeesCollected/TransferSingle/TransferBatch as
+/// bystanders.
+///
+/// This is the ONLY window in 300,000 blocks containing both a Swap and a
+/// WithdrawnFromBin. DepositedToBin and CompositionFee do not occur at all
+/// in 500,000 blocks — see the unit tests in src/lb/pool.rs.
+///
+/// Expect this test to take ~40s: v2.0 has no corroborated bin-tree layout,
+/// so each of the two fetches walks bins sequentially (~19s for 68 bins).
+const V20_RANGE: (u64, u64) = (93_298_348, 93_300_348);
 
 #[tokio::test]
 #[ignore]
 async fn test_lb_convergence_v20() -> Result<()> {
-    converge_one(V20_POOL, "v2.0", Some(V20_RANGE)).await
+    converge_one(V20_POOL, "v2.0", Some(V20_RANGE), &v20_required_topics()).await
 }
 ```
 
-`V20_RANGE` spans 8,000 blocks, which exceeds this endpoint's 2048-block
-`eth_getLogs` cap — the log fetch for a pinned range must be **chunked into
-2048-block windows** and concatenated in order. Apply the same chunking in
-`converge_one` so the head-derived path stays correct if `REPLAY_BLOCKS` grows.
+Build `v20_required_topics()` from the `ILBPairV20` bindings the same way the
+v2.1+ set is built — derive the hashes, never hardcode hex. For reference,
+these were confirmed by printing the bindings' own constants:
 
-- [ ] **Step 2: Run it and interpret the result**
+```
+Swap              0xc528cda9e500228b16ce84fadae290d9a49aecb17483110004c5af0a07f6fd73
+WithdrawnFromBin  0xda5e7177dface55f5e0eff7dfc67420a1db4243ddfcf0ecc84ed93e034dd8cc2
+DepositedToBin    0x4216cc3b…
+CompositionFee    0x56f8e764…
+```
 
-Run: `cargo test --features collector test_lb_convergence_v20 -- --ignored --nocapture`
+**This is the step that adjudicates the v2.0 fee-accounting question.** If bins
+diverge, the `Swap` arm's `bin += amountIn - amountOut` is wrong for v2.0 and
+the `fees` field needs folding in. Report the direction of the discrepancy —
+replayed lower than fetched means fees are missing from the input side. Do not
+adjust the assertion.
 
-- **Passes** → v2.0's `getBin()` excludes fees exactly as `amountIn` does, and the straightforward accounting is correct. Record this in the commit message; it settles the spec's §6.3 open question.
-- **Fails on bin reserves, replayed consistently lower than fetched** → v2.0's `getBin()` includes fees that `amountIn` excludes. Add the `fees` field into the input side of the v2.0 `Swap` arm, splitting it by direction, and rerun.
-- **Fails only on `time_of_last_update`** → v2.0's `feeParameters().time` has different semantics from v2.1+'s `timeOfLastUpdate`. Investigate before adjusting.
+- [ ] **Step 2: Unit-test the two arms no range can cover**
 
-If the pool is too quiet to produce logs, raise `REPLAY_BLOCKS` rather than dropping the assertion.
+Add to `mod tests` in `src/lb/pool.rs`, alongside the existing
+`StaticFeeParametersSet` test. Follow that test's construction pattern.
+
+Cover `ILBPairV20::DepositedToBin` and `ILBPairV20::CompositionFee`: build a
+pool with a known bin, apply the log, and assert the bin's reserves moved by
+exactly the event's amounts. Assert both `reserve_x` and `reserve_y`, and use
+a bin id that already has non-zero reserves so an accidental no-op cannot pass.
+
+Note in a comment that these are unit-tested because the events do not occur
+on any reachable v2.0 fixture — zero in 500,000 blocks — so a future reader
+does not assume the convergence test covers them.
 
 - [ ] **Step 3: Add v2.0 quote parity**
 
