@@ -95,3 +95,32 @@ async fn test_fetch_stamps_version_and_finds_bins() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+#[ignore]
+async fn test_fetch_v20_pool() -> Result<()> {
+    let provider = Arc::new(ProviderBuilder::new().connect_http(RPC_URL.parse()?));
+    let pool = fetch_lb_pool(
+        &provider,
+        V20_POOL,
+        BlockId::latest(),
+        &NoopTokenInfo,
+        MULTICALL,
+        43114,
+    )
+    .await?;
+
+    assert_eq!(pool.version, LBVersion::V2_0);
+    assert!(pool.bin_step > 0, "bin_step must come from feeParameters");
+    assert!(
+        pool.active_id > 0,
+        "active_id must come from getReservesAndId"
+    );
+    assert!(
+        pool.bins.len() > 1,
+        "expected multiple non-empty bins, got {}",
+        pool.bins.len()
+    );
+    assert!(pool.hooks_parameters.is_none(), "v2.0 has no hooks");
+    Ok(())
+}

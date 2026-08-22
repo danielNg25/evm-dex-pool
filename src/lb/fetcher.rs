@@ -1,6 +1,6 @@
 //! RPC-based fetcher for TraderJoe Liquidity Book pools.
 
-use crate::contracts_rpc::RpcILBPair as ILBPair;
+use crate::contracts_rpc::{RpcILBPair as ILBPair, RpcILBPairV20};
 use crate::lb::{detect_lb_version, LBPool, LBVersion};
 use crate::TokenInfo;
 use alloy::eips::BlockId;
@@ -121,28 +121,78 @@ async fn discover_bins_from_tree<P: Provider + Send + Sync>(
     Ok(bin_ids)
 }
 
-/// Fallback: discover all non-empty bins by walking outward from `active_id`
-/// using `getNextNonEmptyBin` in both directions.
+/// Selector of v2.0's `TreeMath__ErrorDepthSearch()`.
 ///
-/// Sequential (O(N) RPC calls), but only used when tree bitmap discovery fails.
+/// v2.0's TreeMath *reverts* with this once a search runs off the end of the
+/// bin tree, where v2.1+ returns a sentinel bin ID instead. It is therefore a
+/// normal terminating condition of the walk, not a failure.
+const TREE_MATH_ERROR_DEPTH_SEARCH: [u8; 4] = [0x10, 0xd6, 0x48, 0x61];
+
+/// One step of the non-empty-bin walk, in the direction `swap_for_y` selects.
+/// `Ok(None)` means the version reported there is no further bin that way.
+///
+/// v2.0 spells this `findFirstNonEmptyBinId(id, swapForY)` and takes its two
+/// arguments in the opposite order to v2.1+'s `getNextNonEmptyBin(swapForY, id)`.
+/// The direction semantics match (`true` walks down to lower IDs); only the
+/// end-of-tree signal differs — see [`TREE_MATH_ERROR_DEPTH_SEARCH`].
+async fn next_non_empty_bin<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    pool_address: Address,
+    version: LBVersion,
+    swap_for_y: bool,
+    id: u32,
+    block_number: BlockId,
+) -> Result<Option<u32>> {
+    let next = match version {
+        LBVersion::V2_0 => {
+            match RpcILBPairV20::new(pool_address, provider)
+                .findFirstNonEmptyBinId(U24::from(id), swap_for_y)
+                .block(block_number)
+                .call()
+                .await
+            {
+                Ok(next) => next,
+                // Only this one revert ends the walk; every other error —
+                // transport, rate limit, any other revert — still propagates.
+                Err(e)
+                    if e.as_revert_data()
+                        .is_some_and(|d| d[..] == TREE_MATH_ERROR_DEPTH_SEARCH) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        LBVersion::V2_1 | LBVersion::V2_2 => {
+            ILBPair::new(pool_address, provider)
+                .getNextNonEmptyBin(swap_for_y, U24::from(id))
+                .block(block_number)
+                .call()
+                .await?
+        }
+    };
+    Ok(Some(next.to()))
+}
+
+/// Fallback: discover all non-empty bins by walking outward from `active_id`
+/// using the version's next-non-empty-bin getter in both directions.
+///
+/// Sequential (O(N) RPC calls), but only used when tree bitmap discovery fails
+/// or the version has no corroborated tree storage layout (v2.0).
 async fn discover_bins_by_walking<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     pool_address: Address,
     active_id: u32,
     block_number: BlockId,
+    version: LBVersion,
 ) -> Result<Vec<u32>> {
-    let lb = ILBPair::new(pool_address, provider);
     let mut bin_ids: Vec<u32> = vec![active_id];
 
     // Walk downward (swapForY=true finds lower bin IDs)
     let mut id = active_id;
-    loop {
-        let next: u32 = lb
-            .getNextNonEmptyBin(true, U24::from(id))
-            .block(block_number)
-            .call()
-            .await?
-            .to();
+    while let Some(next) =
+        next_non_empty_bin(provider, pool_address, version, true, id, block_number).await?
+    {
         if next == 0 || next >= id {
             break;
         }
@@ -152,13 +202,9 @@ async fn discover_bins_by_walking<P: Provider + Send + Sync>(
 
     // Walk upward (swapForY=false finds higher bin IDs)
     let mut id = active_id;
-    loop {
-        let next: u32 = lb
-            .getNextNonEmptyBin(false, U24::from(id))
-            .block(block_number)
-            .call()
-            .await?
-            .to();
+    while let Some(next) =
+        next_non_empty_bin(provider, pool_address, version, false, id, block_number).await?
+    {
         if next == 0x00FF_FFFF || next <= id {
             break;
         }
@@ -186,6 +232,135 @@ fn tree_base_slot(version: LBVersion) -> Option<u64> {
     }
 }
 
+/// Pool state normalised across LB versions.
+struct LBState {
+    token_x_raw: Address,
+    token_y_raw: Address,
+    bin_step: u16,
+    active_id: u32,
+    base_factor: u16,
+    filter_period: u16,
+    decay_period: u16,
+    reduction_factor: u16,
+    variable_fee_control: u32,
+    protocol_share: u16,
+    max_volatility_accumulator: u32,
+    volatility_accumulator: u32,
+    volatility_reference: u32,
+    id_reference: u32,
+    time_of_last_update: u64,
+}
+
+/// Read v2.0 state. v2.0 packs every fee parameter into one `feeParameters()`
+/// struct and has no `getBinStep()`; bin step is field 0 of that struct.
+async fn fetch_v20_state<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    pool_address: Address,
+    block_number: BlockId,
+    multicall_address: Address,
+) -> Result<LBState> {
+    let lb = RpcILBPairV20::new(pool_address, provider);
+    let r = provider
+        .multicall()
+        .address(multicall_address)
+        .add(lb.tokenX()) // 0
+        .add(lb.tokenY()) // 1
+        .add(lb.getReservesAndId()) // 2
+        .add(lb.feeParameters()) // 3
+        .block(block_number)
+        .try_aggregate(false)
+        .await?;
+
+    let token_x_raw = r.0?;
+    let token_y_raw = r.1?;
+    let reserves = r.2?;
+    // `feeParameters()` returns a single *unnamed* tuple, so alloy decodes it
+    // positionally rather than into a named struct. Destructuring pins the
+    // arity, order and per-field width in one place: FeeParameters is
+    // (binStep, baseFactor, filterPeriod, decayPeriod, reductionFactor,
+    // variableFeeControl, protocolShare, maxVolatilityAccumulated,
+    // volatilityAccumulated, volatilityReference, indexRef, time).
+    let (
+        bin_step,
+        base_factor,
+        filter_period,
+        decay_period,
+        reduction_factor,
+        variable_fee_control,
+        protocol_share,
+        max_volatility_accumulated,
+        volatility_accumulated,
+        volatility_reference,
+        index_ref,
+        time,
+    ) = r.3?;
+
+    Ok(LBState {
+        token_x_raw,
+        token_y_raw,
+        bin_step,
+        active_id: reserves.activeId.to(),
+        base_factor,
+        filter_period,
+        decay_period,
+        reduction_factor,
+        variable_fee_control: variable_fee_control.to(),
+        protocol_share,
+        max_volatility_accumulator: max_volatility_accumulated.to(),
+        volatility_accumulator: volatility_accumulated.to(),
+        volatility_reference: volatility_reference.to(),
+        id_reference: index_ref.to(),
+        time_of_last_update: time.to(),
+    })
+}
+
+/// Read v2.1/v2.2 state. Both expose the same split getters.
+async fn fetch_v21_state<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    pool_address: Address,
+    block_number: BlockId,
+    multicall_address: Address,
+) -> Result<LBState> {
+    let lb = ILBPair::new(pool_address, provider);
+    let r = provider
+        .multicall()
+        .address(multicall_address)
+        .add(lb.getTokenX()) // 0
+        .add(lb.getTokenY()) // 1
+        .add(lb.getBinStep()) // 2
+        .add(lb.getActiveId()) // 3
+        .add(lb.getStaticFeeParameters()) // 4
+        .add(lb.getVariableFeeParameters()) // 5
+        .block(block_number)
+        .try_aggregate(false)
+        .await?;
+
+    let token_x_raw = r.0?;
+    let token_y_raw = r.1?;
+    let bin_step = r.2?;
+    let active_id: u32 = r.3?.to();
+    let s = r.4?;
+    let v = r.5?;
+
+    Ok(LBState {
+        token_x_raw,
+        token_y_raw,
+        bin_step,
+        active_id,
+        base_factor: s.baseFactor,
+        filter_period: s.filterPeriod,
+        decay_period: s.decayPeriod,
+        reduction_factor: s.reductionFactor,
+        variable_fee_control: s.variableFeeControl.to(),
+        protocol_share: s.protocolShare,
+        max_volatility_accumulator: s.maxVolatilityAccumulator.to(),
+        volatility_accumulator: v.volatilityAccumulator.to(),
+        volatility_reference: v.volatilityReference.to(),
+        id_reference: v.idReference.to(),
+        time_of_last_update: v.timeOfLastUpdate.to(),
+    })
+}
+
 /// Fetch a TraderJoe Liquidity Book pool from chain.
 ///
 /// Discovers all non-empty bins via storage bitmap reads of the on-chain TreeMath structure.
@@ -211,25 +386,14 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
     let lb_instance = ILBPair::new(pool_address, provider);
 
     // ── Batch 1: Pool metadata + fee parameters ─────────────────────────
-    let multicall_result = provider
-        .multicall()
-        .address(multicall_address)
-        .add(lb_instance.getTokenX()) // 0
-        .add(lb_instance.getTokenY()) // 1
-        .add(lb_instance.getBinStep()) // 2
-        .add(lb_instance.getActiveId()) // 3
-        .add(lb_instance.getStaticFeeParameters()) // 4
-        .add(lb_instance.getVariableFeeParameters()) // 5
-        .block(block_number)
-        .try_aggregate(false)
-        .await?;
-
-    let token_x_raw = multicall_result.0?;
-    let token_y_raw = multicall_result.1?;
-    let bin_step = multicall_result.2?;
-    let active_id: u32 = multicall_result.3?.to();
-    let static_fees = multicall_result.4?;
-    let var_fees = multicall_result.5?;
+    let state = match version {
+        LBVersion::V2_0 => {
+            fetch_v20_state(provider, pool_address, block_number, multicall_address).await?
+        }
+        LBVersion::V2_1 | LBVersion::V2_2 => {
+            fetch_v21_state(provider, pool_address, block_number, multicall_address).await?
+        }
+    };
 
     let hooks_parameters = if version == LBVersion::V2_2 {
         // Version detection already succeeded via this same call (it is the
@@ -261,15 +425,15 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
 
     // ── Resolve tokens ──────────────────────────────────────────────────
     let (token_x, _) = token_info
-        .get_or_fetch_token(provider, token_x_raw, multicall_address)
+        .get_or_fetch_token(provider, state.token_x_raw, multicall_address)
         .await?;
     let (token_y, _) = token_info
-        .get_or_fetch_token(provider, token_y_raw, multicall_address)
+        .get_or_fetch_token(provider, state.token_y_raw, multicall_address)
         .await?;
 
     info!(
         "[Chain {}] LB Pool: TokenX={}, TokenY={}, BinStep={}, ActiveId={}",
-        chain_id, token_x, token_y, bin_step, active_id
+        chain_id, token_x, token_y, state.bin_step, state.active_id
     );
 
     // ── Batch 2: Discover non-empty bins ─────────────────────────────────
@@ -305,8 +469,14 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
             ids
         }
         None => {
-            let ids =
-                discover_bins_by_walking(provider, pool_address, active_id, block_number).await?;
+            let ids = discover_bins_by_walking(
+                provider,
+                pool_address,
+                state.active_id,
+                block_number,
+                version,
+            )
+            .await?;
             if ids.is_empty() {
                 return Err(anyhow::anyhow!(
                     "LB bin walk for {} ({:?}) yielded no bins",
@@ -326,20 +496,40 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
 
     // ── Batch 3: Fetch bin reserves via multicall ────────────────────────
     let mut bins = BTreeMap::new();
+    let lb20_instance = RpcILBPairV20::new(pool_address, provider);
 
     for chunk in bin_ids.chunks(250) {
-        let mut multicall = MulticallBuilder::new_dynamic(provider).address(multicall_address);
-        for &id in chunk {
-            multicall = multicall.add_dynamic(lb_instance.getBin(U24::from(id)));
-        }
-        let results = multicall.block(block_number).aggregate().await?;
-
-        for (i, &id) in chunk.iter().enumerate() {
-            let result = &results[i];
-            let rx: u128 = result.binReserveX;
-            let ry: u128 = result.binReserveY;
-            if rx > 0 || ry > 0 {
-                bins.insert(id, (rx, ry));
+        match version {
+            LBVersion::V2_0 => {
+                let mut multicall =
+                    MulticallBuilder::new_dynamic(provider).address(multicall_address);
+                for &id in chunk {
+                    multicall = multicall.add_dynamic(lb20_instance.getBin(U24::from(id)));
+                }
+                let results = multicall.block(block_number).aggregate().await?;
+                for (i, &id) in chunk.iter().enumerate() {
+                    // v2.0 returns uint256; real bin reserves always fit u128.
+                    let rx: u128 = results[i].reserveX.try_into().unwrap_or(0);
+                    let ry: u128 = results[i].reserveY.try_into().unwrap_or(0);
+                    if rx > 0 || ry > 0 {
+                        bins.insert(id, (rx, ry));
+                    }
+                }
+            }
+            LBVersion::V2_1 | LBVersion::V2_2 => {
+                let mut multicall =
+                    MulticallBuilder::new_dynamic(provider).address(multicall_address);
+                for &id in chunk {
+                    multicall = multicall.add_dynamic(lb_instance.getBin(U24::from(id)));
+                }
+                let results = multicall.block(block_number).aggregate().await?;
+                for (i, &id) in chunk.iter().enumerate() {
+                    let rx: u128 = results[i].binReserveX;
+                    let ry: u128 = results[i].binReserveY;
+                    if rx > 0 || ry > 0 {
+                        bins.insert(id, (rx, ry));
+                    }
+                }
             }
         }
     }
@@ -355,23 +545,39 @@ pub async fn fetch_lb_pool<P: Provider + Send + Sync, T: TokenInfo>(
         pool_address,
         token_x,
         token_y,
-        bin_step,
-        active_id,
+        state.bin_step,
+        state.active_id,
         bins,
-        static_fees.baseFactor,
-        static_fees.filterPeriod,
-        static_fees.decayPeriod,
-        static_fees.reductionFactor,
-        static_fees.variableFeeControl.to(),
-        static_fees.protocolShare,
-        static_fees.maxVolatilityAccumulator.to(),
-        var_fees.volatilityAccumulator.to(),
-        var_fees.volatilityReference.to(),
-        var_fees.idReference.to(),
-        var_fees.timeOfLastUpdate.to(),
+        state.base_factor,
+        state.filter_period,
+        state.decay_period,
+        state.reduction_factor,
+        state.variable_fee_control,
+        state.protocol_share,
+        state.max_volatility_accumulator,
+        state.volatility_accumulator,
+        state.volatility_reference,
+        state.id_reference,
+        state.time_of_last_update,
     );
 
     Ok(pool
         .with_version(version)
         .with_hooks_parameters(hooks_parameters))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The selector is hand-written from a signature the compiler never sees,
+    /// so pin it to the keccak of that signature: a typo here would turn
+    /// "the walk finished" into "propagate the error" (or the reverse).
+    #[test]
+    fn tree_math_depth_search_selector_matches_signature() {
+        assert_eq!(
+            keccak256("TreeMath__ErrorDepthSearch()")[..4],
+            TREE_MATH_ERROR_DEPTH_SEARCH
+        );
+    }
 }
