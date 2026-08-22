@@ -1,6 +1,6 @@
 //! TraderJoe Liquidity Book pool implementation.
 
-use crate::contracts::ILBPair;
+use crate::contracts::{ILBPair, ILBPairV20};
 use crate::lb::math::*;
 use crate::lb::version::LBVersion;
 use crate::pool::base::{
@@ -175,8 +175,7 @@ impl LBPool {
 
             if dt < self.decay_period as u64 {
                 // updateVolatilityReference: volRef = volAcc * reductionFactor / 10000
-                vol_ref = ((self.volatility_accumulator as u64
-                    * self.reduction_factor as u64)
+                vol_ref = ((self.volatility_accumulator as u64 * self.reduction_factor as u64)
                     / 10_000) as u32;
             } else {
                 // Decay period exceeded: reset volatility reference
@@ -453,7 +452,11 @@ impl PoolInterface for LBPool {
         } else if token_in == &self.token_y {
             false
         } else {
-            return Err(anyhow!("Token {} not in LB pool {}", token_in, self.address));
+            return Err(anyhow!(
+                "Token {} not in LB pool {}",
+                token_in,
+                self.address
+            ));
         };
 
         let amount_in_128: u128 = amount_in
@@ -483,7 +486,11 @@ impl PoolInterface for LBPool {
         } else if token_out == &self.token_x {
             false
         } else {
-            return Err(anyhow!("Token {} not in LB pool {}", token_out, self.address));
+            return Err(anyhow!(
+                "Token {} not in LB pool {}",
+                token_out,
+                self.address
+            ));
         };
 
         let amount_out_128: u128 = amount_out
@@ -657,6 +664,85 @@ impl EventApplicable for LBPool {
                 self.max_volatility_accumulator = data.maxVolatilityAccumulator.to();
                 Ok(())
             }
+            Some(&ILBPairV20::Swap::SIGNATURE_HASH) => {
+                let d: ILBPairV20::Swap = event.log_decode()?.inner.data;
+                let id: u32 = d.id.to();
+                // Fail loudly rather than saturating: an amount that does not
+                // fit u128 is malformed, and clamping to u128::MAX would
+                // corrupt the bin silently.
+                let amount_in: u128 = d
+                    .amountIn
+                    .try_into()
+                    .map_err(|_| anyhow!("v2.0 Swap amountIn exceeds u128"))?;
+                let amount_out: u128 = d
+                    .amountOut
+                    .try_into()
+                    .map_err(|_| anyhow!("v2.0 Swap amountOut exceeds u128"))?;
+
+                let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
+                // swapForY: X goes in, Y comes out.
+                let (new_rx, new_ry) = if d.swapForY {
+                    (rx.saturating_add(amount_in), ry.saturating_sub(amount_out))
+                } else {
+                    (rx.saturating_sub(amount_out), ry.saturating_add(amount_in))
+                };
+                self.update_bin(id, new_rx, new_ry);
+
+                // Same updateReferences ordering as the v2.1+ arm — see the
+                // comment there. This MUST run on PRE-swap state, so before
+                // active_id / time_of_last_update are overwritten below.
+                // Writing `id_reference = id` here instead was the exact bug
+                // found on v2.1: it sets the reference to the swap's FINAL bin
+                // rather than the pre-swap activeId, and never writes
+                // volatility_reference at all.
+                let ts = Self::log_timestamp(event);
+                let (vol_ref, id_ref) = self.update_references(ts);
+                self.volatility_reference = vol_ref;
+                self.id_reference = id_ref;
+
+                self.active_id = id;
+                self.volatility_accumulator = d.volatilityAccumulated.to();
+                self.time_of_last_update = ts;
+                // last_updated is local bookkeeping and stays wall clock.
+                self.last_updated = chrono::Utc::now().timestamp() as u64;
+                Ok(())
+            }
+            Some(&ILBPairV20::DepositedToBin::SIGNATURE_HASH) => {
+                let d: ILBPairV20::DepositedToBin = event.log_decode()?.inner.data;
+                let id: u32 = d.id.to();
+                let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
+                self.update_bin(
+                    id,
+                    rx.saturating_add(d.amountX.try_into().unwrap_or(0)),
+                    ry.saturating_add(d.amountY.try_into().unwrap_or(0)),
+                );
+                self.last_updated = Self::log_timestamp(event);
+                Ok(())
+            }
+            Some(&ILBPairV20::WithdrawnFromBin::SIGNATURE_HASH) => {
+                let d: ILBPairV20::WithdrawnFromBin = event.log_decode()?.inner.data;
+                let id: u32 = d.id.to();
+                let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
+                self.update_bin(
+                    id,
+                    rx.saturating_sub(d.amountX.try_into().unwrap_or(0)),
+                    ry.saturating_sub(d.amountY.try_into().unwrap_or(0)),
+                );
+                self.last_updated = Self::log_timestamp(event);
+                Ok(())
+            }
+            Some(&ILBPairV20::CompositionFee::SIGNATURE_HASH) => {
+                let d: ILBPairV20::CompositionFee = event.log_decode()?.inner.data;
+                let id: u32 = d.id.to();
+                let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
+                self.update_bin(
+                    id,
+                    rx.saturating_add(d.feesX.try_into().unwrap_or(0)),
+                    ry.saturating_add(d.feesY.try_into().unwrap_or(0)),
+                );
+                self.last_updated = Self::log_timestamp(event);
+                Ok(())
+            }
             _ => {
                 trace!("Ignoring unknown event for LB pool {}", self.address);
                 Ok(())
@@ -674,11 +760,18 @@ impl TopicList for LBPool {
             ILBPair::DepositedToBins::SIGNATURE_HASH,
             ILBPair::WithdrawnFromBins::SIGNATURE_HASH,
             ILBPair::StaticFeeParametersSet::SIGNATURE_HASH,
+            ILBPairV20::Swap::SIGNATURE_HASH,
+            ILBPairV20::DepositedToBin::SIGNATURE_HASH,
+            ILBPairV20::WithdrawnFromBin::SIGNATURE_HASH,
+            ILBPairV20::CompositionFee::SIGNATURE_HASH,
         ]
     }
 
     fn profitable_topics() -> Vec<Topic> {
-        vec![ILBPair::Swap::SIGNATURE_HASH]
+        vec![
+            ILBPair::Swap::SIGNATURE_HASH,
+            ILBPairV20::Swap::SIGNATURE_HASH,
+        ]
     }
 }
 
@@ -717,10 +810,23 @@ mod tests {
 
     fn pool_with_time(t: u64) -> LBPool {
         let mut p = LBPool::new(
-            Address::ZERO, Address::ZERO, Address::ZERO,
-            20, 8_388_608, BTreeMap::new(),
-            5_000, 30, 600, 5_000, 40_000, 1_000, 350_000,
-            0, 0, 8_388_608, t,
+            Address::ZERO,
+            Address::ZERO,
+            Address::ZERO,
+            20,
+            8_388_608,
+            BTreeMap::new(),
+            5_000,
+            30,
+            600,
+            5_000,
+            40_000,
+            1_000,
+            350_000,
+            0,
+            0,
+            8_388_608,
+            t,
         );
         p.update_bin(8_388_608, 1_000_000, 1_000_000);
         p
@@ -819,17 +925,159 @@ mod tests {
             .calculate_output_at(
                 &pool.token_x.clone(),
                 U256::from(1_000u64),
-                &QuoteContext { timestamp: 1_700_000_000 },
+                &QuoteContext {
+                    timestamp: 1_700_000_000,
+                },
             )
             .unwrap();
         let late = pool
             .calculate_output_at(
                 &pool.token_x.clone(),
                 U256::from(1_000u64),
-                &QuoteContext { timestamp: 1_700_100_000 },
+                &QuoteContext {
+                    timestamp: 1_700_100_000,
+                },
             )
             .unwrap();
 
         assert!(early <= late, "decayed volatility should not raise the fee");
+    }
+
+    #[test]
+    fn topics_cover_both_generations_without_collision() {
+        let topics = LBPool::topics();
+        assert!(topics.contains(&ILBPair::Swap::SIGNATURE_HASH));
+        assert!(topics.contains(&crate::contracts::ILBPairV20::Swap::SIGNATURE_HASH));
+
+        let mut sorted = topics.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), topics.len(), "duplicate topic registered");
+    }
+
+    /// Build a v2.0 Swap log.
+    fn v20_swap_log(
+        id: u32,
+        swap_for_y: bool,
+        amount_in: u128,
+        amount_out: u128,
+        vol_acc: u32,
+        block_timestamp: u64,
+    ) -> Log {
+        let event = crate::contracts::ILBPairV20::Swap {
+            sender: Address::ZERO,
+            recipient: Address::ZERO,
+            id: U256::from(id),
+            swapForY: swap_for_y,
+            amountIn: U256::from(amount_in),
+            amountOut: U256::from(amount_out),
+            volatilityAccumulated: U256::from(vol_acc),
+            fees: U256::ZERO,
+        };
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_timestamp: Some(block_timestamp),
+            ..Default::default()
+        }
+    }
+
+    /// The v2.0 Swap arm must call update_references() on PRE-swap state:
+    /// id_reference takes the pre-swap active_id (not the swap's final bin),
+    /// and volatility_reference is written from the decayed accumulator.
+    #[test]
+    fn v20_swap_updates_references_before_overwriting_state() {
+        let mut pool = pool_with_time(1_700_000_000);
+        pool.volatility_accumulator = 100_000;
+        pool.update_bin(8_388_610, 0, 2_000);
+
+        // dt = 100: past filter_period (30), inside decay_period (600).
+        pool.apply_log(&v20_swap_log(
+            8_388_610,
+            true,
+            1_000,
+            1_500,
+            77_777,
+            1_700_000_100,
+        ))
+        .unwrap();
+
+        // References were computed from pre-swap state.
+        assert_eq!(
+            pool.id_reference, 8_388_608,
+            "id_reference must be the PRE-swap active_id, not the event's id"
+        );
+        assert_eq!(
+            pool.volatility_reference, 50_000,
+            "volatility_reference must decay the PRE-swap accumulator"
+        );
+
+        // Then the event's own state was applied.
+        assert_eq!(pool.active_id, 8_388_610);
+        assert_eq!(pool.volatility_accumulator, 77_777);
+        assert_eq!(pool.time_of_last_update, 1_700_000_100);
+
+        // swapForY: X in, Y out.
+        assert_eq!(pool.bins.get(&8_388_610).copied(), Some((1_000, 500)));
+    }
+
+    /// v2.0 deposit/withdraw/composition-fee arms move the right bin.
+    #[test]
+    fn v20_liquidity_events_update_bins() {
+        use crate::contracts::ILBPairV20;
+
+        fn log_of<E: SolEvent>(event: E) -> Log {
+            Log {
+                inner: alloy::primitives::Log {
+                    address: Address::ZERO,
+                    data: event.encode_log_data(),
+                },
+                block_timestamp: Some(1_700_000_100),
+                ..Default::default()
+            }
+        }
+
+        let mut pool = pool_with_time(1_700_000_000);
+
+        pool.apply_log(&log_of(ILBPairV20::DepositedToBin {
+            sender: Address::ZERO,
+            recipient: Address::ZERO,
+            id: U256::from(8_388_608u32),
+            amountX: U256::from(500u64),
+            amountY: U256::from(700u64),
+        }))
+        .unwrap();
+        assert_eq!(
+            pool.bins.get(&8_388_608).copied(),
+            Some((1_000_500, 1_000_700))
+        );
+
+        pool.apply_log(&log_of(ILBPairV20::WithdrawnFromBin {
+            sender: Address::ZERO,
+            recipient: Address::ZERO,
+            id: U256::from(8_388_608u32),
+            amountX: U256::from(500u64),
+            amountY: U256::from(700u64),
+        }))
+        .unwrap();
+        assert_eq!(
+            pool.bins.get(&8_388_608).copied(),
+            Some((1_000_000, 1_000_000))
+        );
+
+        pool.apply_log(&log_of(ILBPairV20::CompositionFee {
+            sender: Address::ZERO,
+            recipient: Address::ZERO,
+            id: U256::from(8_388_608u32),
+            feesX: U256::from(3u64),
+            feesY: U256::from(4u64),
+        }))
+        .unwrap();
+        assert_eq!(
+            pool.bins.get(&8_388_608).copied(),
+            Some((1_000_003, 1_000_004))
+        );
     }
 }
