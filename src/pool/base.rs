@@ -1,4 +1,6 @@
-use crate::contracts::{IAlgebraFactory, IUniswapV2Factory, IUniswapV3Factory, IVeloPoolFactory};
+use crate::contracts::{
+    IAlgebraFactory, ILBFactory, IUniswapV2Factory, IUniswapV3Factory, IVeloPoolFactory,
+};
 use crate::erc4626::ERC4626Pool;
 use crate::erc4626::VerioIP;
 use crate::lb::LBPool;
@@ -186,4 +188,13 @@ pub const POOL_CREATED_TOPICS: &[Topic] = &[
     IUniswapV3Factory::PoolCreated::SIGNATURE_HASH,
     IAlgebraFactory::Pool::SIGNATURE_HASH,
     IVeloPoolFactory::PoolCreated::SIGNATURE_HASH,
+    // Trader Joe Liquidity Book, all generations (v2.0/v2.1/v2.2 share this
+    // event). Registering the topic is all this crate does: pairing it with an
+    // LB factory address (see `crate::lb::factories`) and feeding the decoded
+    // pair into `add_pools` is the consumer's job.
+    //
+    // Unlike every other LB topic in this crate, this one has NOT been
+    // confirmed against a live log — see the `ILBFactory` binding in
+    // `src/contracts.rs` for why and for what that means.
+    ILBFactory::LBPairCreated::SIGNATURE_HASH,
 ];
