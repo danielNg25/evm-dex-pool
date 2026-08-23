@@ -70,17 +70,19 @@ sol! {
 // LB v2.0, v2.1 and v2.2 — the same five parameters in the same order — so a
 // single binding covers every generation and a single topic0 matches them all.
 //
-// UNVERIFIED AGAINST A LIVE EVENT. Every other LB topic0 in this crate was
-// checked against a log pulled off Avalanche; this one could not be. Pair
-// creation is rare enough that both the v2.1 and v2.2 factories emitted zero
-// logs across 240,000 recent blocks, and the pairs used as fixtures elsewhere
-// in this crate were all created before the archive endpoint's 10,000,000-block
-// retention window, so their creation logs are unreachable. The topic is
-// therefore derived from this ABI by `sol!` — correct by construction if the
-// ABI is right — and is NOT corroborated by an observed `LBPairCreated` log.
-// Do not add a test that asserts this hash against a constant computed from
-// the same ABI; that proves nothing. If a creation event ever lands inside
-// the archive window, verify it then and say so here.
+// VERIFIED AGAINST A LIVE EVENT. The earlier caveat here — that pair creation
+// looked too rare to observe within reach of the archive endpoint's
+// retention window — turned out to be a sampling artifact: creation is
+// concentrated in an earlier era (24-97 `LBPairCreated` logs per 2,000-block
+// window around Avalanche blocks 88.7M-91.5M), not spread evenly across
+// recent history. A real log, decoded through this exact binding, matched
+// `LBPairCreated(address indexed tokenX, address indexed tokenY, uint256
+// indexed binStep, address LBPair, uint256 pid)` field-for-field: three
+// indexed topics (tokenX, tokenY, binStep) and two data words (LBPair, pid),
+// emitted by the v2.2 factory `0xb43120c4745967fa9b93E79C149E66B0f2D6Fe0c`.
+// See `lb_pair_created_topic_matches_deployed_contract` in
+// `src/contracts_rpc.rs` for the pinned topic0 hash and
+// `tests/lb_discovery.rs` for the live fetch-and-decode integration test.
 sol! {
     ILBFactory,
     "contracts/ABI/ILBFactory.json"

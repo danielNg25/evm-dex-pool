@@ -221,4 +221,30 @@ mod tests {
             hex!("a32e146844d6144a22e94c586715a1317d58a8aa3581ec33d040113ddcb24350")
         );
     }
+
+    /// Ground truth, from a live Avalanche log decoded off the v2.2 factory
+    /// `0xb43120c4745967fa9b93E79C149E66B0f2D6Fe0c` in the window ending at
+    /// block 91,408,504: three indexed topics (tokenX
+    /// `0x30d83929d743a5f28108fb394f8187d54ea804d6`, tokenY WAVAX
+    /// `0xb31f66aa3c1e785363f0875a1b74e27b85fd66c7`, binStep `10`) and two
+    /// data words (LBPair `0x8d8591de161bb901549f569676f2d2d4687e5210`, pid
+    /// `41200`) — matching this crate's `ILBFactory::LBPairCreated` binding
+    /// field-for-field.
+    ///
+    /// The hash below is what the chain emitted. If
+    /// `contracts/ABI/ILBFactory.json` ever produces a different one, the
+    /// ABI is wrong — do not "fix" this constant. See
+    /// `tests/lb_discovery.rs` for a live-fetch integration test that
+    /// decodes a fresh log through this same binding.
+    #[test]
+    fn lb_pair_created_topic_matches_deployed_contract() {
+        assert_eq!(
+            crate::contracts::ILBFactory::LBPairCreated::SIGNATURE,
+            "LBPairCreated(address,address,uint256,address,uint256)"
+        );
+        assert_eq!(
+            crate::contracts::ILBFactory::LBPairCreated::SIGNATURE_HASH,
+            hex!("2c8d104b27c6b7f4492017a6f5cf3803043688934ebcaa6a03540beeaf976aff")
+        );
+    }
 }

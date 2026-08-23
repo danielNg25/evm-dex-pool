@@ -193,8 +193,9 @@ pub const POOL_CREATED_TOPICS: &[Topic] = &[
     // LB factory address (see `crate::lb::factories`) and feeding the decoded
     // pair into `add_pools` is the consumer's job.
     //
-    // Unlike every other LB topic in this crate, this one has NOT been
-    // confirmed against a live log — see the `ILBFactory` binding in
-    // `src/contracts.rs` for why and for what that means.
+    // Like every other LB topic in this crate, this one HAS been confirmed
+    // against a live log — see the `ILBFactory` binding in `src/contracts.rs`
+    // for the details and `tests/lb_discovery.rs` for the fetch-and-decode
+    // integration test.
     ILBFactory::LBPairCreated::SIGNATURE_HASH,
 ];
