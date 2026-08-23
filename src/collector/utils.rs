@@ -58,19 +58,29 @@ pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(
     let futures = wanted.iter().map(|&n| {
         let provider = provider.clone();
         async move {
-            let block = provider
-                .get_block_by_number(BlockNumberOrTag::Number(n))
-                .await
-                .ok()
-                .flatten();
-            (n, block.map(|b| b.header.timestamp))
+            match provider.get_block_by_number(BlockNumberOrTag::Number(n)).await {
+                Ok(Some(block)) => (n, Ok(block.header.timestamp)),
+                // The RPC call succeeded but had nothing to return for this
+                // number (e.g. reorg'd away, or not yet visible to this node).
+                Ok(None) => (n, Err("no block returned".to_string())),
+                // The RPC call itself failed (timeout, rate limit, transport
+                // error, etc). Distinct from the above: this is a request
+                // that never got an answer at all.
+                Err(e) => (n, Err(e.to_string())),
+            }
         }
     });
-    let fetched: HashMap<u64, u64> = futures_util::future::join_all(futures)
-        .await
-        .into_iter()
-        .filter_map(|(n, ts)| ts.map(|t| (n, t)))
-        .collect();
+
+    let mut fetched: HashMap<u64, u64> = HashMap::new();
+    let mut failures: Vec<(u64, String)> = Vec::new();
+    for (n, result) in futures_util::future::join_all(futures).await {
+        match result {
+            Ok(ts) => {
+                fetched.insert(n, ts);
+            }
+            Err(reason) => failures.push((n, reason)),
+        }
+    }
 
     // A block whose header could not be read leaves every log in it on the
     // caller's fallback (wall clock, for `LBPool::apply_log`). That fallback
@@ -78,10 +88,24 @@ pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(
     // degradation here can zero out `volatility_reference` mid-replay. Loud
     // by design: this is exactly the failure mode the timestamp-enrichment
     // path exists to prevent.
-    if fetched.len() < wanted.len() {
+    if !failures.is_empty() {
+        const MAX_REASONS_SHOWN: usize = 5;
+        let reasons = failures
+            .iter()
+            .take(MAX_REASONS_SHOWN)
+            .map(|(n, reason)| format!("{n}: {reason}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let remaining = failures.len().saturating_sub(MAX_REASONS_SHOWN);
+        let more = if remaining > 0 {
+            format!(" (+{remaining} more)")
+        } else {
+            String::new()
+        };
         warn!(
             "enrich_log_timestamps: resolved {} of {} requested block headers; \
-             logs in unresolved blocks keep their wall-clock fallback timestamp",
+             logs in unresolved blocks keep their wall-clock fallback timestamp; \
+             failures: [{reasons}]{more}",
             fetched.len(),
             wanted.len()
         );
@@ -129,5 +153,70 @@ mod tests {
         let mut none_needed = vec![log_at(7)];
         none_needed[0].block_timestamp = Some(42);
         assert!(blocks_needing_timestamps(&none_needed).is_empty());
+    }
+
+    /// Exercises `enrich_log_timestamps` against a real `Provider` backed by
+    /// alloy's built-in mock transport (`alloy::providers::mock::Asserter`),
+    /// so the RPC-error and no-block branches run as actual code paths
+    /// rather than being inferred from `blocks_needing_timestamps` alone.
+    mod with_mocked_provider {
+        use super::*;
+        use alloy::providers::mock::Asserter;
+        use alloy::providers::ProviderBuilder;
+        use alloy::rpc::types::{Block, Header as RpcHeader};
+
+        fn block_with_timestamp(timestamp: u64) -> Block {
+            let inner = alloy::consensus::Header {
+                timestamp,
+                ..Default::default()
+            };
+            Block::empty(RpcHeader::new(inner))
+        }
+
+        /// Happy path sanity check: confirms the mocked provider actually
+        /// exercises `get_block_by_number` the way the live RPC path does,
+        /// so the failure-mode tests below are trustworthy.
+        #[tokio::test]
+        async fn fills_in_timestamp_when_the_header_is_returned() {
+            let asserter = Asserter::new();
+            let provider = Arc::new(ProviderBuilder::new().connect_mocked_client(asserter.clone()));
+            asserter.push_success(&block_with_timestamp(1_700_000_000));
+
+            let mut logs = vec![log_at(100)];
+            enrich_log_timestamps(&provider, &mut logs).await.unwrap();
+
+            assert_eq!(logs[0].block_timestamp, Some(1_700_000_000));
+        }
+
+        /// Failure mode 1: the RPC call itself errors out.
+        #[tokio::test]
+        async fn keeps_fallback_when_the_rpc_call_errors() {
+            let asserter = Asserter::new();
+            let provider = Arc::new(ProviderBuilder::new().connect_mocked_client(asserter.clone()));
+            asserter.push_failure_msg("boom: connection reset");
+
+            let mut logs = vec![log_at(100)];
+            let result = enrich_log_timestamps(&provider, &mut logs).await;
+
+            // Same contract as before: partial failure still returns Ok(()),
+            // and the unresolved log keeps its caller-supplied fallback.
+            assert!(result.is_ok());
+            assert_eq!(logs[0].block_timestamp, None);
+        }
+
+        /// Failure mode 2: the RPC call succeeds but has no block for that
+        /// number (e.g. `eth_getBlockByNumber` returning `null`).
+        #[tokio::test]
+        async fn keeps_fallback_when_no_block_is_returned() {
+            let asserter = Asserter::new();
+            let provider = Arc::new(ProviderBuilder::new().connect_mocked_client(asserter.clone()));
+            asserter.push_success(&Option::<Block>::None);
+
+            let mut logs = vec![log_at(100)];
+            let result = enrich_log_timestamps(&provider, &mut logs).await;
+
+            assert!(result.is_ok());
+            assert_eq!(logs[0].block_timestamp, None);
+        }
     }
 }
