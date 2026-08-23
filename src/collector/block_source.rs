@@ -30,6 +30,64 @@ async fn enrich_if_lb_pools_present<P: Provider + Send + Sync>(
     Ok(())
 }
 
+/// Position of a log in chain order: `(block number, transaction index, log index)`.
+///
+/// Ordered so that Rust's lexicographic tuple comparison *is* chain order.
+type LogPosition = (u64, u64, u64);
+
+/// Chain-order position of `log`, or `None` when any of the three coordinates
+/// is missing.
+///
+/// Every log returned by `eth_getLogs` over a numbered block range is mined and
+/// carries all three; `None` means a malformed or non-conforming RPC response.
+fn log_position(log: &Log) -> Option<LogPosition> {
+    Some((log.block_number?, log.transaction_index?, log.log_index?))
+}
+
+/// Whether `position` is at or after `boundary` in chain order.
+///
+/// The three coordinates must be compared *lexicographically* — block first,
+/// and the lower coordinates only to break a tie on the higher ones. Comparing
+/// them independently (`block >= b && tx >= t && log >= l`) misses any later
+/// block whose transaction index happens to be smaller: `(101, 2, 0)` is
+/// strictly after `(100, 5, 3)` in chain order, yet `2 >= 5` is false. During
+/// websocket bootstrap that means RPC catch-up applies an event the queue also
+/// delivers, so the event lands twice and reserves are over-stated.
+fn is_at_or_after(position: LogPosition, boundary: LogPosition) -> bool {
+    position >= boundary
+}
+
+/// Inclusive `(from, to)` block ranges the websocket catch-up has to fetch.
+///
+/// Covers `(last_processed_block, first_event_block]`: the cursor block's events
+/// are already reflected in registry state, and `first_event_block` *is*
+/// included because the first queued event sits mid-block — the events before
+/// it in that block reach the registry only through this catch-up.
+///
+/// `fetch_events` builds a filter that is inclusive at both ends, so successive
+/// ranges must not share a block: `[a, b]` is followed by `[b + 1, ..]`, never
+/// `[b, ..]`. Sharing it applied every batch boundary block's events twice.
+fn catchup_batches(
+    last_processed_block: u64,
+    max_blocks_per_batch: u64,
+    first_event_block: u64,
+) -> Vec<(u64, u64)> {
+    // A zero-configured batch size would otherwise underflow below and yield a
+    // range that never advances.
+    let span = max_blocks_per_batch.max(1);
+    let mut batches = Vec::new();
+    let mut start = last_processed_block.saturating_add(1);
+    while start <= first_event_block {
+        let end = std::cmp::min(start.saturating_add(span - 1), first_event_block);
+        batches.push((start, end));
+        if end >= first_event_block {
+            break;
+        }
+        start = end + 1;
+    }
+    batches
+}
+
 /// How the unified updater should process a batch of events.
 pub enum ProcessingMode {
     /// Apply to pool registry only. Used for catch-up / non-latest confirmed blocks.
@@ -411,32 +469,53 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             events.len()
         );
 
-        let mut first_event_block = latest_block;
-        let mut first_event_index = 0;
-        let mut first_event_log_index = 0;
-        if !events.is_empty() {
-            let first_event = events.first().unwrap();
-            first_event_block = first_event.block_number.unwrap();
-            first_event_index = first_event.transaction_index.unwrap();
-            first_event_log_index = first_event.log_index.unwrap();
-        }
+        // Chain-order position of the earliest queued event. RPC catch-up must
+        // cover exactly `(last_processed, first_queued)` — everything from this
+        // position onwards arrives from the queue below, so applying any of it
+        // here too would double-apply it.
+        //
+        // `min` rather than `first` because it does not assume the queue
+        // preserves chain order (several websocket listeners may feed it), and
+        // it ignores any log whose payload left the position incomplete.
+        // Falling back to `(latest_block, 0, 0)` when the queue is empty keeps
+        // the previous behaviour: catch up through `latest_block` exclusive,
+        // leaving that block's events to the live subscription.
+        let first_queued_position: LogPosition = events
+            .iter()
+            .filter_map(log_position)
+            .min()
+            .unwrap_or((latest_block, 0, 0));
+        let (first_event_block, first_event_index, first_event_log_index) = first_queued_position;
         info!(
-            "[Chain {}] First event block: {}; index: {}",
-            self.chain_id, first_event_block, first_event_index
+            "[Chain {}] First event block: {}; tx index: {}; log index: {}",
+            self.chain_id, first_event_block, first_event_index, first_event_log_index
         );
 
-        // Catch up from last processed block to first websocket event
+        // Catch up from last processed block to first websocket event.
+        //
+        // `last_processed_block` is the block whose events the registry state
+        // already includes, so catch-up starts at the block *after* it — the
+        // same convention `LatestBlockSource`, `PendingBlockSource` and
+        // `catchup_registry_to_block` use. Starting at `last_processed_block`
+        // re-applied that whole block.
         let last_processed_block = self.pool_registry.get_last_processed_block();
-        let mut start_block = last_processed_block;
         let topics = self.topics.to_vec();
 
         info!(
             "[Chain {}] Catching up to first event block {}",
             self.chain_id, first_event_block
         );
-        while start_block < first_event_block {
-            let end_block =
-                std::cmp::min(start_block + self.max_blocks_per_batch, first_event_block);
+        // Batches tile the gap exactly once each — see `catchup_batches`.
+        // Indexed rather than iterated so the error arm below can retry the
+        // same batch, as it always has, instead of skipping it.
+        let batches = catchup_batches(
+            last_processed_block,
+            self.max_blocks_per_batch,
+            first_event_block,
+        );
+        let mut batch_index = 0usize;
+        while batch_index < batches.len() {
+            let (start_block, end_block) = batches[batch_index];
 
             match fetch_events(
                 &self.provider,
@@ -465,17 +544,33 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
 
                     let mut should_break = false;
                     for event in fetched_events {
-                        // Stop if we've reached the first WS event
-                        if event.block_number.unwrap() >= first_event_block
-                            && event.transaction_index.unwrap() >= first_event_index
-                            && event.log_index.unwrap() >= first_event_log_index
-                        {
-                            info!(
-                                "[Chain {}] Reached first event {} block {} index {}, breaking",
+                        // A log the RPC returned without a full position cannot
+                        // be ordered against the queue boundary. Skip it rather
+                        // than panic on the unwrap or risk applying an event the
+                        // queue also delivers; every mined log carries all three
+                        // coordinates, so this is a malformed response.
+                        let Some(position) = log_position(&event) else {
+                            error!(
+                                "[Chain {}] Skipping log without a chain position (block {:?}, tx index {:?}, log index {:?}) for pool {}",
                                 self.chain_id,
-                                event.transaction_hash.unwrap(),
-                                event.block_number.unwrap(),
-                                event.transaction_index.unwrap()
+                                event.block_number,
+                                event.transaction_index,
+                                event.log_index,
+                                event.address()
+                            );
+                            continue;
+                        };
+
+                        // Stop if we've reached the first WS event. This event
+                        // and everything after it arrive from the queue below.
+                        if is_at_or_after(position, first_queued_position) {
+                            info!(
+                                "[Chain {}] Reached first event {:?} block {} tx index {} log index {}, breaking",
+                                self.chain_id,
+                                event.transaction_hash,
+                                position.0,
+                                position.1,
+                                position.2
                             );
                             should_break = true;
                             break;
@@ -484,17 +579,19 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                         if let Some(pool) = self.pool_registry.get_pool(&event.address()) {
                             if let Err(e) = pool.write().await.apply_log(&event) {
                                 error!(
-                                    "[Chain {}] Error applying event {} for pool {}, event {}",
+                                    "[Chain {}] Error applying event {} for pool {}, event {:?}",
                                     self.chain_id,
                                     e,
                                     event.address(),
-                                    event.transaction_hash.unwrap()
+                                    event.transaction_hash
                                 );
                             }
                         }
                     }
 
-                    if end_block >= first_event_block || should_break {
+                    // The queue takes over from here; the remaining batches
+                    // would only re-apply what it already holds.
+                    if should_break {
                         break;
                     }
                 }
@@ -507,7 +604,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 }
             }
 
-            start_block = end_block;
+            batch_index += 1;
         }
 
         // Apply the initial websocket events that were buffered
@@ -517,11 +614,11 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             if let Some(pool) = self.pool_registry.get_pool(&event.address()) {
                 if let Err(e) = pool.write().await.apply_log(&event) {
                     error!(
-                        "[Chain {}] Error applying event {} for pool {}, event {}",
+                        "[Chain {}] Error applying event {} for pool {}, event {:?}",
                         self.chain_id,
                         e,
                         event.address(),
-                        event.transaction_hash.unwrap()
+                        event.transaction_hash
                     );
                 }
             }
@@ -609,5 +706,159 @@ async fn get_block_number_with_retry<P: Provider + Send + Sync>(
         }
         tokio::time::sleep(backoff).await;
         backoff = std::cmp::min(backoff * 2, max_backoff);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stop test as it was written before the fix: three independent `>=`
+    /// comparisons ANDed together. Kept here only to pin the difference.
+    fn legacy_stop_test(position: LogPosition, boundary: LogPosition) -> bool {
+        position.0 >= boundary.0 && position.1 >= boundary.1 && position.2 >= boundary.2
+    }
+
+    fn log_at(block: u64, tx_index: u64, log_index: u64) -> Log {
+        Log {
+            block_number: Some(block),
+            transaction_index: Some(tx_index),
+            log_index: Some(log_index),
+            ..Default::default()
+        }
+    }
+
+    // -- ordering test ------------------------------------------------------
+
+    #[test]
+    fn later_block_with_smaller_tx_index_is_at_or_after() {
+        // The live Avalanche counterexample: the first queued event is at
+        // (100, 5, 3) and a catch-up event at (101, 2, 0) is strictly later in
+        // chain order, so catch-up must stop rather than apply it — the queue
+        // delivers it.
+        let boundary = (100, 5, 3);
+        assert!(is_at_or_after((101, 2, 0), boundary));
+        // ...which is exactly where the old three-way AND went wrong.
+        assert!(!legacy_stop_test((101, 2, 0), boundary));
+    }
+
+    #[test]
+    fn same_block_with_smaller_log_index_is_before() {
+        let boundary = (100, 5, 3);
+        assert!(!is_at_or_after((100, 5, 2), boundary));
+        assert!(!is_at_or_after((100, 4, 9), boundary));
+        assert!(!is_at_or_after((99, 9, 9), boundary));
+    }
+
+    #[test]
+    fn boundary_itself_is_at_or_after() {
+        let boundary = (100, 5, 3);
+        assert!(is_at_or_after(boundary, boundary));
+        assert!(is_at_or_after((100, 5, 4), boundary));
+        assert!(is_at_or_after((100, 6, 0), boundary));
+    }
+
+    #[test]
+    fn log_position_requires_all_three_coordinates() {
+        assert_eq!(log_position(&log_at(100, 5, 3)), Some((100, 5, 3)));
+
+        let mut no_block = log_at(100, 5, 3);
+        no_block.block_number = None;
+        assert_eq!(log_position(&no_block), None);
+
+        let mut no_tx = log_at(100, 5, 3);
+        no_tx.transaction_index = None;
+        assert_eq!(log_position(&no_tx), None);
+
+        let mut no_log_index = log_at(100, 5, 3);
+        no_log_index.log_index = None;
+        assert_eq!(log_position(&no_log_index), None);
+    }
+
+    // -- batch boundary -----------------------------------------------------
+
+    /// Every block in `(last_processed, first_event_block]` appears in exactly
+    /// one batch — no repeats (which double-apply) and no gaps (which drop).
+    fn assert_tiles_exactly_once(last_processed: u64, span: u64, first_event_block: u64) {
+        let batches = catchup_batches(last_processed, span, first_event_block);
+        let mut expected = last_processed + 1;
+        for (from, to) in &batches {
+            assert_eq!(
+                *from,
+                expected,
+                "batch {:?} does not resume at {} (batches: {:?})",
+                (from, to),
+                expected,
+                batches
+            );
+            assert!(to >= from, "empty batch {:?}", (from, to));
+            expected = to + 1;
+        }
+        assert_eq!(
+            expected,
+            first_event_block + 1,
+            "batches stop short of {} (batches: {:?})",
+            first_event_block,
+            batches
+        );
+    }
+
+    #[test]
+    fn batches_do_not_share_a_boundary_block() {
+        // fetch_events is inclusive at both ends, so [101,110] must be followed
+        // by [111,...]. The pre-fix loop produced [100,110], [110,120], ...
+        assert_eq!(
+            catchup_batches(100, 10, 135),
+            vec![(101, 110), (111, 120), (121, 130), (131, 135)]
+        );
+    }
+
+    #[test]
+    fn batches_start_after_the_processed_cursor() {
+        // last_processed's events are already in registry state.
+        assert_eq!(catchup_batches(100, 10, 105), vec![(101, 105)]);
+    }
+
+    #[test]
+    fn batches_cover_every_block_exactly_once() {
+        for span in [1, 2, 3, 7, 10, 1000] {
+            for first_event_block in 100..=140 {
+                assert_tiles_exactly_once(100, span, first_event_block);
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_and_equal_cursors_terminate() {
+        // First queued event is in the very next block: that block still needs
+        // fetching, because events preceding the queued one are not in the queue.
+        assert_eq!(catchup_batches(100, 10, 101), vec![(101, 101)]);
+        // Nothing to catch up: the cursor is already at or past the queue.
+        assert_eq!(catchup_batches(100, 10, 100), vec![]);
+        assert_eq!(catchup_batches(100, 10, 99), vec![]);
+    }
+
+    #[test]
+    fn zero_batch_size_still_advances() {
+        assert_eq!(
+            catchup_batches(100, 0, 103),
+            vec![(101, 101), (102, 102), (103, 103)]
+        );
+    }
+
+    #[test]
+    fn saturating_bounds_do_not_overflow() {
+        assert_eq!(
+            catchup_batches(u64::MAX - 1, 10, u64::MAX),
+            vec![(u64::MAX, u64::MAX)]
+        );
+        assert_eq!(
+            catchup_batches(u64::MAX - 2, u64::MAX, u64::MAX),
+            vec![(u64::MAX - 1, u64::MAX)]
+        );
     }
 }
