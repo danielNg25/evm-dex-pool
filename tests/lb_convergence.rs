@@ -61,6 +61,14 @@ const V20_REQUIRED_TOPICS: [(&str, B256); 2] = [
     ),
 ];
 
+/// Coverage set for the flash-loan fixture. `FlashLoan` is the whole point of
+/// the range; `Swap` rides along so the range is not exclusively flash loans
+/// and the ordinary replay path is still exercised beside them.
+const FLASHLOAN_REQUIRED_TOPICS: [(&str, B256); 2] = [
+    ("Swap", ILBPair::Swap::SIGNATURE_HASH),
+    ("FlashLoan", ILBPair::FlashLoan::SIGNATURE_HASH),
+];
+
 const V22_POOL: Address = address!("8573f98175d816d520248b5facf40d309b1c9cee");
 const V21_POOL: Address = address!("4224f6f4c9280509724db2dbac314621e4465c29");
 /// LB v2.0 USDC.e/USDC on Avalanche, binStep 1. The only v2.0 pair with
@@ -108,6 +116,53 @@ async fn test_lb_convergence_v22() -> Result<()> {
 #[ignore]
 async fn test_lb_convergence_v21() -> Result<()> {
     converge_one(V21_POOL, "v2.1", Some(V21_RANGE), &REQUIRED_TOPICS).await
+}
+
+/// v2.1, flash-loan coverage. Verified live by `eth_getLogs` over this exact
+/// range: 19 logs — 15 Swap and 4 FlashLoan, and nothing else.
+///
+/// The four flash loans, decoded from their raw logs:
+///
+/// ```text
+/// block 93501454  activeId 8395265  totalFees (x=1, y=0)  protocolFees (0, 0)
+/// block 93501469  activeId 8395265  totalFees (x=1, y=0)  protocolFees (0, 0)
+/// block 93501476  activeId 8395263  totalFees (x=1, y=0)  protocolFees (0, 0)
+/// block 93502199  activeId 8395264  totalFees (x=1, y=0)  protocolFees (0, 0)
+/// ```
+///
+/// So this range is a real regression gate, not a smoke test: without the
+/// `FlashLoan` arm in `apply_log` the replay ends up 2 short on bin 8_395_265
+/// and 1 short on each of 8_395_263 and 8_395_264, and
+/// `assert_lb_pools_converge` fails on those bins. Block 93,502,199 is the
+/// one independently observed moving bin 8,395,264 from 1272 to 1273 while a
+/// collector without the fix stayed at 1272.
+///
+/// What this range does NOT cover: every one of the four has
+/// `protocolFees == 0`, so nothing here distinguishes crediting `totalFees`
+/// from crediting `totalFees - protocolFees`. That distinction is covered by
+/// `flash_loan_credits_the_named_bin_net_of_protocol_fees` in
+/// `src/lb/pool.rs`. Likewise the event's `activeId` equals the pool's
+/// `active_id` throughout, so the "use the bin the event names" choice is
+/// only pinned by that unit test.
+const V21_FLASHLOAN_RANGE: (u64, u64) = (93_501_000, 93_503_000);
+
+/// The end-to-end proof for the `FlashLoan` arm: replay across four real
+/// flash loans and refetch. Passing means the flash-loan credit, the bins it
+/// lands in, and the decision to leave `active_id` / the volatility fields /
+/// `time_of_last_update` alone all agree with the chain — `converge_one`
+/// compares every one of those fields, so if `flashLoan()` did touch the
+/// variable-fee parameters on chain this test would fail rather than pass
+/// quietly.
+#[tokio::test]
+#[ignore]
+async fn test_lb_convergence_v21_flashloan() -> Result<()> {
+    converge_one(
+        V21_POOL,
+        "v2.1-flashloan",
+        Some(V21_FLASHLOAN_RANGE),
+        &FLASHLOAN_REQUIRED_TOPICS,
+    )
+    .await
 }
 
 /// v2.0. Verified live: 2 Swap (blocks 93299096 and 93299113, 17s apart —

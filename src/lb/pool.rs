@@ -664,6 +664,88 @@ impl EventApplicable for LBPool {
                 self.max_volatility_accumulator = data.maxVolatilityAccumulator.to();
                 Ok(())
             }
+            Some(&ILBPair::FlashLoan::SIGNATURE_HASH) => {
+                // `LBPair.flashLoan()` credits the LP share of the loan fee
+                // straight into a bin and emits ONLY this event — no `Swap`, no
+                // `DepositedToBins`. Before this arm existed the topic was not
+                // even in `topics()`, so a collector-tracked pool silently
+                // under-stated that bin after every flash loan and under-quoted
+                // from then on, permanently and cumulatively.
+                //
+                // Observed on Avalanche: bin 8,395,264 of
+                // `0x4224f6f4c9280509724db2dbac314621e4465c29` moved 1272 ->
+                // 1273 at block 93,502,199 while the replayed pool stayed at
+                // 1272. Not an exotic path either — a `FlashLoan` occurs in 9
+                // of 60 sampled 2,000-block windows on that pool.
+                let d: ILBPair::FlashLoan = event.log_decode()?.inner.data;
+
+                // The bin credited is the one the EVENT names, not
+                // `self.active_id`. On chain the two agree — `flashLoan()`
+                // reads `activeId` out of the packed parameters and writes
+                // exactly that bin — but sourcing it from the log is what every
+                // other arm here does, and it stays right even if
+                // `self.active_id` has drifted. Unlike the v2.0 arms below, no
+                // fallible conversion is needed: the ABI type is `uint24`, so
+                // every value fits `u32` by construction.
+                let id: u32 = d.activeId.to();
+
+                let (total_x, total_y) = decode_amounts(d.totalFees);
+                let (protocol_x, protocol_y) = decode_amounts(d.protocolFees);
+
+                // Direction is always a CREDIT, on whichever side(s) were
+                // borrowed. The borrower repays principal plus `totalFees`;
+                // `protocolFees` is skimmed off into the pair's `_protocolFees`
+                // accumulator, which is not bin reserve and is not modelled
+                // here, and the remainder is added to the bin. Mirrors
+                // joe-v2 v2.1 `LBPair.flashLoan()`:
+                //
+                //   _bins[activeId] = _bins[activeId].add(totalFees.sub(protocolFees));
+                //
+                // `saturating_sub` would silently collapse to 0 on a malformed
+                // log and hand back a bin that looks plausible and is wrong —
+                // the exact failure mode the v2.0 arms were converted away
+                // from. Reject the log instead.
+                let net_x = total_x.checked_sub(protocol_x).ok_or_else(|| {
+                    anyhow!("FlashLoan protocolFees.x {protocol_x} exceeds totalFees.x {total_x}")
+                })?;
+                let net_y = total_y.checked_sub(protocol_y).ok_or_else(|| {
+                    anyhow!("FlashLoan protocolFees.y {protocol_y} exceeds totalFees.y {total_y}")
+                })?;
+
+                let (rx, ry) = self.bins.get(&id).copied().unwrap_or((0, 0));
+                let new_rx = rx
+                    .checked_add(net_x)
+                    .ok_or_else(|| anyhow!("FlashLoan credit overflows bin {id} reserve x"))?;
+                let new_ry = ry
+                    .checked_add(net_y)
+                    .ok_or_else(|| anyhow!("FlashLoan credit overflows bin {id} reserve y"))?;
+                self.update_bin(id, new_rx, new_ry);
+
+                // Deliberately touches NOTHING else. `flashLoan()` does not
+                // move the active bin, does not call `updateVolatilityParameters`
+                // or `updateReferences`, and does not write `timeOfLastUpdate`
+                // — it only reads `activeId` and `protocolShare` out of the
+                // packed parameters and writes them back unchanged. A flash
+                // loan moves no price, so there is no volatility to accumulate.
+                //
+                // Writing `self.active_id = id` here would be worse than
+                // redundant: in the `Swap` arms `active_id` is only ever
+                // assigned as part of the `update_references()` ordering that
+                // must run on pre-swap state, and setting it outside that
+                // sequence would desynchronise `id_reference` from
+                // `active_id` for the next swap.
+                //
+                // `test_lb_convergence_v21_flashloan` adjudicates this: its
+                // pinned range holds four FlashLoans, and the refetched pool
+                // is compared on `active_id`, `volatility_accumulator`,
+                // `volatility_reference`, `id_reference` and
+                // `time_of_last_update` as well as on every bin.
+
+                // last_updated is local bookkeeping and stays wall clock, same
+                // as the other v2.1+ arms above.
+                self.last_updated = chrono::Utc::now().timestamp() as u64;
+                Ok(())
+            }
             Some(&ILBPairV20::Swap::SIGNATURE_HASH) => {
                 let d: ILBPairV20::Swap = event.log_decode()?.inner.data;
                 // v2.0's event ABI widens every one of these to uint256, so the
@@ -814,12 +896,22 @@ impl TopicList for LBPool {
             ILBPair::DepositedToBins::SIGNATURE_HASH,
             ILBPair::WithdrawnFromBins::SIGNATURE_HASH,
             ILBPair::StaticFeeParametersSet::SIGNATURE_HASH,
+            // v2.1+ only. `flashLoan()` credits the LP share of the loan fee
+            // into the active bin and emits nothing else, so this topic is the
+            // only signal that the bin moved. v2.0 has no counterpart in
+            // `ILBPairV20` — see `flash_loan_has_no_v20_counterpart` below.
+            ILBPair::FlashLoan::SIGNATURE_HASH,
             ILBPairV20::Swap::SIGNATURE_HASH,
             ILBPairV20::DepositedToBin::SIGNATURE_HASH,
             ILBPairV20::WithdrawnFromBin::SIGNATURE_HASH,
         ]
     }
 
+    /// `FlashLoan` is deliberately absent. `profitable_topics` marks logs worth
+    /// re-evaluating for a trade, and a flash loan is not a trade: it moves no
+    /// price and changes no bin's *ratio* enough to be an opportunity signal —
+    /// it just adds a fee to the active bin. It still belongs in `topics()`
+    /// because the state change is real and must be applied.
     fn profitable_topics() -> Vec<Topic> {
         vec![
             ILBPair::Swap::SIGNATURE_HASH,
@@ -1159,6 +1251,144 @@ mod tests {
     fn v20_composition_fee_is_not_subscribed() {
         use crate::contracts::ILBPairV20;
         assert!(!LBPool::topics().contains(&ILBPairV20::CompositionFee::SIGNATURE_HASH));
-        assert_eq!(LBPool::topics().len(), 7);
+        assert_eq!(LBPool::topics().len(), 8);
+    }
+
+    // ─── FlashLoan ───────────────────────────────────────────────────────────
+
+    /// Pack a `(x, y)` amount pair the way LB does: X in the low 128 bits,
+    /// Y in the high 128 bits of a `bytes32`.
+    fn packed(x: u128, y: u128) -> B256 {
+        let mut b = [0u8; 32];
+        b[0..16].copy_from_slice(&y.to_be_bytes());
+        b[16..32].copy_from_slice(&x.to_be_bytes());
+        B256::from(b)
+    }
+
+    fn flash_loan_log(active_id: u32, total: (u128, u128), protocol: (u128, u128)) -> Log {
+        let event = ILBPair::FlashLoan {
+            sender: Address::ZERO,
+            receiver: Address::ZERO,
+            activeId: active_id.try_into().unwrap(),
+            amounts: packed(1_000_000, 0),
+            totalFees: packed(total.0, total.1),
+            protocolFees: packed(protocol.0, protocol.1),
+        };
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_timestamp: Some(1_700_009_999),
+            ..Default::default()
+        }
+    }
+
+    /// The credit lands in the bin the EVENT names, and it is
+    /// `totalFees - protocolFees` on each side.
+    ///
+    /// Both halves need a unit test rather than only the live fixture. The
+    /// live range pinned by `test_lb_convergence_v21_flashloan` has
+    /// `protocolFees == 0` on all four of its FlashLoans, so nothing there
+    /// distinguishes `totalFees` from `totalFees - protocolFees`; a handler
+    /// that credited the gross fee would pass it. And in that range the
+    /// event's `activeId` always equals the pool's `active_id`, so nothing
+    /// there distinguishes the two sources for the bin id either. This test
+    /// separates both: the flash loan names a bin that is NOT `active_id`,
+    /// and the protocol share is non-zero and different on X and Y.
+    #[test]
+    fn flash_loan_credits_the_named_bin_net_of_protocol_fees() {
+        let mut pool = pool_with_time(1_700_000_000);
+        pool.update_bin(8_388_609, 5, 5);
+
+        pool.apply_log(&flash_loan_log(8_388_609, (100, 40), (30, 10)))
+            .unwrap();
+
+        assert_eq!(
+            pool.bins.get(&8_388_609).copied(),
+            Some((5 + 70, 5 + 30)),
+            "bin named by the event must gain totalFees - protocolFees"
+        );
+        assert_eq!(
+            pool.bins.get(&8_388_608).copied(),
+            Some((1_000_000, 1_000_000)),
+            "self.active_id's bin must not be touched when the event names another"
+        );
+    }
+
+    /// A flash loan moves no price, so it must not disturb any of the
+    /// swap-driven state. If `flashLoan()` ever did update the volatility
+    /// parameters on chain, `test_lb_convergence_v21_flashloan` would fail
+    /// against a refetch — that live test, not this one, is the evidence for
+    /// the claim; this one pins the behaviour so a later edit cannot quietly
+    /// change it without a live run.
+    #[test]
+    fn flash_loan_leaves_swap_state_untouched() {
+        let mut pool = pool_with_time(1_700_000_000);
+        pool.active_id = 8_388_608;
+        pool.volatility_accumulator = 123_456;
+        pool.volatility_reference = 65_432;
+        pool.id_reference = 8_388_600;
+
+        pool.apply_log(&flash_loan_log(8_388_608, (7, 0), (0, 0)))
+            .unwrap();
+
+        assert_eq!(pool.active_id, 8_388_608);
+        assert_eq!(pool.volatility_accumulator, 123_456);
+        assert_eq!(pool.volatility_reference, 65_432);
+        assert_eq!(pool.id_reference, 8_388_600);
+        assert_eq!(
+            pool.time_of_last_update, 1_700_000_000,
+            "flashLoan() does not write timeOfLastUpdate on chain, so replay must not either"
+        );
+        assert_eq!(
+            pool.bins.get(&8_388_608).copied(),
+            Some((1_000_007, 1_000_000))
+        );
+    }
+
+    /// `protocolFees > totalFees` is impossible on chain, so it means the log
+    /// is malformed or misdecoded. Reject it loudly instead of saturating to a
+    /// zero credit, which would leave a plausible-looking but wrong bin.
+    #[test]
+    fn flash_loan_rejects_protocol_fees_exceeding_total() {
+        let mut pool = pool_with_time(1_700_000_000);
+        let before = pool.bins.get(&8_388_608).copied();
+
+        assert!(pool
+            .apply_log(&flash_loan_log(8_388_608, (10, 0), (11, 0)))
+            .is_err());
+        assert_eq!(pool.bins.get(&8_388_608).copied(), before);
+
+        assert!(pool
+            .apply_log(&flash_loan_log(8_388_608, (0, 10), (0, 11)))
+            .is_err());
+        assert_eq!(pool.bins.get(&8_388_608).copied(), before);
+    }
+
+    /// Subscribed (the bin really moves) but not profitable (no price moved).
+    #[test]
+    fn flash_loan_is_subscribed_but_not_profitable() {
+        assert!(LBPool::topics().contains(&ILBPair::FlashLoan::SIGNATURE_HASH));
+        assert!(!LBPool::profitable_topics().contains(&ILBPair::FlashLoan::SIGNATURE_HASH));
+    }
+
+    /// v2.0 gets no FlashLoan arm because `contracts/ABI/ILBPairV20.json`
+    /// declares no such event, and this crate does not invent ABI entries it
+    /// cannot check against a live log.
+    ///
+    /// Read this narrowly. It asserts what the checked-in v2.0 ABI contains,
+    /// NOT that deployed v2.0 pairs never emit a flash-loan event. Nobody has
+    /// established the latter here. If a v2.0 flash-loan log is ever captured
+    /// off-chain, add the event to that ABI with its observed topic0 asserted
+    /// in `src/contracts_rpc.rs`, wire an arm, and delete this test.
+    #[test]
+    fn flash_loan_has_no_v20_counterpart() {
+        const V20_ABI: &str = include_str!("../../contracts/ABI/ILBPairV20.json");
+        assert!(
+            !V20_ABI.contains("FlashLoan"),
+            "ILBPairV20.json gained a FlashLoan entry — wire an apply_log arm \
+             and a topics() entry for it, or this event is silently dropped"
+        );
     }
 }

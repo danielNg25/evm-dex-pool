@@ -187,6 +187,33 @@ mod tests {
         );
     }
 
+    /// Ground truth, from a live Avalanche log: tx
+    /// `0xb4aa0a25f7052b11f2d7dd77932cb4a844c9f8dfd58682d3148e91f8dd863fa2`,
+    /// block 93,502,199, pair `0x4224f6f4c9280509724db2dbac314621e4465c29`,
+    /// logIndex 13. Two indexed topics and four data words; word 0 is
+    /// `0x801a00` = 8,395,264 (the activeId, matching the bin that moved) and
+    /// word 2 is `totalFees` packed as `(x = 1, y = 0)`.
+    ///
+    /// The hash below is what the chain emitted. If `contracts/ABI/ILBPair.json`
+    /// ever produces a different one, the ABI is wrong — do not "fix" this
+    /// constant.
+    ///
+    /// v2.0 has no counterpart asserted here because
+    /// `contracts/ABI/ILBPairV20.json` declares no flash-loan event and none
+    /// was captured off-chain to derive one from — see
+    /// `flash_loan_has_no_v20_counterpart` in `src/lb/pool.rs`.
+    #[test]
+    fn v21_flash_loan_topic_matches_deployed_contract() {
+        assert_eq!(
+            crate::contracts::ILBPair::FlashLoan::SIGNATURE,
+            "FlashLoan(address,address,uint24,bytes32,bytes32,bytes32)"
+        );
+        assert_eq!(
+            crate::contracts::ILBPair::FlashLoan::SIGNATURE_HASH,
+            hex!("d126bd9d94daca8e55ffd8283fac05394aec8326c6b1639e1e8a445fbe8bbc7d")
+        );
+    }
+
     #[test]
     fn v21_withdrawn_from_bins_topic_matches_deployed_contract() {
         assert_eq!(

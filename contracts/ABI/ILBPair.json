@@ -346,6 +346,49 @@
     },
     {
         "type": "event",
+        "name": "FlashLoan",
+        "inputs": [
+            {
+                "name": "sender",
+                "type": "address",
+                "indexed": true,
+                "internalType": "address"
+            },
+            {
+                "name": "receiver",
+                "type": "address",
+                "indexed": true,
+                "internalType": "address"
+            },
+            {
+                "name": "activeId",
+                "type": "uint24",
+                "indexed": false,
+                "internalType": "uint24"
+            },
+            {
+                "name": "amounts",
+                "type": "bytes32",
+                "indexed": false,
+                "internalType": "bytes32"
+            },
+            {
+                "name": "totalFees",
+                "type": "bytes32",
+                "indexed": false,
+                "internalType": "bytes32"
+            },
+            {
+                "name": "protocolFees",
+                "type": "bytes32",
+                "indexed": false,
+                "internalType": "bytes32"
+            }
+        ],
+        "anonymous": false
+    },
+    {
+        "type": "event",
         "name": "StaticFeeParametersSet",
         "inputs": [
             {

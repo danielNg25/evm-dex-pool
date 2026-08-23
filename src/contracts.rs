@@ -65,3 +65,23 @@ sol! {
     IVeloPoolFactory,
     "contracts/ABI/IVeloPoolFactory.json"
 }
+
+// Trader Joe Liquidity Book factory. `LBPairCreated` is identical across
+// LB v2.0, v2.1 and v2.2 — the same five parameters in the same order — so a
+// single binding covers every generation and a single topic0 matches them all.
+//
+// UNVERIFIED AGAINST A LIVE EVENT. Every other LB topic0 in this crate was
+// checked against a log pulled off Avalanche; this one could not be. Pair
+// creation is rare enough that both the v2.1 and v2.2 factories emitted zero
+// logs across 240,000 recent blocks, and the pairs used as fixtures elsewhere
+// in this crate were all created before the archive endpoint's 10,000,000-block
+// retention window, so their creation logs are unreachable. The topic is
+// therefore derived from this ABI by `sol!` — correct by construction if the
+// ABI is right — and is NOT corroborated by an observed `LBPairCreated` log.
+// Do not add a test that asserts this hash against a constant computed from
+// the same ABI; that proves nothing. If a creation event ever lands inside
+// the archive window, verify it then and say so here.
+sol! {
+    ILBFactory,
+    "contracts/ABI/ILBFactory.json"
+}
