@@ -207,10 +207,28 @@ impl PoolRegistry {
             .store(block_number, Ordering::Relaxed);
     }
 
-    /// Add topics to the registry
+    /// Add topics to the registry, skipping any already present.
+    ///
+    /// Idempotent by design: `fetch_pools_into_registry` calls this once per
+    /// pool type on every fetch, and `CollectorHandle::add_pools` calls it
+    /// again on every dynamic pool addition, both passing the same handful of
+    /// topics for a given pool type each time. Without deduplication the
+    /// `Vec` grows without bound over the life of the process (e.g. fetching
+    /// 18 Trader Joe LB pools left 144 entries where 8 are meaningful), and
+    /// that list feeds directly into `Filter::event_signature(...)` for
+    /// `eth_getLogs`/`eth_subscribe`, wasting bandwidth on every request.
+    ///
+    /// Kept as a `Vec` (not a `HashSet`) so `get_topics()` keeps its ordering
+    /// stable across calls, which matters for anything diffing filters or
+    /// logs against a previous snapshot; the list is tiny once deduped, so
+    /// the linear containment check per insert is not a concern.
     pub fn add_topics(&self, topics: Vec<Topic>) {
         let mut topics_lock = self.topics.write().unwrap();
-        topics_lock.extend(topics);
+        for topic in topics {
+            if !topics_lock.contains(&topic) {
+                topics_lock.push(topic);
+            }
+        }
     }
 
     /// Add profitable topics to the registry
@@ -303,6 +321,60 @@ mod tests {
         let topics = vec![[0u8; 32].into()];
         registry.add_topics(topics.clone());
         assert_eq!(registry.get_topics().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_topics_is_idempotent() {
+        let registry = PoolRegistry::new(1);
+        let topics: Vec<Topic> = vec![[0u8; 32].into(), [1u8; 32].into()];
+
+        registry.add_topics(topics.clone());
+        assert_eq!(registry.get_topics().len(), 2);
+
+        // Adding the exact same list again must leave the length unchanged.
+        registry.add_topics(topics.clone());
+        assert_eq!(registry.get_topics().len(), 2);
+        registry.add_topics(topics.clone());
+        assert_eq!(registry.get_topics().len(), 2);
+
+        assert_eq!(registry.get_topics(), topics);
+    }
+
+    #[tokio::test]
+    async fn test_add_topics_overlapping_adds_only_new_entries() {
+        let registry = PoolRegistry::new(1);
+        let a: Topic = [0u8; 32].into();
+        let b: Topic = [1u8; 32].into();
+        let c: Topic = [2u8; 32].into();
+
+        registry.add_topics(vec![a, b]);
+        assert_eq!(registry.get_topics().len(), 2);
+
+        // `b` overlaps with the existing list; only `c` is new.
+        registry.add_topics(vec![b, c]);
+        let topics = registry.get_topics();
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics, vec![a, b, c]);
+    }
+
+    #[tokio::test]
+    async fn test_add_topics_repeated_per_pool_type_does_not_multiply() {
+        // Regression test: `fetch_pools_into_registry` calls `add_topics`
+        // once per pool type per fetch, and `CollectorHandle::add_pools`
+        // does the same on every dynamic pool addition. Simulate several
+        // such calls for the same pool type (as happens when a bot
+        // repeatedly discovers new Trader Joe LB pools) and assert the
+        // topic count stays at one pool type's topic count rather than
+        // growing by that count on every call.
+        let registry = PoolRegistry::new(1);
+        let lb_topics = PoolType::TraderJoeLB.topics();
+        let expected_len = lb_topics.len();
+
+        for _ in 0..18 {
+            registry.add_topics(PoolType::TraderJoeLB.topics());
+        }
+
+        assert_eq!(registry.get_topics().len(), expected_len);
     }
 
     #[tokio::test]
