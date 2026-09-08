@@ -112,6 +112,7 @@ fn build_fetch_config() -> PoolFetchConfig {
         wait_time_between_chunks: 200,
         max_retries: 3,
         parallel_fetch: true,
+
     }
 }
 
@@ -144,7 +145,11 @@ async fn assert_pools_match_chain_at<P>(
             .unwrap_or_else(|| panic!("[verify] Pool {} not found in registry", addr));
         let pool = pool_arc.read().await;
 
-        let pool_type = identify_pool_type(provider, addr)
+        let multicall_addr = evm_dex_pool::collector::resolve_multicall_address(
+            fetch_config.chain_id,
+            fetch_config.multicall_address,
+        );
+        let pool_type = identify_pool_type(provider, addr, multicall_addr)
             .await
             .unwrap_or_else(|e| panic!("[verify] identify_pool_type failed for {addr}: {e}"));
 
@@ -272,8 +277,10 @@ async fn test_add_pools_http() -> Result<()> {
             use_websocket: false,
             websocket_urls: vec![],
             wait_time: 2_000, // poll every 2 s
+            refetch_algebra_fee: false,
         },
         Arc::clone(&registry),
+        None,
         None,
         None,
     )
@@ -284,8 +291,9 @@ async fn test_add_pools_http() -> Result<()> {
 
     // ── Dynamically add new pools ──────────────────────────────────────────
     println!("[http] adding {} new pool(s) …", new_addrs.len());
+    let add_block = provider.get_block_number().await?;
     handle
-        .add_pools(new_addrs.clone(), &fetch_config, &token_info)
+        .add_pools(new_addrs.clone(), add_block, &fetch_config, &token_info)
         .await?;
     println!(
         "[http] add_pools done (registry now has {} pool(s)) — sleeping 100 s …",
@@ -392,8 +400,10 @@ async fn test_add_pools_ws() -> Result<()> {
             use_websocket: true,
             websocket_urls: WS_RPCS.iter().map(|s| s.to_string()).collect(),
             wait_time: 0,
+            refetch_algebra_fee: false,
         },
         Arc::clone(&registry),
+        None,
         None,
         None,
     )
@@ -404,8 +414,9 @@ async fn test_add_pools_ws() -> Result<()> {
 
     // ── Dynamically add new pools ──────────────────────────────────────────
     println!("[ws] adding {} new pool(s) …", new_addrs.len());
+    let add_block = provider.get_block_number().await?;
     handle
-        .add_pools(new_addrs.clone(), &fetch_config, &token_info)
+        .add_pools(new_addrs.clone(), add_block, &fetch_config, &token_info)
         .await?;
 
     // Immediately after add_pools_ws:

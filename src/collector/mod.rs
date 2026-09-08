@@ -1,3 +1,4 @@
+pub mod algebra_fee_refetch;
 pub mod block_source;
 pub mod bootstrap;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod unified_pool_updater;
 pub mod utils;
 pub mod websocket_listener;
 
+pub use algebra_fee_refetch::refetch_algebra_v3_fees;
 pub use block_source::{
     BlockSource, EventBatch, LatestBlockSource, PendingBlockSource, ProcessingMode,
     WebsocketBlockSource,
@@ -22,7 +24,9 @@ pub use event_queue::{create_event_queue, EventQueue, EventSender};
 pub use handle::CollectorHandle;
 pub use metrics::CollectorMetrics;
 pub use multicall::resolve_multicall_address;
-pub use pool_fetcher::{fetch_pool, fetch_pools_into_registry, identify_pool_type};
+pub use pool_fetcher::{
+    fetch_pool, fetch_pools_into_registry, identify_pool_type, identify_pool_types,
+};
 pub use unified_pool_updater::{UnifiedPoolUpdater, UpdaterMode};
 pub use utils::*;
 pub use websocket_listener::WebsocketListener;

@@ -59,30 +59,58 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
     let (token0, token1, fee, tick_spacing, sqrt_price_x96, tick, liquidity, factory) =
         if let Ok(slot0_result) = multicall_result.7 {
             (
-                multicall_result.0.unwrap(),
-                multicall_result.1.unwrap(),
-                multicall_result.2.unwrap(),
-                multicall_result.3.unwrap(),
+                multicall_result
+                    .0
+                    .map_err(|e| anyhow::anyhow!("token0() failed for {}: {}", pool_address, e))?,
+                multicall_result
+                    .1
+                    .map_err(|e| anyhow::anyhow!("token1() failed for {}: {}", pool_address, e))?,
+                multicall_result
+                    .2
+                    .map_err(|e| anyhow::anyhow!("fee() failed for {}: {}", pool_address, e))?,
+                multicall_result.3.map_err(|e| {
+                    anyhow::anyhow!("tickSpacing() failed for {}: {}", pool_address, e)
+                })?,
                 slot0_result.sqrtPriceX96,
                 slot0_result.tick,
-                multicall_result.5.unwrap(),
-                multicall_result.6.unwrap(),
+                multicall_result.5.map_err(|e| {
+                    anyhow::anyhow!("liquidity() failed for {}: {}", pool_address, e)
+                })?,
+                multicall_result
+                    .6
+                    .map_err(|e| anyhow::anyhow!("factory() failed for {}: {}", pool_address, e))?,
             )
         } else if let Ok(slot0_result) = multicall_result.12 {
             let fee: U24 = U24::from(slot0_result.fee);
             v3_pool_type = V3PoolType::AlgebraPoolFeeInState;
             (
-                multicall_result.0.unwrap(),
-                multicall_result.1.unwrap(),
+                multicall_result
+                    .0
+                    .map_err(|e| anyhow::anyhow!("token0() failed for {}: {}", pool_address, e))?,
+                multicall_result
+                    .1
+                    .map_err(|e| anyhow::anyhow!("token1() failed for {}: {}", pool_address, e))?,
                 fee,
-                multicall_result.3.unwrap(),
+                multicall_result.3.map_err(|e| {
+                    anyhow::anyhow!("tickSpacing() failed for {}: {}", pool_address, e)
+                })?,
                 slot0_result.price,
                 slot0_result.tick,
-                multicall_result.5.unwrap(),
-                multicall_result.6.unwrap(),
+                multicall_result.5.map_err(|e| {
+                    anyhow::anyhow!("liquidity() failed for {}: {}", pool_address, e)
+                })?,
+                multicall_result
+                    .6
+                    .map_err(|e| anyhow::anyhow!("factory() failed for {}: {}", pool_address, e))?,
             )
         } else if let Ok(_) = multicall_result.11 {
-            let slot0_result = multicall_result.10.unwrap();
+            let slot0_result = multicall_result.10.map_err(|e| {
+                anyhow::anyhow!(
+                    "globalState() [AlgebraTwoSideFee] failed for {}: {}",
+                    pool_address,
+                    e
+                )
+            })?;
             let fee: U24 = if slot0_result.feeZto > slot0_result.feeOtz {
                 U24::from(slot0_result.feeZto)
             } else {
@@ -90,41 +118,77 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
             };
             v3_pool_type = V3PoolType::AlgebraTwoSideFee;
             (
-                multicall_result.0.unwrap(),
-                multicall_result.1.unwrap(),
+                multicall_result
+                    .0
+                    .map_err(|e| anyhow::anyhow!("token0() failed for {}: {}", pool_address, e))?,
+                multicall_result
+                    .1
+                    .map_err(|e| anyhow::anyhow!("token1() failed for {}: {}", pool_address, e))?,
                 fee,
-                multicall_result.3.unwrap(),
+                multicall_result.3.map_err(|e| {
+                    anyhow::anyhow!("tickSpacing() failed for {}: {}", pool_address, e)
+                })?,
                 slot0_result.price,
                 slot0_result.tick,
-                multicall_result.5.unwrap(),
-                multicall_result.6.unwrap(),
+                multicall_result.5.map_err(|e| {
+                    anyhow::anyhow!("liquidity() failed for {}: {}", pool_address, e)
+                })?,
+                multicall_result
+                    .6
+                    .map_err(|e| anyhow::anyhow!("factory() failed for {}: {}", pool_address, e))?,
             )
         } else if let Ok(slot0_result) = multicall_result.9 {
             v3_pool_type = V3PoolType::AlgebraV3;
             (
-                multicall_result.0.unwrap(),
-                multicall_result.1.unwrap(),
-                U24::from(multicall_result.8.unwrap()),
-                multicall_result.3.unwrap(),
+                multicall_result
+                    .0
+                    .map_err(|e| anyhow::anyhow!("token0() failed for {}: {}", pool_address, e))?,
+                multicall_result
+                    .1
+                    .map_err(|e| anyhow::anyhow!("token1() failed for {}: {}", pool_address, e))?,
+                U24::from(multicall_result.8.map_err(|e| {
+                    anyhow::anyhow!("fee() [AlgebraV3] failed for {}: {}", pool_address, e)
+                })?),
+                multicall_result.3.map_err(|e| {
+                    anyhow::anyhow!("tickSpacing() failed for {}: {}", pool_address, e)
+                })?,
                 slot0_result.price,
                 slot0_result.tick,
-                multicall_result.5.unwrap(),
-                multicall_result.6.unwrap(),
+                multicall_result.5.map_err(|e| {
+                    anyhow::anyhow!("liquidity() failed for {}: {}", pool_address, e)
+                })?,
+                multicall_result
+                    .6
+                    .map_err(|e| anyhow::anyhow!("factory() failed for {}: {}", pool_address, e))?,
             )
         } else {
-            let slot0_result = multicall_result.4.unwrap();
-            let factory = multicall_result.6.unwrap();
+            let slot0_result = multicall_result
+                .4
+                .map_err(|e| anyhow::anyhow!("slot0() failed for {}: {}", pool_address, e))?;
+            let factory = multicall_result
+                .6
+                .map_err(|e| anyhow::anyhow!("factory() failed for {}: {}", pool_address, e))?;
             if is_ramses_factory(factory) {
                 v3_pool_type = V3PoolType::RamsesV2;
             }
             (
-                multicall_result.0.unwrap(),
-                multicall_result.1.unwrap(),
-                multicall_result.2.unwrap(),
-                multicall_result.3.unwrap(),
+                multicall_result
+                    .0
+                    .map_err(|e| anyhow::anyhow!("token0() failed for {}: {}", pool_address, e))?,
+                multicall_result
+                    .1
+                    .map_err(|e| anyhow::anyhow!("token1() failed for {}: {}", pool_address, e))?,
+                multicall_result
+                    .2
+                    .map_err(|e| anyhow::anyhow!("fee() failed for {}: {}", pool_address, e))?,
+                multicall_result.3.map_err(|e| {
+                    anyhow::anyhow!("tickSpacing() failed for {}: {}", pool_address, e)
+                })?,
                 slot0_result.sqrtPriceX96,
                 slot0_result.tick,
-                multicall_result.5.unwrap(),
+                multicall_result.5.map_err(|e| {
+                    anyhow::anyhow!("liquidity() failed for {}: {}", pool_address, e)
+                })?,
                 factory,
             )
         };

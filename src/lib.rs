@@ -1,5 +1,6 @@
 pub(crate) mod contracts;
 pub mod erc4626;
+pub mod lb;
 pub mod pool;
 pub mod v2;
 pub mod v3;
@@ -18,7 +19,8 @@ pub use utils::create_fallback_provider;
 // Core traits and types
 pub use pool::MockPool;
 pub use pool::{
-    EventApplicable, PoolInterface, PoolType, PoolTypeTrait, Topic, TopicList, POOL_CREATED_TOPICS,
+    EventApplicable, PoolInterface, PoolType, PoolTypeTrait, QuoteContext, Topic, TopicList,
+    POOL_CREATED_TOPICS,
 };
 
 // V2
@@ -29,6 +31,9 @@ pub use v3::{Tick, TickMap, UniswapV3Pool, V3PoolType};
 
 // ERC4626
 pub use erc4626::{ERC4626Pool, ERC4626Standard, VerioIP};
+
+// LB (TraderJoe Liquidity Book)
+pub use lb::LBPool;
 
 // Registry (optional feature)
 #[cfg(feature = "registry")]

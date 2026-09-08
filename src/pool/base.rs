@@ -1,6 +1,9 @@
-use crate::contracts::{IAlgebraFactory, IUniswapV2Factory, IUniswapV3Factory, IVeloPoolFactory};
+use crate::contracts::{
+    IAlgebraFactory, ILBFactory, IUniswapV2Factory, IUniswapV3Factory, IVeloPoolFactory,
+};
 use crate::erc4626::ERC4626Pool;
 use crate::erc4626::VerioIP;
+use crate::lb::LBPool;
 use crate::v2::UniswapV2Pool;
 use crate::v3::UniswapV3Pool;
 use alloy::sol_types::SolEvent;
@@ -19,12 +22,45 @@ pub trait PoolTypeTrait: Send + Sync {
     fn pool_type(&self) -> PoolType;
 }
 
+/// Context for a quote whose result depends on when the swap executes.
+///
+/// Only pool types with time-dependent state consult this — currently only
+/// Trader Joe LB, whose variable fee decays against `timeOfLastUpdate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuoteContext {
+    /// Block timestamp the swap is expected to execute at, in seconds.
+    pub timestamp: u64,
+}
+
 pub trait PoolInterface: std::fmt::Debug + Send + Sync + PoolTypeTrait + EventApplicable {
     /// Calculate output amount for a swap given an input amount and token
     fn calculate_output(&self, token_in: &Address, amount_in: U256) -> Result<U256>;
 
     /// Calculate input amount for a swap given an output amount and token
     fn calculate_input(&self, token_out: &Address, amount_out: U256) -> Result<U256>;
+
+    /// Time-aware variant of [`calculate_output`].
+    ///
+    /// Defaults to the timeless form, which is correct for every pool type
+    /// with no time-dependent state (V2, V3, ERC4626).
+    fn calculate_output_at(
+        &self,
+        token_in: &Address,
+        amount_in: U256,
+        _ctx: &QuoteContext,
+    ) -> Result<U256> {
+        self.calculate_output(token_in, amount_in)
+    }
+
+    /// Time-aware variant of [`calculate_input`].
+    fn calculate_input_at(
+        &self,
+        token_out: &Address,
+        amount_out: U256,
+        _ctx: &QuoteContext,
+    ) -> Result<U256> {
+        self.calculate_input(token_out, amount_out)
+    }
 
     /// Apply a swap to the pool state
     fn apply_swap(&mut self, token_in: &Address, amount_in: U256, amount_out: U256) -> Result<()>;
@@ -88,6 +124,25 @@ pub enum PoolType {
     UniswapV3,
     /// ERC4626-compatible pool
     ERC4626(ERC4626Pool),
+    /// TraderJoe Liquidity Book pool (bin-based AMM)
+    TraderJoeLB,
+}
+
+impl std::fmt::Display for PoolType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PoolType::UniswapV2 => write!(f, "uniswap_v2"),
+            PoolType::UniswapV3 => write!(f, "uniswap_v3"),
+            PoolType::ERC4626(ERC4626Pool::VerioIP) => write!(f, "verio_ip"),
+            PoolType::TraderJoeLB => write!(f, "traderjoe_liquidity_book"),
+        }
+    }
+}
+
+impl From<PoolType> for String {
+    fn from(pool_type: PoolType) -> Self {
+        pool_type.to_string()
+    }
 }
 
 impl Default for PoolType {
@@ -102,6 +157,7 @@ impl PoolType {
             Self::UniswapV2 => UniswapV2Pool::topics(),
             Self::UniswapV3 => UniswapV3Pool::topics(),
             Self::ERC4626(ERC4626Pool::VerioIP) => VerioIP::topics(),
+            Self::TraderJoeLB => LBPool::topics(),
         }
     }
 
@@ -110,6 +166,7 @@ impl PoolType {
             Self::UniswapV2 => UniswapV2Pool::profitable_topics(),
             Self::UniswapV3 => UniswapV3Pool::profitable_topics(),
             Self::ERC4626(ERC4626Pool::VerioIP) => VerioIP::profitable_topics(),
+            Self::TraderJoeLB => LBPool::profitable_topics(),
         }
     }
 }
@@ -131,4 +188,14 @@ pub const POOL_CREATED_TOPICS: &[Topic] = &[
     IUniswapV3Factory::PoolCreated::SIGNATURE_HASH,
     IAlgebraFactory::Pool::SIGNATURE_HASH,
     IVeloPoolFactory::PoolCreated::SIGNATURE_HASH,
+    // Trader Joe Liquidity Book, all generations (v2.0/v2.1/v2.2 share this
+    // event). Registering the topic is all this crate does: pairing it with an
+    // LB factory address (see `crate::lb::factories`) and feeding the decoded
+    // pair into `add_pools` is the consumer's job.
+    //
+    // Like every other LB topic in this crate, this one HAS been confirmed
+    // against a live log — see the `ILBFactory` binding in `src/contracts.rs`
+    // for the details and `tests/lb_discovery.rs` for the fetch-and-decode
+    // integration test.
+    ILBFactory::LBPairCreated::SIGNATURE_HASH,
 ];

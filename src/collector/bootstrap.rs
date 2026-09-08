@@ -18,12 +18,19 @@ use super::websocket_listener::WebsocketListener;
 ///
 /// Returns a [`CollectorHandle`] that can be used to stop the collector or
 /// add new pool addresses while the collector is running.
+/// Bootstrap the collector.
+///
+/// `algebra_refetch_provider` (last arg): optional dedicated provider for the
+/// per-batch Algebra V3 fee multicall. Pass `Some` to point fee refetches at a
+/// different RPC endpoint than the one driving event ingestion. Pass `None` to
+/// reuse `provider`. Has no effect unless `config.refetch_algebra_fee` is true.
 pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
     provider: Arc<P>,
     config: CollectorConfig,
     pool_registry: Arc<PoolRegistry>,
     metrics: Option<Arc<dyn CollectorMetrics>>,
     swap_event_tx: Option<mpsc::Sender<PendingEvent>>,
+    algebra_refetch_provider: Option<Arc<P>>,
 ) -> Result<CollectorHandle<P>> {
     let chain_id = pool_registry.get_network_id();
     let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -62,6 +69,8 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             config.max_blocks_per_batch,
             UpdaterMode::Websocket { event_queue },
             cancel_rx,
+            config.refetch_algebra_fee,
+            algebra_refetch_provider.as_ref().map(Arc::clone),
         );
 
         let updater_handle = tokio::spawn(async move {
@@ -77,6 +86,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             ws_listeners,
             ws_urls,
             provider,
+            algebra_refetch_provider,
             pool_registry,
             metrics,
             swap_event_tx,
@@ -96,6 +106,8 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             config.max_blocks_per_batch,
             UpdaterMode::PendingBlock,
             cancel_rx,
+            config.refetch_algebra_fee,
+            algebra_refetch_provider.as_ref().map(Arc::clone),
         );
 
         let updater_handle = tokio::spawn(async move {
@@ -110,6 +122,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             vec![],
             vec![],
             provider,
+            algebra_refetch_provider,
             pool_registry,
             metrics,
             swap_event_tx,
@@ -131,6 +144,8 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
                 wait_time_ms: config.wait_time,
             },
             cancel_rx,
+            config.refetch_algebra_fee,
+            algebra_refetch_provider.as_ref().map(Arc::clone),
         );
 
         let updater_handle = tokio::spawn(async move {
@@ -145,6 +160,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             vec![],
             vec![],
             provider,
+            algebra_refetch_provider,
             pool_registry,
             metrics,
             swap_event_tx,

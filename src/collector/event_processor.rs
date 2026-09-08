@@ -152,7 +152,7 @@ impl EventProcessor {
         }
 
         if collect_swaps {
-            info!(
+            debug!(
                 "[Chain {}] process_confirmed_events: sending {} swap events",
                 self.chain_id,
                 swap_events.len()
@@ -168,7 +168,7 @@ impl EventProcessor {
                     .await;
             }
         }
-        info!("[Chain {}] process_confirmed_events: done", self.chain_id);
+        debug!("[Chain {}] process_confirmed_events: done", self.chain_id);
     }
 
     /// Process pending block events: clone pools into speculative state, apply events

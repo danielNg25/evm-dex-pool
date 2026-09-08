@@ -6,6 +6,7 @@ use crate::collector::pool_fetcher::{fetch_pool, identify_pool_type};
 use crate::collector::unified_pool_updater::{UnifiedPoolUpdater, UpdaterMode};
 use crate::collector::websocket_listener::WebsocketListener;
 use crate::collector::CollectorConfig;
+use crate::v3::{UniswapV3Pool, V3PoolType};
 use crate::{PoolInterface, PoolRegistry, PoolType, TokenInfo};
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::Address;
@@ -36,6 +37,9 @@ pub struct CollectorHandle<P: Provider + Send + Sync + Clone + 'static> {
 
     // Stored for collector restart
     provider: Arc<P>,
+    /// Optional dedicated provider for the per-batch Algebra V3 fee refetch.
+    /// When `None`, the refetch reuses `provider`.
+    algebra_refetch_provider: Option<Arc<P>>,
     pool_registry: Arc<PoolRegistry>,
     metrics: Option<Arc<dyn CollectorMetrics>>,
     swap_event_tx: Option<mpsc::Sender<PendingEvent>>,
@@ -50,6 +54,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         ws_listeners: Vec<Arc<WebsocketListener>>,
         ws_urls: Vec<String>,
         provider: Arc<P>,
+        algebra_refetch_provider: Option<Arc<P>>,
         pool_registry: Arc<PoolRegistry>,
         metrics: Option<Arc<dyn CollectorMetrics>>,
         swap_event_tx: Option<mpsc::Sender<PendingEvent>>,
@@ -61,6 +66,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
             ws_listeners,
             ws_urls,
             provider,
+            algebra_refetch_provider,
             pool_registry,
             metrics,
             swap_event_tx,
@@ -85,16 +91,17 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
 
     /// Dynamically add new pool addresses to the running collector.
     ///
-    /// Pools already present in the registry are silently skipped.
+    /// `block_number` is the block at which the pools were detected (e.g. the
+    /// block where the pool factory emitted a creation event). If the collector's
+    /// `last_processed_block` is behind `block_number`, existing registry pools
+    /// are caught up to `block_number` first, then the new pools are fetched at
+    /// that block.
     ///
-    /// The method fetches each pool's on-chain state in memory, applies a
-    /// block-level catchup so new pools are consistent with the existing
-    /// registry, then registers them. The collector is paused only for the
-    /// brief synchronisation step, not during the (potentially slow) RPC
-    /// fetch phase.
+    /// Pools already present in the registry are silently skipped.
     pub async fn add_pools<T: TokenInfo>(
         &mut self,
         new_addresses: Vec<Address>,
+        block_number: u64,
         fetch_config: &PoolFetchConfig,
         token_info: &T,
     ) -> Result<()> {
@@ -117,10 +124,10 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         }
 
         if self.collector_config.use_websocket {
-            self.add_pools_ws(&addresses, fetch_config, token_info)
+            self.add_pools_ws(&addresses, block_number, fetch_config, token_info)
                 .await
         } else {
-            self.add_pools_http(&addresses, fetch_config, token_info)
+            self.add_pools_http(&addresses, block_number, fetch_config, token_info)
                 .await
         }
     }
@@ -139,6 +146,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         let mut removed = 0usize;
         for addr in addresses {
             if self.pool_registry.remove_pool(addr).is_some() {
+                self.pool_registry.remove_algebra_v3_address(addr);
                 removed += 1;
             }
         }
@@ -161,18 +169,24 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
     async fn add_pools_http<T: TokenInfo>(
         &mut self,
         addresses: &[Address],
+        block_number: u64,
         fetch_config: &PoolFetchConfig,
         token_info: &T,
     ) -> Result<()> {
         let chain_id = fetch_config.chain_id;
 
-        // 1. Record the block at which we start fetching (collector still running).
-        let fetch_block = self.pool_registry.get_last_processed_block();
+        // 1. Determine fetch block: use the caller's block_number if it is
+        //    ahead of last_processed_block (the pool may not exist at the
+        //    stale cursor on low-activity networks).
+        let last_block = self.pool_registry.get_last_processed_block();
+        let fetch_block = block_number.max(last_block);
         info!(
-            "[Chain {}] add_pools: fetching {} pools in memory at block {}",
+            "[Chain {}] add_pools: fetching {} pools in memory at block {} (last_processed={}, requested={})",
             chain_id,
             addresses.len(),
-            fetch_block
+            fetch_block,
+            last_block,
+            block_number
         );
 
         // 2. Fetch pool state into memory — NOT into the registry yet.
@@ -194,13 +208,29 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
 
         // 3. Stop the updater and wait for it to exit. last_processed_block is now stable.
         self.stop_updater().await;
+        let stop_block = self.pool_registry.get_last_processed_block();
 
-        // 4. Read the final block the collector reached before stopping.
-        let final_block = self.pool_registry.get_last_processed_block();
+        // 4. Catch up as needed so all pools share the same block cursor.
+        //    - fetch_block > stop_block: existing registry pools need to advance
+        //    - stop_block > fetch_block: new in-memory pools need to advance
+        if fetch_block > stop_block {
+            info!(
+                "[Chain {}] add_pools: catching up existing pools blocks {}..={}",
+                chain_id,
+                stop_block + 1,
+                fetch_block
+            );
+            catchup_registry_to_block(
+                &self.provider,
+                &self.pool_registry,
+                stop_block + 1,
+                fetch_block,
+                chain_id,
+            )
+            .await?;
+        }
 
-        // 5. Catchup: apply events for the new pool addresses only, from
-        //    fetch_block+1 to final_block. Existing pool addresses are NOT
-        //    included in the filter, so no double-apply risk.
+        let final_block = fetch_block.max(stop_block);
         if final_block > fetch_block {
             info!(
                 "[Chain {}] add_pools: catching up new pools blocks {}..={}",
@@ -219,15 +249,16 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
             .await?;
         }
 
-        // 6. Register pools and any new event topics.
+        // 5. Register pools and any new event topics.
         register_pools_and_topics(&self.pool_registry, pools);
+        self.pool_registry.set_last_processed_block(final_block);
 
         info!(
             "[Chain {}] add_pools: restarting collector from block {}",
             chain_id, final_block
         );
 
-        // 7. Restart the updater from final_block.
+        // 6. Restart the updater from final_block.
         let mode = if self.collector_config.use_pending_blocks {
             UpdaterMode::PendingBlock
         } else {
@@ -252,6 +283,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
     async fn add_pools_ws<T: TokenInfo>(
         &mut self,
         addresses: &[Address],
+        block_number: u64,
         fetch_config: &PoolFetchConfig,
         token_info: &T,
     ) -> Result<()> {
@@ -273,15 +305,39 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         self.stop_updater().await;
         let stop_block = self.pool_registry.get_last_processed_block();
         info!(
-            "[Chain {}] add_pools(ws): updater stopped at block {}",
-            chain_id, stop_block
+            "[Chain {}] add_pools(ws): updater stopped at block {} (requested block={})",
+            chain_id, stop_block, block_number
         );
 
-        // 3. Create a fresh EventQueue.
+        // 3. Determine fetch block: use the caller's block_number if it is
+        //    ahead of stop_block (the pool may not exist at the stale cursor
+        //    on low-activity networks).
+        let fetch_block = block_number.max(stop_block);
+
+        // 4. If fetch_block > stop_block, catch up existing registry pools
+        //    so all pool state is consistent at fetch_block.
+        if fetch_block > stop_block {
+            info!(
+                "[Chain {}] add_pools(ws): catching up existing pools blocks {}..={}",
+                chain_id,
+                stop_block + 1,
+                fetch_block
+            );
+            catchup_registry_to_block(
+                &self.provider,
+                &self.pool_registry,
+                stop_block + 1,
+                fetch_block,
+                chain_id,
+            )
+            .await?;
+        }
+
+        // 5. Create a fresh EventQueue.
         let new_event_queue = EventQueue::new(1000, 1000, chain_id);
         let event_sender = new_event_queue.get_sender();
 
-        // 4. Start new WS listeners for ALL addresses (existing + new) NOW,
+        // 6. Start new WS listeners for ALL addresses (existing + new) NOW,
         //    so they buffer events during the upcoming (slow) pool fetch phase.
         //    This mirrors the WebsocketBlockSource::bootstrap pattern: listeners
         //    start first so no events are missed between fetch and subscription.
@@ -312,45 +368,62 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         }
         self.ws_listeners = new_ws_listeners;
 
-        // 5. Fetch new pool state into memory at stop_block.
+        // 7. Fetch new pool state into memory at fetch_block.
         //    WS listeners are already buffering events in the background.
         info!(
             "[Chain {}] add_pools(ws): fetching {} pools at block {}",
             chain_id,
             addresses.len(),
-            stop_block
+            fetch_block
         );
-        let pools = fetch_pools_in_memory(
+        let pools = match fetch_pools_in_memory(
             &self.provider,
             addresses,
-            BlockId::Number(BlockNumberOrTag::Number(stop_block)),
+            BlockId::Number(BlockNumberOrTag::Number(fetch_block)),
             token_info,
             fetch_config,
         )
-        .await?;
+        .await
+        {
+            Ok(pools) => pools,
+            Err(e) => {
+                // Recovery: restart the updater with existing pools so the
+                // collector keeps running even though we failed to add new pools.
+                warn!(
+                    "[Chain {}] add_pools(ws): fetch failed, restarting collector without new pools: {}",
+                    chain_id, e
+                );
+                self.pool_registry.set_last_processed_block(fetch_block);
+                self.spawn_updater(
+                    UpdaterMode::Websocket {
+                        event_queue: new_event_queue,
+                    },
+                    fetch_block,
+                );
+                return Err(e);
+            }
+        };
 
-        // 6. Register pools and any new event topics.
-        //    Pool state is at stop_block — consistent with existing pools.
+        // 8. Register pools and any new event topics.
+        //    Pool state is at fetch_block — consistent with existing pools.
         register_pools_and_topics(&self.pool_registry, pools);
+        self.pool_registry.set_last_processed_block(fetch_block);
 
-        // 7. last_processed_block stays at stop_block (unchanged).
+        // 9. Restart the updater in Websocket mode with the new EventQueue.
         //    WebsocketBlockSource::bootstrap() will drain the EventQueue
-        //    (populated during step 5) and RPC-catch up ALL pools (old + new)
-        //    from stop_block to first_event_block, then apply buffered events.
-
-        // 8. Restart the updater in Websocket mode with the new EventQueue.
+        //    and RPC-catch up ALL pools from fetch_block to current.
         self.spawn_updater(
             UpdaterMode::Websocket {
                 event_queue: new_event_queue,
             },
-            stop_block,
+            fetch_block,
         );
 
         info!(
             "[Chain {}] add_pools(ws): done — {} new pools registered, updater restarted from block {}",
             chain_id,
             addresses.len(),
-            stop_block
+            fetch_block
         );
         Ok(())
     }
@@ -387,6 +460,8 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
             self.collector_config.max_blocks_per_batch,
             mode,
             cancel_rx,
+            self.collector_config.refetch_algebra_fee,
+            self.algebra_refetch_provider.as_ref().map(Arc::clone),
         );
         let handle = tokio::spawn(async move {
             if let Err(e) = updater.start().await {
@@ -415,6 +490,8 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
     config: &PoolFetchConfig,
 ) -> Result<Vec<Box<dyn PoolInterface>>> {
     let chain_id = config.chain_id;
+    let multicall_address =
+        crate::collector::resolve_multicall_address(config.chain_id, config.multicall_address);
     let chunk_size = config.chunk_size.max(1);
     let chunk_count = addresses.len().div_ceil(chunk_size);
     let mut pools: Vec<Box<dyn PoolInterface>> = Vec::with_capacity(addresses.len());
@@ -434,7 +511,8 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                 .map(|&address| {
                     let provider = Arc::clone(provider);
                     async move {
-                        let pool_type = identify_pool_type(&provider, address).await?;
+                        let pool_type =
+                            identify_pool_type(&provider, address, multicall_address).await?;
                         fetch_pool(
                             &provider,
                             address,
@@ -450,8 +528,9 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
             join_all(futures).await
         } else {
             let mut seq = Vec::with_capacity(chunk.len());
-            for &address in chunk {
-                let pool_type = identify_pool_type(provider, address).await?;
+            for (i, &address) in chunk.iter().enumerate() {
+                let pool_type =
+                    identify_pool_type(provider, address, multicall_address).await?;
                 seq.push(
                     fetch_pool(
                         provider,
@@ -463,6 +542,16 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                     )
                     .await,
                 );
+                if i + 1 < chunk.len() && config.wait_time_between_chunks > 0 {
+                    info!(
+                        "[Chain {}] Sequential mode: waiting {}ms before next pool ({}/{})",
+                        chain_id, config.wait_time_between_chunks, i + 1, chunk.len()
+                    );
+                    tokio::time::sleep(Duration::from_millis(
+                        config.wait_time_between_chunks,
+                    ))
+                    .await;
+                }
             }
             seq
         };
@@ -482,7 +571,17 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
             }
         }
 
-        for (_, address) in failed {
+        for (retry_idx, (_, address)) in failed.into_iter().enumerate() {
+            if retry_idx > 0 && config.wait_time_between_chunks > 0 {
+                info!(
+                    "[Chain {}] Sequential mode: waiting {}ms before retrying next pool",
+                    chain_id, config.wait_time_between_chunks
+                );
+                tokio::time::sleep(Duration::from_millis(
+                    config.wait_time_between_chunks,
+                ))
+                .await;
+            }
             let mut success = false;
             for attempt in 1..=config.max_retries {
                 let delay = Duration::from_millis(500 * 2u64.pow(attempt - 1));
@@ -492,7 +591,8 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                 );
                 tokio::time::sleep(delay).await;
                 match async {
-                    let pool_type = identify_pool_type(provider, address).await?;
+                    let pool_type =
+                        identify_pool_type(provider, address, multicall_address).await?;
                     fetch_pool(
                         provider,
                         address,
@@ -596,16 +696,75 @@ async fn apply_catchup_events_in_memory<P: Provider + Send + Sync>(
     Ok(())
 }
 
+/// Catch up existing registry pools from `from_block` to `to_block` by
+/// fetching and applying on-chain events. Used when the caller's
+/// `block_number` is ahead of `last_processed_block`.
+async fn catchup_registry_to_block<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    pool_registry: &Arc<PoolRegistry>,
+    from_block: u64,
+    to_block: u64,
+    chain_id: u64,
+) -> Result<()> {
+    let addresses = pool_registry.get_all_addresses();
+    let topics = pool_registry.get_topics();
+
+    let events: Vec<Log> = fetch_events_with_retry(
+        provider,
+        addresses,
+        topics,
+        BlockNumberOrTag::Number(from_block),
+        BlockNumberOrTag::Number(to_block),
+        chain_id,
+    )
+    .await?;
+
+    info!(
+        "[Chain {}] catchup_registry_to_block: applying {} events over blocks {}..={}",
+        chain_id,
+        events.len(),
+        from_block,
+        to_block
+    );
+
+    for event in &events {
+        if let Some(pool) = pool_registry.get_pool(&event.address()) {
+            if let Err(e) = pool.write().await.apply_log(event) {
+                warn!(
+                    "[Chain {}] catchup_registry_to_block error for pool {}: {}",
+                    chain_id,
+                    event.address(),
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Insert pool objects into the registry and register any previously unseen
-/// pool-type event topics.
+/// pool-type event topics. Also tracks Algebra V3 addresses for periodic fee
+/// refetch (see [`crate::collector::algebra_fee_refetch`]).
 fn register_pools_and_topics(registry: &Arc<PoolRegistry>, pools: Vec<Box<dyn PoolInterface>>) {
     let mut new_pool_types: HashSet<PoolType> = HashSet::new();
     for pool in pools {
         new_pool_types.insert(pool.pool_type());
+        track_if_algebra_v3(registry, pool.as_ref());
         registry.add_pool(pool);
     }
     for pool_type in new_pool_types {
         registry.add_topics(pool_type.topics());
         registry.add_profitable_topics(pool_type.profitable_topics());
+    }
+}
+
+/// If `pool` is a `V3PoolType::AlgebraV3`, register its address with the
+/// registry so the collector can refetch its dynamic fee after each batch.
+pub(crate) fn track_if_algebra_v3(registry: &PoolRegistry, pool: &dyn PoolInterface) {
+    if let Some(v3) = pool.as_any().downcast_ref::<UniswapV3Pool>() {
+        if v3.pool_type == V3PoolType::AlgebraV3 {
+            registry.add_algebra_v3_address(v3.address);
+        }
     }
 }

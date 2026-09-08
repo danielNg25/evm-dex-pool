@@ -1,8 +1,9 @@
 use crate::contracts_rpc::RpcIUniswapV3Pool as IUniswapV3Pool;
 use crate::erc4626::fetch_erc4626_pool;
+use crate::lb::fetch_lb_pool;
 use crate::pool::base::PoolInterface;
 use crate::v2::fetch_v2_pool;
-use crate::v3::fetch_v3_pool;
+use crate::v3::{fetch_v3_pool, UniswapV3Pool, V3PoolType};
 use crate::{PoolRegistry, PoolType, TokenInfo};
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::Address;
@@ -16,18 +17,66 @@ use std::sync::Arc;
 use super::config::PoolFetchConfig;
 use super::multicall::resolve_multicall_address;
 
-/// Detect whether a pool is V2 or V3 by calling `liquidity()` (V3-specific).
+/// Detect pool type by calling type-specific view functions in a single multicall.
+///
+/// LB is probed first via [`crate::lb::detect_lb_version`], which uses a
+/// positive per-version discriminator. `liquidity()` succeeding then means
+/// V3; otherwise V2.
 pub async fn identify_pool_type<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     pool_address: Address,
+    multicall_address: Address,
 ) -> Result<PoolType> {
-    let pair_instance = IUniswapV3Pool::new(pool_address, provider);
-    let fee_call = pair_instance.liquidity().into_transaction_request();
-
-    match provider.call(fee_call).await {
-        Ok(_) => Ok(PoolType::UniswapV3),
-        Err(_) => Ok(PoolType::UniswapV2),
+    // LB first, using a positive per-version discriminator. The previous
+    // getBinStep() probe existed only on v2.1+, so v2.0 pairs fell through
+    // to the UniswapV2 default and panicked the bootstrap in fetch_v2_pool.
+    if crate::lb::detect_lb_version(provider, pool_address, multicall_address, BlockId::latest())
+        .await?
+        .is_some()
+    {
+        return Ok(PoolType::TraderJoeLB);
     }
+
+    let v3_instance = IUniswapV3Pool::new(pool_address, provider);
+    let result = provider
+        .multicall()
+        .address(multicall_address)
+        .add(v3_instance.liquidity())
+        .try_aggregate(false)
+        .await?;
+
+    if result.0.is_ok() {
+        return Ok(PoolType::UniswapV3);
+    }
+    Ok(PoolType::UniswapV2)
+}
+
+/// Identify pool types for multiple addresses concurrently.
+///
+/// Fires all probes in parallel using the resolved multicall address.
+pub async fn identify_pool_types<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    addresses: &[Address],
+    multicall_address: Address,
+) -> Result<Vec<(Address, PoolType)>> {
+    if addresses.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let futures: Vec<_> = addresses
+        .iter()
+        .map(|&addr| {
+            let provider = provider.clone();
+            async move {
+                let pool_type =
+                    identify_pool_type(&provider, addr, multicall_address).await?;
+                Ok::<_, anyhow::Error>((addr, pool_type))
+            }
+        })
+        .collect();
+
+    let results = join_all(futures).await;
+    results.into_iter().collect()
 }
 
 /// Fetch a single pool by type using the appropriate fetcher.
@@ -72,6 +121,28 @@ pub async fn fetch_pool<P: Provider + Send + Sync, T: TokenInfo>(
                 fetch_erc4626_pool(provider, pool_type, pool_address, block_number, token_info)
                     .await?;
             Ok(pool)
+        }
+        PoolType::TraderJoeLB => {
+            let pool = fetch_lb_pool(
+                provider,
+                pool_address,
+                block_number,
+                token_info,
+                multicall_address,
+                config.chain_id,
+            )
+            .await?;
+            Ok(Box::new(pool))
+        }
+    }
+}
+
+/// If `pool` is a `V3PoolType::AlgebraV3`, register its address with the
+/// registry so the collector can refetch its dynamic fee after each batch.
+fn track_if_algebra_v3(registry: &PoolRegistry, pool: &dyn PoolInterface) {
+    if let Some(v3) = pool.as_any().downcast_ref::<UniswapV3Pool>() {
+        if v3.pool_type == V3PoolType::AlgebraV3 {
+            registry.add_algebra_v3_address(v3.address);
         }
     }
 }
@@ -135,14 +206,17 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
             chunk.len()
         );
 
+        // Identify all pool types in the chunk concurrently (1 multicall per pool, all in parallel)
+        let multicall_address = resolve_multicall_address(config.chain_id, config.multicall_address);
+        let chunk_types = identify_pool_types(provider, chunk, multicall_address).await?;
+
         let results: Vec<Result<(Address, PoolType, Box<dyn PoolInterface>), anyhow::Error>> =
             if config.parallel_fetch {
-                let futures: Vec<_> = chunk
+                let futures: Vec<_> = chunk_types
                     .iter()
-                    .map(|&address| {
+                    .map(|&(address, pool_type)| {
                         let provider = provider.clone();
                         async move {
-                            let pool_type = identify_pool_type(&provider, address).await?;
                             let pool = fetch_pool(
                                 &provider,
                                 address,
@@ -159,9 +233,8 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                 join_all(futures).await
             } else {
                 let mut seq_results = Vec::with_capacity(chunk.len());
-                for &address in chunk {
+                for (i, &(address, pool_type)) in chunk_types.iter().enumerate() {
                     let result = async {
-                        let pool_type = identify_pool_type(provider, address).await?;
                         let pool = fetch_pool(
                             provider,
                             address,
@@ -175,6 +248,16 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                     }
                     .await;
                     seq_results.push(result);
+                    if i + 1 < chunk_types.len() && config.wait_time_between_chunks > 0 {
+                        info!(
+                            "[Chain {}] Sequential mode: waiting {}ms before next pool ({}/{})",
+                            config.chain_id, config.wait_time_between_chunks, i + 1, chunk_types.len()
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            config.wait_time_between_chunks,
+                        ))
+                        .await;
+                    }
                 }
                 seq_results
             };
@@ -188,6 +271,7 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                         "[Chain {}] Fetched pool {} ({:?})",
                         config.chain_id, address, pool_type
                     );
+                    track_if_algebra_v3(pool_registry, pool.as_ref());
                     pool_registry.add_pool(pool);
                     pool_types_present.insert(pool_type);
                     fetched_addresses.push(address);
@@ -203,7 +287,17 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
         }
 
         // Retry failed pools with exponential backoff
-        for &address in &failed_pools {
+        for (retry_idx, &address) in failed_pools.iter().enumerate() {
+            if retry_idx > 0 && config.wait_time_between_chunks > 0 {
+                info!(
+                    "[Chain {}] Sequential mode: waiting {}ms before retrying next pool",
+                    config.chain_id, config.wait_time_between_chunks
+                );
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    config.wait_time_between_chunks,
+                ))
+                .await;
+            }
             let mut success = false;
             for attempt in 1..=config.max_retries {
                 let delay = tokio::time::Duration::from_millis(500 * 2u64.pow(attempt - 1));
@@ -214,7 +308,7 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                 tokio::time::sleep(delay).await;
 
                 match async {
-                    let pool_type = identify_pool_type(provider, address).await?;
+                    let pool_type = identify_pool_type(provider, address, multicall_address).await?;
                     let pool = fetch_pool(
                         provider,
                         address,
@@ -233,6 +327,7 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                             "[Chain {}] Fetched pool {} ({:?}) on retry {}",
                             config.chain_id, address, pool_type, attempt
                         );
+                        track_if_algebra_v3(pool_registry, pool.as_ref());
                         pool_registry.add_pool(pool);
                         pool_types_present.insert(pool_type);
                         fetched_addresses.push(address);
@@ -248,10 +343,10 @@ pub async fn fetch_pools_into_registry<P: Provider + Send + Sync, T: TokenInfo>(
                 }
             }
             if !success {
-                panic!(
+                return Err(anyhow::anyhow!(
                     "Failed to fetch pool {} after {} retries. Check RPC connection and rate limits.",
                     address, config.max_retries
-                );
+                ));
             }
         }
 

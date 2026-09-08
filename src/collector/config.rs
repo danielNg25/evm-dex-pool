@@ -13,6 +13,11 @@ pub struct CollectorConfig {
     pub websocket_urls: Vec<String>,
     /// Polling interval in milliseconds for LatestBlock mode.
     pub wait_time: u64,
+    /// If true, after each event batch the collector will multicall `fee()` on
+    /// every tracked Algebra V3 pool (variant `V3PoolType::AlgebraV3`) and
+    /// write the fresh fee back into the registry. Use for chains where the
+    /// Algebra fee plugin updates fees per-block without emitting events.
+    pub refetch_algebra_fee: bool,
 }
 
 /// Configuration for batch pool fetching from RPC.

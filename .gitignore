@@ -2,3 +2,6 @@
 .env
 .DS_Store
 src/.DS_Store
+joe-v2
+contracts/.DS_Store
+agent-docs
