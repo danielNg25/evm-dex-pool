@@ -2,16 +2,12 @@ use crate::contracts_rpc::RpcAlgebraPoolFeeInState as AlgebraPoolFeeInState;
 use crate::contracts_rpc::RpcAlgebraTwoSideFee as AlgebraTwoSideFee;
 use crate::contracts_rpc::RpcAlgebraV3Pool as AlgebraV3Pool;
 use crate::contracts_rpc::RpcCLPPool as CLPPool;
-use crate::contracts_rpc::RpcIQuoter as IQuoter;
 use crate::contracts_rpc::RpcIUniswapV3Pool as IUniswapV3Pool;
 use crate::contracts_rpc::RpcRamsesCLPool as RamsesCLPool;
-use crate::v3::{
-    get_ramses_quoter, is_ramses_factory, Tick, UniswapV3Pool, V3PoolType, MAX_TICK_I32,
-    MIN_TICK_I32, RAMSES_FACTOR,
-};
-use crate::{PoolInterface, TokenInfo};
+use crate::v3::{Tick, UniswapV3Pool, V3PoolType, MAX_TICK_I32, MIN_TICK_I32};
+use crate::TokenInfo;
+use alloy::primitives::U128;
 use alloy::primitives::{aliases::U24, Address, Signed, U160, U256};
-use alloy::primitives::{Uint, U128};
 use alloy::{
     eips::BlockId,
     providers::{MulticallBuilder, Provider},
@@ -171,9 +167,6 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
             let factory = multicall_result
                 .6
                 .map_err(|e| anyhow::anyhow!("factory() failed for {}: {}", pool_address, e))?;
-            if is_ramses_factory(factory) {
-                v3_pool_type = V3PoolType::RamsesV2;
-            }
             (
                 multicall_result
                     .0
@@ -203,12 +196,10 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
     // is the marker.
     //
     // This runs only when nothing above classified the pool, so an Algebra
-    // variant keeps its classification and a true Ramses V2 pool -- caught by
-    // the `is_ramses_factory` check -- keeps `RamsesV2` and its quoter-calibrated
-    // ratio math. `UniswapV3` is the only fall-through value, and the guard is
-    // placed after the whole chain rather than inside its final `else` so it
-    // also covers a Ramses CL pool that decoded through the `CLPPool::slot0()`
-    // branch.
+    // variant keeps its classification. `UniswapV3` is the only fall-through
+    // value, and the guard is placed after the whole chain rather than inside
+    // its final `else` so it also covers a Ramses CL pool that decoded through
+    // the `CLPPool::slot0()` branch.
     if v3_pool_type == V3PoolType::UniswapV3 && multicall_result.13.is_ok() {
         v3_pool_type = V3PoolType::RamsesCL;
     }
@@ -241,17 +232,6 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
 
     fetch_v3_ticks(provider, &mut pool, block_number, multicall_address).await?;
 
-    if pool.pool_type == V3PoolType::RamsesV2 {
-        let ratio_conversion_factor =
-            calculate_ratio_conversion_factor(&pool, provider, block_number, chain_id).await?;
-        info!(
-            "[Chain {}] Ratio conversion factor: {}",
-            chain_id,
-            ratio_conversion_factor.to::<U128>()
-        );
-        pool.update_ratio_conversion_factor(ratio_conversion_factor);
-    }
-
     Ok(pool)
 }
 
@@ -265,10 +245,7 @@ pub async fn fetch_v3_ticks<P: Provider + Send + Sync>(
     let mut tick_indices = Vec::new();
 
     match pool.pool_type {
-        V3PoolType::UniswapV3
-        | V3PoolType::RamsesV2
-        | V3PoolType::RamsesCL
-        | V3PoolType::PancakeV3 => {
+        V3PoolType::UniswapV3 | V3PoolType::RamsesCL | V3PoolType::PancakeV3 => {
             // Fetch word bitmap
             let min_word = pool.tick_to_word(MIN_TICK_I32);
             let max_word = pool.tick_to_word(MAX_TICK_I32);
@@ -427,10 +404,7 @@ pub async fn fetch_v3_ticks<P: Provider + Send + Sync>(
     // Split tick fetching into chunks
     let mut all_ticks: BTreeMap<i32, Tick> = BTreeMap::new();
     match pool.pool_type {
-        V3PoolType::UniswapV3
-        | V3PoolType::RamsesV2
-        | V3PoolType::RamsesCL
-        | V3PoolType::PancakeV3 => {
+        V3PoolType::UniswapV3 | V3PoolType::RamsesCL | V3PoolType::PancakeV3 => {
             let contract = IUniswapV3Pool::new(pool.address, provider);
             for chunk in tick_indices.chunks(250) {
                 let mut multicall =
@@ -481,103 +455,4 @@ pub async fn fetch_v3_ticks<P: Provider + Send + Sync>(
     pool.ticks = all_ticks;
 
     Ok(())
-}
-
-pub async fn calculate_ratio_conversion_factor<P: Provider + Send + Sync>(
-    pool_v3: &UniswapV3Pool,
-    provider: &Arc<P>,
-    block_number: BlockId,
-    chain_id: u64,
-) -> Result<U256> {
-    let quoter = get_ramses_quoter(pool_v3.factory);
-    if let Some(quoter) = quoter {
-        let quoter_instance = IQuoter::new(quoter, &provider);
-        let amount_in = U256::from(100000000000u64);
-
-        let ratio_conversion_factor_0 = match quoter_instance
-            .quoteExactInputSingle(
-                pool_v3.token0,
-                pool_v3.token1,
-                U24::from(pool_v3.fee),
-                amount_in,
-                Uint::from(0),
-            )
-            .call()
-            .block(block_number)
-            .await
-        {
-            Ok(amount_out_0) => {
-                let amount_out_estimate_0 = pool_v3
-                    .calculate_output(&pool_v3.token0, amount_in)
-                    .unwrap();
-
-                let ratio_conversion_factor_0 = if amount_out_estimate_0 == U256::ZERO {
-                    U256::MAX
-                } else if amount_out_0 == amount_out_estimate_0 {
-                    U256::from(RAMSES_FACTOR)
-                } else {
-                    amount_out_0 * U256::from(RAMSES_FACTOR) / amount_out_estimate_0 - U256::ONE
-                };
-                info!(
-                    "[Chain {}] Ratio conversion factor 0: {}",
-                    chain_id, ratio_conversion_factor_0
-                );
-                ratio_conversion_factor_0
-            }
-            Err(_) => {
-                info!(
-                    "[Chain {}] Failed to fetch ratio conversion factor 0",
-                    chain_id
-                );
-                U256::from(RAMSES_FACTOR)
-            }
-        };
-
-        let ratio_conversion_factor_1 = match quoter_instance
-            .quoteExactInputSingle(
-                pool_v3.token1,
-                pool_v3.token0,
-                U24::from(pool_v3.fee),
-                amount_in,
-                Uint::from(0),
-            )
-            .call()
-            .block(block_number)
-            .await
-        {
-            Ok(amount_out_1) => {
-                let amount_out_estimate_1 = pool_v3
-                    .calculate_output(&pool_v3.token1, amount_in)
-                    .unwrap();
-
-                let ratio_conversion_factor_1 = if amount_out_estimate_1 == U256::ZERO {
-                    U256::MAX
-                } else if amount_out_1 == amount_out_estimate_1 {
-                    U256::from(RAMSES_FACTOR)
-                } else {
-                    amount_out_1 * U256::from(RAMSES_FACTOR) / amount_out_estimate_1 - U256::ONE
-                };
-                info!(
-                    "[Chain {}] Ratio conversion factor 1: {}",
-                    chain_id, ratio_conversion_factor_1
-                );
-                ratio_conversion_factor_1
-            }
-            Err(_) => {
-                info!(
-                    "[Chain {}] Failed to fetch ratio conversion factor 1",
-                    chain_id
-                );
-                U256::from(RAMSES_FACTOR)
-            }
-        };
-
-        if ratio_conversion_factor_0 == U256::MAX && ratio_conversion_factor_1 == U256::MAX {
-            Ok(U256::from(RAMSES_FACTOR))
-        } else {
-            Ok(ratio_conversion_factor_0.min(ratio_conversion_factor_1))
-        }
-    } else {
-        Ok(U256::from(RAMSES_FACTOR))
-    }
 }

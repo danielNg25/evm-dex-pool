@@ -15,13 +15,13 @@
 mod common;
 
 use alloy::eips::{BlockId, BlockNumberOrTag};
-use alloy::primitives::{address, Address, U256};
+use alloy::primitives::{address, Address};
 use alloy::providers::{Provider, ProviderBuilder};
 use anyhow::Result;
 use std::sync::Arc;
 
 use common::{CachingTokenInfo, CHAIN_ID, MULTICALL, RPC_URL};
-use evm_dex_pool::v3::{fetch_v3_pool, V3PoolType, RAMSES_FACTOR};
+use evm_dex_pool::v3::{fetch_v3_pool, V3PoolType};
 
 /// Pharaoh (Ramses CL fork). `lastPeriod()` answers 2959; `globalState()` reverts.
 const PHARAOH: Address = address!("0xFf0855A9027f5F5c2bbaCC4aAC477AfbeeefbeA9");
@@ -29,8 +29,13 @@ const PHARAOH: Address = address!("0xFf0855A9027f5F5c2bbaCC4aAC477AfbeeefbeA9");
 const UNISWAP_V3: Address = address!("0x7b602f98D71715916E7c963f51bfEbC754aDE2d0");
 /// Algebra. `globalState()` answers; `lastPeriod()` reverts.
 const ALGEBRA: Address = address!("0x23fF0B5370BF33725918e6105108f3fa2c4b8a05");
+/// The one configured pool deployed by the factory that used to be hardcoded
+/// in `RAMSES_FACTORIES`. It answers `lastPeriod()` (2959) like any other
+/// Ramses-family pool, but the factory allowlist claimed it first and pinned
+/// it to `RamsesV2`, which excluded it from the mutable-fee refetch set.
+const FORMER_RAMSES_V2: Address = address!("0x0021368b76e7F280accAd186ae06039EB1d499b8");
 
-async fn classify(address: Address) -> Result<(V3PoolType, U256)> {
+async fn classify(address: Address) -> Result<V3PoolType> {
     let provider = Arc::new(ProviderBuilder::new().connect_http(RPC_URL.parse()?));
     let block = provider.get_block_number().await?;
     let pool = fetch_v3_pool(
@@ -43,26 +48,18 @@ async fn classify(address: Address) -> Result<(V3PoolType, U256)> {
     )
     .await?;
     println!(
-        "[test] {address} -> {:?} (fee {}, ratio_conversion_factor {})",
-        pool.pool_type, pool.fee, pool.ratio_conversion_factor
+        "[test] {address} -> {:?} (fee {})",
+        pool.pool_type, pool.fee
     );
-    Ok((pool.pool_type, pool.ratio_conversion_factor))
+    Ok(pool.pool_type)
 }
 
-/// The Pharaoh pool must classify as `RamsesCL` and must NOT pick up a
-/// calibrated `ratio_conversion_factor` -- its factory is absent from
-/// `RAMSES_FACTORIES`, so there is no quoter to calibrate against and the
-/// `RamsesV2` scaling would be wrong.
+/// The Pharaoh pool must classify as `RamsesCL`, which is what puts it on
+/// the mutable-fee refetch list.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn pharaoh_pool_classifies_as_ramses_cl() -> Result<()> {
-    let (pool_type, factor) = classify(PHARAOH).await?;
-    assert_eq!(pool_type, V3PoolType::RamsesCL);
-    assert_eq!(
-        factor,
-        U256::from(RAMSES_FACTOR),
-        "RamsesCL must keep the identity ratio conversion factor"
-    );
+    assert_eq!(classify(PHARAOH).await?, V3PoolType::RamsesCL);
     Ok(())
 }
 
@@ -70,8 +67,7 @@ async fn pharaoh_pool_classifies_as_ramses_cl() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn uniswap_v3_pool_stays_uniswap_v3() -> Result<()> {
-    let (pool_type, _) = classify(UNISWAP_V3).await?;
-    assert_eq!(pool_type, V3PoolType::UniswapV3);
+    assert_eq!(classify(UNISWAP_V3).await?, V3PoolType::UniswapV3);
     Ok(())
 }
 
@@ -80,7 +76,18 @@ async fn uniswap_v3_pool_stays_uniswap_v3() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn algebra_pool_stays_algebra() -> Result<()> {
-    let (pool_type, _) = classify(ALGEBRA).await?;
-    assert_eq!(pool_type, V3PoolType::AlgebraV3);
+    assert_eq!(classify(ALGEBRA).await?, V3PoolType::AlgebraV3);
+    Ok(())
+}
+
+/// Regression guard for removing the `ratio_conversion_factor` calibration.
+/// With the factory allowlist gone, this pool falls through to the
+/// `lastPeriod()` check like every other Ramses-family pool and classifies as
+/// `RamsesCL` -- which is what puts it on the fee-refetch list. Previously it
+/// was `RamsesV2` and got a constant calibrated once at startup instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn former_ramses_v2_pool_now_classifies_as_ramses_cl() -> Result<()> {
+    assert_eq!(classify(FORMER_RAMSES_V2).await?, V3PoolType::RamsesCL);
     Ok(())
 }

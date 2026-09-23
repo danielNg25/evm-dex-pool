@@ -195,7 +195,7 @@ Pass `None` to disable metrics.
 ## Pool Types Supported
 
 - **UniswapV2Pool** — constant product (`x * y = k`) and stable swap curves
-- **UniswapV3Pool** — concentrated liquidity with tick-based pricing (supports UniswapV3, PancakeV3, AlgebraV3, RamsesV2 variants)
+- **UniswapV3Pool** — concentrated liquidity with tick-based pricing (supports UniswapV3, PancakeV3, AlgebraV3, RamsesCL variants)
 - **ERC4626** — vault-based pools (deposit/withdraw pricing)
 
 All pool types implement `PoolInterface` which provides `calculate_output`, `calculate_input`, `apply_swap`, `apply_log`, `tokens`, `fee`, `address`, etc.

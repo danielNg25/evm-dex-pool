@@ -48,7 +48,7 @@ All pool types implement `PoolInterface`, which requires:
 ### Pool Implementations
 
 - **`src/v2/`** — `UniswapV2Pool` with `V2PoolType` (UniswapV2 or Stable). Fee stored in 1_000_000 basis. `src/v2/factories.rs` has chain-specific factory address → fee mappings for 80+ networks.
-- **`src/v3/`** — `UniswapV3Pool` with full tick-based concentrated liquidity math (bit_math, full_math, sqrt_price_math, swap_math, tick_math — Rust ports of Uniswap V3 Solidity contracts). `V3PoolType` has 6 variants: `UniswapV3`, `PancakeV3`, `AlgebraV3`, `RamsesV2`, `AlgebraTwoSideFee`, `AlgebraPoolFeeInState`.
+- **`src/v3/`** — `UniswapV3Pool` with full tick-based concentrated liquidity math (bit_math, full_math, sqrt_price_math, swap_math, tick_math — Rust ports of Uniswap V3 Solidity contracts). `V3PoolType` has 6 variants: `UniswapV3`, `PancakeV3`, `AlgebraV3`, `AlgebraTwoSideFee`, `AlgebraPoolFeeInState`, `RamsesCL`. `AlgebraV3` and `RamsesCL` have a mutable `fee()` that changes without an event, so the registry tracks them for periodic refetch.
 - **`src/erc4626/`** — `ERC4626Standard` and `VerioIP` variants. `ERC4626Pool` enum selects the variant.
 
 ### Registry (`src/registry.rs`, feature `registry`)

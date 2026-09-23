@@ -15,7 +15,6 @@ use super::{v3_swap, Tick, TickMap};
 /// The Q64.96 precision used by Uniswap V3
 pub const Q96_U128: u128 = 1 << 96;
 pub const FEE_DENOMINATOR: u32 = 1000000;
-pub const RAMSES_FACTOR: u128 = 10000000000;
 
 /// Enum representing the type of V3 pool
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -23,14 +22,12 @@ pub enum V3PoolType {
     UniswapV3,
     PancakeV3,
     AlgebraV3,
-    RamsesV2,
     AlgebraTwoSideFee,
     AlgebraPoolFeeInState,
     /// Ramses-family concentrated-liquidity fork (Pharaoh, Shadow, Nile, Cleo,
-    /// Ramses CL). Swap math is identical to [`V3PoolType::UniswapV3`] -- in
-    /// particular it does NOT get the quoter-calibrated `ratio_conversion_factor`
-    /// that [`V3PoolType::RamsesV2`] applies. The variant exists only so the
-    /// collector knows the pool's `fee()` is mutable and must be refetched.
+    /// Ramses CL). Swap math is identical to [`V3PoolType::UniswapV3`]. The
+    /// variant exists only so the collector knows the pool's `fee()` is
+    /// mutable and must be refetched.
     ///
     /// New variants go at the end: `bincode` encodes enums by positional index,
     /// and consumers persist `UniswapV3Pool` with it.
@@ -60,8 +57,6 @@ pub struct UniswapV3Pool {
     pub liquidity: u128,
     /// Mapping of initialized ticks
     pub ticks: TickMap,
-    /// Ratio conversion factor
-    pub ratio_conversion_factor: U256,
     /// Factory address
     pub factory: Address,
     /// Last update timestamp
@@ -98,13 +93,8 @@ impl UniswapV3Pool {
             ticks: BTreeMap::new(),
             last_updated: current_time,
             created_at: current_time,
-            ratio_conversion_factor: U256::from(RAMSES_FACTOR),
             factory,
         }
-    }
-
-    pub fn update_ratio_conversion_factor(&mut self, factor: U256) {
-        self.ratio_conversion_factor = factor;
     }
 
     pub fn set_fee(&mut self, fee: U24) {
@@ -226,11 +216,7 @@ impl UniswapV3Pool {
         } else {
             return Err(anyhow!("Token not in pool"));
         }
-        if self.pool_type == V3PoolType::RamsesV2 {
-            Ok(result * self.ratio_conversion_factor / U256::from(RAMSES_FACTOR))
-        } else {
-            Ok(result)
-        }
+        Ok(result)
     }
 
     /// Calculate the amount out for a swap with the exact formula
@@ -550,9 +536,7 @@ mod tests {
     const TOKEN0: Address = address!("0x0000000000000000000000000000000000000002");
     const TOKEN1: Address = address!("0x0000000000000000000000000000000000000003");
 
-    /// A pool sitting at tick 0 with liquidity on either side, and a
-    /// `ratio_conversion_factor` of 2x so that Ramses V2's post-scaling is
-    /// unmistakable in the output.
+    /// A pool sitting at tick 0 with liquidity on either side.
     fn pool_with_type(pool_type: V3PoolType) -> UniswapV3Pool {
         let mut pool = UniswapV3Pool::new(
             address!("0x0000000000000000000000000000000000000001"),
@@ -579,39 +563,33 @@ mod tests {
                 },
             );
         }
-        pool.update_ratio_conversion_factor(U256::from(RAMSES_FACTOR) * U256::from(2u8));
         pool
     }
 
-    /// `RamsesCL` exists only to mark a mutable fee. It must quote exactly like
-    /// `UniswapV3` -- in particular it must NOT pick up the quoter-calibrated
-    /// `ratio_conversion_factor` that `RamsesV2` applies, because a Pharaoh
-    /// factory is absent from `RAMSES_FACTORIES` and so has no calibrated
-    /// quoter to derive that factor from.
+    /// Every V3 variant now quotes through the same math. The Ramses
+    /// `ratio_conversion_factor` -- a constant calibrated once against the
+    /// Ramses quoter to paper over a divergence whose cause turned out to be a
+    /// mutable fee -- is gone, so no variant post-scales its output. A
+    /// reintroduced scaling branch would break this.
     #[test]
-    fn ramses_cl_quotes_identically_to_uniswap_v3() {
+    fn all_v3_variants_quote_identically() {
         let amount_in = U256::from(1_000_000_000_000u64);
 
-        let uniswap = pool_with_type(V3PoolType::UniswapV3)
-            .calculate_exact_input(&TOKEN0, amount_in)
-            .unwrap();
-        let ramses_cl = pool_with_type(V3PoolType::RamsesCL)
-            .calculate_exact_input(&TOKEN0, amount_in)
-            .unwrap();
-        let ramses_v2 = pool_with_type(V3PoolType::RamsesV2)
+        let baseline = pool_with_type(V3PoolType::UniswapV3)
             .calculate_exact_input(&TOKEN0, amount_in)
             .unwrap();
 
-        // Guard against a vacuous 0 == 0 == 0 comparison.
-        assert!(uniswap > U256::ZERO, "fixture produced no output");
-        assert_eq!(
-            ramses_cl, uniswap,
-            "RamsesCL must use plain Uniswap V3 math"
-        );
-        assert_eq!(
-            ramses_v2,
-            uniswap * U256::from(2u8),
-            "RamsesV2 must still apply its ratio conversion factor"
-        );
+        // Guard against a vacuous 0 == 0 comparison.
+        assert!(baseline > U256::ZERO, "fixture produced no output");
+
+        for pool_type in [V3PoolType::PancakeV3, V3PoolType::RamsesCL] {
+            let quoted = pool_with_type(pool_type)
+                .calculate_exact_input(&TOKEN0, amount_in)
+                .unwrap();
+            assert_eq!(
+                quoted, baseline,
+                "{pool_type:?} must quote identically to UniswapV3 -- no post-scaling"
+            );
+        }
     }
 }

@@ -2,6 +2,51 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.7.0]
+
+### Removed
+
+- **The Ramses `ratio_conversion_factor` calibration is gone.** A `RamsesV2`
+  pool used to have its quotes post-scaled by a constant measured once at fetch
+  time: `calculate_ratio_conversion_factor` quoted 1e11 units through the Ramses
+  quoter in both directions, compared each against this crate's own V3 math, and
+  kept the smaller ratio (minus 1 wei). That constant corrected a divergence
+  whose cause was unknown at the time. The cause was the mutable `fee()`
+  addressed in 1.6.0, so the correction is now redundant -- and it carried the
+  same staleness flaw it was compensating for, since it was never recomputed
+  after startup. It also applied to `calculate_exact_input` only, leaving
+  `calculate_exact_output` uncorrected.
+
+  Removed with it: `UniswapV3Pool::ratio_conversion_factor` (public field),
+  `UniswapV3Pool::update_ratio_conversion_factor`, `RAMSES_FACTOR`,
+  `calculate_ratio_conversion_factor`, `RAMSES_FACTORIES`, `is_ramses_factory`
+  and `get_ramses_quoter`.
+
+### Changed
+
+- **Breaking: `UniswapV3Pool` lost a field.** `bincode`-persisted pools from
+  1.6.0 or earlier will not deserialize. Clear the pool snapshot; it rebuilds
+  from chain on the next run.
+- **Breaking: `V3PoolType::RamsesV2` is removed.** With the factory allowlist
+  gone nothing assigned it, and those pools now fall through to the
+  `lastPeriod()` check and classify as `RamsesCL` -- which puts them on the
+  mutable-fee refetch list, the correct treatment and what the calibration
+  constant was standing in for. Downstream `match` arms over `V3PoolType` must
+  drop their `RamsesV2` arm; it belongs with `UniswapV3` wherever it appears.
+  Removing it also shifts the positional indices `bincode` assigns to the later
+  variants, but no persisted pool survives this release anyway (see the field
+  removal above), so there is no old data to protect.
+- All V3 variants now quote through identical math, with no post-scaling on any
+  path. Pinned by `v3::pool::tests::all_v3_variants_quote_identically`.
+
+### Tests
+
+- `tests/ramses_cl_detect.rs` gains `former_ramses_v2_pool_now_classifies_as_ramses_cl`,
+  covering `0x0021368B…` -- the one pool deployed by the formerly hardcoded
+  factory. It answers `lastPeriod()` like any Ramses-family pool, but the
+  allowlist used to claim it first and pin it to `RamsesV2`, excluding it from
+  fee refetch.
+
 ## [1.6.0]
 
 ### Added
