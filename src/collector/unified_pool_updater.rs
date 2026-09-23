@@ -7,11 +7,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use super::algebra_fee_refetch::refetch_algebra_v3_fees;
 use super::block_source::{
     BlockSource, EventBatch, LatestBlockSource, PendingBlockSource, ProcessingMode,
     WebsocketBlockSource,
 };
+use super::dynamic_fee_refetch::refetch_dynamic_fees;
 use super::event_processor::{EventProcessor, PendingEvent};
 use super::metrics::CollectorMetrics;
 use super::multicall::resolve_multicall_address;
@@ -196,13 +196,13 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
 
                     if self.refetch_algebra_fee {
                         if let Some(block) = processed_through_block {
-                            let addresses = self.pool_registry.get_algebra_v3_addresses();
+                            let addresses = self.pool_registry.get_dynamic_fee_addresses();
                             if !addresses.is_empty() {
                                 let refetch_provider = self
                                     .algebra_refetch_provider
                                     .as_ref()
                                     .unwrap_or(&self.provider);
-                                if let Err(e) = refetch_algebra_v3_fees(
+                                if let Err(e) = refetch_dynamic_fees(
                                     refetch_provider,
                                     &self.pool_registry,
                                     &addresses,

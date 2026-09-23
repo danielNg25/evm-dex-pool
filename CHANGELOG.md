@@ -2,6 +2,78 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.6.0]
+
+### Added
+
+- **Ramses-family concentrated-liquidity support** — new `V3PoolType::RamsesCL`
+  for Pharaoh (Avalanche), Shadow, Nile, Cleo and Ramses CL. These forks are
+  Uniswap V3-shaped and keep `slot0()`, so the Algebra discriminator
+  `globalState()` never saw them and they were classified as plain
+  `UniswapV3` with a fee frozen at startup. They are detected by the
+  `lastPeriod()` view (selector `0xd340ef8a`), which answers on the
+  Ramses family and reverts on both Uniswap V3 and Algebra; it is added as
+  call 13 of the existing `fetch_v3_pool` multicall, so detection costs no
+  extra round trip. The check runs only after every existing branch, so
+  Algebra variants and true `RamsesV2` pools keep their classification.
+- `RamsesCL` pools are registered for periodic fee refetch alongside Algebra,
+  so their mutable fee tracks the chain instead of drifting.
+
+### Changed
+
+- **Breaking: `V3PoolType` gained a variant.** Exhaustive `match` expressions
+  over `V3PoolType` in downstream code must add a `RamsesCL` arm. It should be
+  grouped with `UniswapV3`/`RamsesV2` wherever routing or swap math is
+  selected. The variant is appended last so `bincode`-persisted pools keep
+  their positional indices.
+- `RamsesCL` deliberately uses **identical math to `UniswapV3`**. It does not
+  get the quoter-calibrated `ratio_conversion_factor` that `RamsesV2` applies:
+  Pharaoh's factory is absent from `RAMSES_FACTORIES`, so `get_ramses_quoter`
+  returns `None` and there is nothing to calibrate against. Pinned by
+  `v3::pool::tests::ramses_cl_quotes_identically_to_uniswap_v3`.
+- **Breaking: dynamic-fee tracking renamed on `PoolRegistry`** — the tracking
+  set now covers more than Algebra. `add_algebra_v3_address`,
+  `remove_algebra_v3_address` and `get_algebra_v3_addresses` become
+  `add_dynamic_fee_address`, `remove_dynamic_fee_address` and
+  `get_dynamic_fee_addresses`.
+- **Breaking: `collector::algebra_fee_refetch` is now
+  `collector::dynamic_fee_refetch`**, and `refetch_algebra_v3_fees` is
+  `refetch_dynamic_fees`. `CollectorConfig::refetch_algebra_fee` is
+  **unchanged** and still the flag that enables it.
+- `PoolRegistry::add_pool` now registers a mutable-fee pool for refetch itself,
+  and `remove_pool` untracks it. Tracking previously lived in a private helper
+  on the fetch path only. The internal helper is gone; no public API changed.
+
+### Fixed
+
+- **The fee refetch never ran when pools were restored from a snapshot.** Pools
+  loaded that way go in through `add_pool` directly, and
+  `fetch_pools_into_registry` skips addresses already in the registry -- so the
+  fetch-path helper that populated the refetch set never saw them and
+  `get_dynamic_fee_addresses()` came back empty. Every Algebra pool in that mode
+  was quoting on a fee frozen at startup. Tracking now happens inside
+  `add_pool`, so every insertion path is covered by construction.
+- `remove_pool` left the address in the refetch set. Callers that remove pools
+  directly (e.g. a liquidity filter) grew the set without bound and wasted
+  multicall slots on pools that were no longer held.
+- The periodic fee refetch read `fee()` through the Algebra ABI, which types it
+  `uint16`. Ramses-family fees are `uint24`, so a pool on a tier above 65535
+  (e.g. 100000 = 10%) would have failed to decode and silently kept its stale
+  fee. The refetch now reads `fee()` through the Uniswap V3 ABI (`uint24`);
+  Algebra's `uint16` response still decodes correctly, since both ABI-encode to
+  a 32-byte word.
+
+### Tests
+
+- `tests/ramses_cl_detect.rs` (live, `--ignored`) classifies three Avalanche
+  pools: Pharaoh `0xFf0855A9…` → `RamsesCL`, Uniswap V3 `0x7b602f98…` →
+  `UniswapV3`, Algebra `0x23fF0B53…` → `AlgebraV3`.
+- `contracts_rpc::tests::last_period_selector_matches_deployed_contracts` pins
+  the `lastPeriod()` selector.
+- `registry::tests::add_pool_tracks_mutable_fee_pools` and
+  `remove_pool_untracks_mutable_fee_pools` cover the snapshot-restore shape:
+  insertion through `add_pool` alone, with no fetch path involved.
+
 ## [1.5.0]
 
 ### Added

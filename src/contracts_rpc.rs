@@ -89,6 +89,23 @@ sol! {
     "contracts/ABI/IQuoter.json"
 }
 
+// Ramses-family concentrated-liquidity forks (Pharaoh on Avalanche, Shadow,
+// Nile, Cleo, Ramses CL). These are Uniswap V3-shaped -- they keep `slot0()`,
+// so the Algebra discriminator `globalState()` is blind to them -- but their
+// `fee()` is mutable and changes without emitting an event the collector sees.
+//
+// `lastPeriod()` is the marker: it answers on Ramses-family CL pools and
+// reverts on both Uniswap V3 and Algebra. Verified on Avalanche:
+//   0xFf0855A9027f5F5c2bbaCC4aAC477AfbeeefbeA9 -> 2959   (Pharaoh)
+//   0x7b602f98D71715916E7c963f51bfEbC754aDE2d0 -> revert (Uniswap V3)
+//   0x23fF0B5370BF33725918e6105108f3fa2c4b8a05 -> revert (Algebra)
+sol! {
+    #[sol(rpc)]
+    interface RpcRamsesCLPool {
+        function lastPeriod() external view returns (uint256);
+    }
+}
+
 // LB pool contracts (for fetching)
 sol! {
     #[sol(rpc)]
@@ -132,9 +149,23 @@ mod tests {
     /// has the wrong parameter types, its computed selector will not match.
     #[test]
     fn v20_selectors_match_deployed_contracts() {
-        assert_eq!(RpcILBPairV20::getReservesAndIdCall::SELECTOR, hex!("1b05b83e"));
+        assert_eq!(
+            RpcILBPairV20::getReservesAndIdCall::SELECTOR,
+            hex!("1b05b83e")
+        );
         assert_eq!(RpcILBPairV20::feeParametersCall::SELECTOR, hex!("98c7adf3"));
-        assert_eq!(RpcILBPairV20::findFirstNonEmptyBinIdCall::SELECTOR, hex!("8f919a83"));
+        assert_eq!(
+            RpcILBPairV20::findFirstNonEmptyBinIdCall::SELECTOR,
+            hex!("8f919a83")
+        );
+    }
+
+    /// `lastPeriod()` is the sole discriminator `fetch_v3_pool` uses to detect a
+    /// Ramses-family CL pool. Selector confirmed by eth_call against a live
+    /// Pharaoh pair (returns 2959) and a live Uniswap V3 pair (reverts).
+    #[test]
+    fn last_period_selector_matches_deployed_contracts() {
+        assert_eq!(RpcRamsesCLPool::lastPeriodCall::SELECTOR, hex!("d340ef8a"));
     }
 
     #[test]
@@ -142,8 +173,14 @@ mod tests {
         assert_eq!(RpcILBPair::getReservesCall::SELECTOR, hex!("0902f1ac"));
         assert_eq!(RpcILBPair::getActiveIdCall::SELECTOR, hex!("dbe65edc"));
         assert_eq!(RpcILBPair::getBinStepCall::SELECTOR, hex!("17f11ecc"));
-        assert_eq!(RpcILBPair::getStaticFeeParametersCall::SELECTOR, hex!("7ca0de30"));
-        assert_eq!(RpcILBPair::getVariableFeeParametersCall::SELECTOR, hex!("8d7024e5"));
+        assert_eq!(
+            RpcILBPair::getStaticFeeParametersCall::SELECTOR,
+            hex!("7ca0de30")
+        );
+        assert_eq!(
+            RpcILBPair::getVariableFeeParametersCall::SELECTOR,
+            hex!("8d7024e5")
+        );
     }
 
     /// getLBHooksParameters() is the sole discriminator Task 3 uses to detect v2.2:
@@ -152,7 +189,10 @@ mod tests {
     /// (reverts) on Avalanche C-Chain -- see the fix report for the raw responses.
     #[test]
     fn get_lb_hooks_parameters_selector_matches_deployed_contract() {
-        assert_eq!(RpcILBPair::getLBHooksParametersCall::SELECTOR, hex!("781a8915"));
+        assert_eq!(
+            RpcILBPair::getLBHooksParametersCall::SELECTOR,
+            hex!("781a8915")
+        );
     }
 
     /// Real topic0 values observed on deployed LB pairs via eth_getLogs. Asserting

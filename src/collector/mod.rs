@@ -1,7 +1,7 @@
-pub mod algebra_fee_refetch;
 pub mod block_source;
 pub mod bootstrap;
 pub mod config;
+pub mod dynamic_fee_refetch;
 pub mod event_processor;
 pub mod event_queue;
 pub mod handle;
@@ -12,13 +12,13 @@ pub mod unified_pool_updater;
 pub mod utils;
 pub mod websocket_listener;
 
-pub use algebra_fee_refetch::refetch_algebra_v3_fees;
 pub use block_source::{
     BlockSource, EventBatch, LatestBlockSource, PendingBlockSource, ProcessingMode,
     WebsocketBlockSource,
 };
 pub use bootstrap::start_collector;
 pub use config::{CollectorConfig, PoolFetchConfig};
+pub use dynamic_fee_refetch::refetch_dynamic_fees;
 pub use event_processor::{fetch_events_with_retry, EventProcessor, PendingEvent};
 pub use event_queue::{create_event_queue, EventQueue, EventSender};
 pub use handle::CollectorHandle;

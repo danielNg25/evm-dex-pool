@@ -1,3 +1,4 @@
+use crate::v3::{UniswapV3Pool, V3PoolType};
 use crate::{PoolInterface, PoolType, Topic};
 use alloy::primitives::Address;
 use dashmap::DashMap;
@@ -18,9 +19,9 @@ pub struct PoolRegistry {
     by_address:
         Arc<DashMap<Address, Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>>>,
     /// Addresses of pools whose `fee()` may change every block without emitting
-    /// an event (currently `V3PoolType::AlgebraV3`). Maintained as pools are
-    /// added/removed so the collector can refetch fees in a single multicall.
-    algebra_v3_addresses: Arc<DashMap<Address, ()>>,
+    /// an event. Maintained as pools are added/removed so the collector can
+    /// refetch fees in a single multicall.
+    dynamic_fee_addresses: Arc<DashMap<Address, ()>>,
     last_processed_block: AtomicU64,
     topics: RwLock<Vec<Topic>>,
     profitable_topics: RwLock<HashSet<Topic>>,
@@ -31,7 +32,7 @@ impl PoolRegistry {
     pub fn new(network_id: u64) -> Self {
         Self {
             by_address: Arc::new(DashMap::new()),
-            algebra_v3_addresses: Arc::new(DashMap::new()),
+            dynamic_fee_addresses: Arc::new(DashMap::new()),
             last_processed_block: AtomicU64::new(0),
             topics: RwLock::new(Vec::new()),
             profitable_topics: RwLock::new(HashSet::new()),
@@ -39,33 +40,33 @@ impl PoolRegistry {
         }
     }
 
-    /// Track an Algebra V3 pool address for periodic fee refetch.
-    pub fn add_algebra_v3_address(&self, address: Address) {
-        if self.algebra_v3_addresses.insert(address, ()).is_none() {
+    /// Track a mutable-fee pool address for periodic fee refetch.
+    pub fn add_dynamic_fee_address(&self, address: Address) {
+        if self.dynamic_fee_addresses.insert(address, ()).is_none() {
             info!(
-                "[Chain {}] Tracking Algebra V3 pool {} for periodic fee refetch ({} total)",
+                "[Chain {}] Tracking dynamic-fee pool {} for periodic fee refetch ({} total)",
                 self.network_id,
                 address,
-                self.algebra_v3_addresses.len()
+                self.dynamic_fee_addresses.len()
             );
         }
     }
 
-    /// Stop tracking an Algebra V3 pool address.
-    pub fn remove_algebra_v3_address(&self, address: &Address) {
-        if self.algebra_v3_addresses.remove(address).is_some() {
+    /// Stop tracking a mutable-fee pool address.
+    pub fn remove_dynamic_fee_address(&self, address: &Address) {
+        if self.dynamic_fee_addresses.remove(address).is_some() {
             info!(
-                "[Chain {}] Untracking Algebra V3 pool {} ({} remaining)",
+                "[Chain {}] Untracking dynamic-fee pool {} ({} remaining)",
                 self.network_id,
                 address,
-                self.algebra_v3_addresses.len()
+                self.dynamic_fee_addresses.len()
             );
         }
     }
 
-    /// Snapshot of currently tracked Algebra V3 pool addresses.
-    pub fn get_algebra_v3_addresses(&self) -> Vec<Address> {
-        self.algebra_v3_addresses
+    /// Snapshot of currently tracked mutable-fee pool addresses.
+    pub fn get_dynamic_fee_addresses(&self) -> Vec<Address> {
+        self.dynamic_fee_addresses
             .iter()
             .map(|entry| *entry.key())
             .collect()
@@ -86,9 +87,21 @@ impl PoolRegistry {
         self.by_address.len()
     }
 
-    /// Add a pool to the registry
+    /// Add a pool to the registry.
+    ///
+    /// Mutable-fee pools are registered for periodic fee refetch here rather
+    /// than at the fetch site, so that *every* insertion path is covered by
+    /// construction -- including a snapshot restore, which bypasses
+    /// `fetch_pools_into_registry` entirely (that function skips addresses
+    /// already in the registry).
     pub fn add_pool(&self, pool: Box<dyn PoolInterface + Send + Sync>) {
         let address = pool.address();
+        // Borrow ends before `pool` moves into the map below.
+        if let Some(v3) = pool.as_any().downcast_ref::<UniswapV3Pool>() {
+            if matches!(v3.pool_type, V3PoolType::AlgebraV3 | V3PoolType::RamsesCL) {
+                self.add_dynamic_fee_address(address);
+            }
+        }
         self.by_address
             .insert(address, Arc::new(tokio::sync::RwLock::new(pool)));
     }
@@ -103,12 +116,20 @@ impl PoolRegistry {
             .map(|entry| Arc::clone(entry.value()))
     }
 
-    /// Remove a pool by address
+    /// Remove a pool by address.
+    ///
+    /// Also drops the address from the mutable-fee refetch set, so callers that
+    /// remove pools directly (e.g. a liquidity filter) do not leave the set
+    /// growing without bound.
     pub fn remove_pool(
         &self,
         address: &Address,
     ) -> Option<Arc<tokio::sync::RwLock<Box<dyn PoolInterface + Send + Sync>>>> {
-        self.by_address.remove(address).map(|(_, pool)| pool)
+        let removed = self.by_address.remove(address).map(|(_, pool)| pool);
+        if removed.is_some() {
+            self.remove_dynamic_fee_address(address);
+        }
+        removed
     }
 
     /// Get all pools
@@ -252,7 +273,7 @@ impl Clone for PoolRegistry {
     fn clone(&self) -> Self {
         Self {
             by_address: Arc::clone(&self.by_address),
-            algebra_v3_addresses: Arc::clone(&self.algebra_v3_addresses),
+            dynamic_fee_addresses: Arc::clone(&self.dynamic_fee_addresses),
             last_processed_block: AtomicU64::new(self.last_processed_block.load(Ordering::Relaxed)),
             topics: RwLock::new(self.topics.read().unwrap().clone()),
             profitable_topics: RwLock::new(self.profitable_topics.read().unwrap().clone()),
@@ -281,6 +302,7 @@ impl std::fmt::Debug for PoolRegistry {
 mod tests {
     use super::*;
     use crate::MockPool;
+    use alloy::primitives::{address, aliases::U24, U160};
 
     #[tokio::test]
     async fn test_add_and_get_pool() {
@@ -388,6 +410,66 @@ mod tests {
         // Cloned registry shares the by_address map
         assert_eq!(cloned.pool_count(), 1);
         assert!(cloned.get_pool(&addr).is_some());
+    }
+
+    /// Build a V3 pool of a given type. Only `address` and `pool_type` matter
+    /// for registry bookkeeping.
+    fn v3_pool(addr: Address, pool_type: V3PoolType) -> Box<dyn PoolInterface + Send + Sync> {
+        Box::new(UniswapV3Pool::new(
+            addr,
+            Address::ZERO,
+            Address::ZERO,
+            U24::from(3000u32),
+            60,
+            U160::ZERO,
+            0,
+            0,
+            Address::ZERO,
+            pool_type,
+        ))
+    }
+
+    /// Tracking must happen in `add_pool`, not at the fetch site: the consuming
+    /// bot restores pools from a local snapshot straight through `add_pool`, and
+    /// `fetch_pools_into_registry` then skips those addresses as already
+    /// present. If tracking lived only on the fetch path, snapshot-restored
+    /// Algebra and Ramses CL pools would never be refetched at all.
+    #[tokio::test]
+    async fn add_pool_tracks_mutable_fee_pools() {
+        let registry = PoolRegistry::new(1);
+        let algebra = address!("0x0000000000000000000000000000000000000001");
+        let ramses_cl = address!("0x0000000000000000000000000000000000000002");
+        let uniswap = address!("0x0000000000000000000000000000000000000003");
+
+        // No fetch path involved -- this is the snapshot-restore shape.
+        registry.add_pool(v3_pool(algebra, V3PoolType::AlgebraV3));
+        registry.add_pool(v3_pool(ramses_cl, V3PoolType::RamsesCL));
+        registry.add_pool(v3_pool(uniswap, V3PoolType::UniswapV3));
+        // A non-V3 pool must not be tracked either.
+        registry.add_pool(MockPool::new_boxed());
+
+        let mut tracked = registry.get_dynamic_fee_addresses();
+        tracked.sort();
+        assert_eq!(
+            tracked,
+            vec![algebra, ramses_cl],
+            "only AlgebraV3 and RamsesCL are mutable-fee"
+        );
+        assert_eq!(registry.pool_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn remove_pool_untracks_mutable_fee_pools() {
+        let registry = PoolRegistry::new(1);
+        let ramses_cl = address!("0x0000000000000000000000000000000000000002");
+        registry.add_pool(v3_pool(ramses_cl, V3PoolType::RamsesCL));
+        assert_eq!(registry.get_dynamic_fee_addresses(), vec![ramses_cl]);
+
+        assert!(registry.remove_pool(&ramses_cl).is_some());
+        assert!(
+            registry.get_dynamic_fee_addresses().is_empty(),
+            "remove_pool must not leak the refetch set"
+        );
     }
 
     #[tokio::test]
