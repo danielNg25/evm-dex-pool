@@ -26,6 +26,15 @@ pub enum V3PoolType {
     RamsesV2,
     AlgebraTwoSideFee,
     AlgebraPoolFeeInState,
+    /// Ramses-family concentrated-liquidity fork (Pharaoh, Shadow, Nile, Cleo,
+    /// Ramses CL). Swap math is identical to [`V3PoolType::UniswapV3`] -- in
+    /// particular it does NOT get the quoter-calibrated `ratio_conversion_factor`
+    /// that [`V3PoolType::RamsesV2`] applies. The variant exists only so the
+    /// collector knows the pool's `fee()` is mutable and must be refetched.
+    ///
+    /// New variants go at the end: `bincode` encodes enums by positional index,
+    /// and consumers persist `UniswapV3Pool` with it.
+    RamsesCL,
 }
 
 /// Struct containing V3 pool information including tick data
@@ -530,5 +539,79 @@ impl fmt::Display for UniswapV3Pool {
 impl PoolTypeTrait for UniswapV3Pool {
     fn pool_type(&self) -> PoolType {
         PoolType::UniswapV3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy::primitives::address;
+
+    const TOKEN0: Address = address!("0x0000000000000000000000000000000000000002");
+    const TOKEN1: Address = address!("0x0000000000000000000000000000000000000003");
+
+    /// A pool sitting at tick 0 with liquidity on either side, and a
+    /// `ratio_conversion_factor` of 2x so that Ramses V2's post-scaling is
+    /// unmistakable in the output.
+    fn pool_with_type(pool_type: V3PoolType) -> UniswapV3Pool {
+        let mut pool = UniswapV3Pool::new(
+            address!("0x0000000000000000000000000000000000000001"),
+            TOKEN0,
+            TOKEN1,
+            U24::from(3000u32),
+            60,
+            U160::from(Q96_U128), // sqrtPriceX96 at tick 0
+            0,
+            1_000_000_000_000_000_000u128,
+            address!("0x0000000000000000000000000000000000000004"),
+            pool_type,
+        );
+        for (index, liquidity_net) in [
+            (-60i32, 1_000_000_000_000_000_000i128),
+            (60, -1_000_000_000_000_000_000),
+        ] {
+            pool.ticks.insert(
+                index,
+                Tick {
+                    index,
+                    liquidity_net,
+                    liquidity_gross: 1_000_000_000_000_000_000u128,
+                },
+            );
+        }
+        pool.update_ratio_conversion_factor(U256::from(RAMSES_FACTOR) * U256::from(2u8));
+        pool
+    }
+
+    /// `RamsesCL` exists only to mark a mutable fee. It must quote exactly like
+    /// `UniswapV3` -- in particular it must NOT pick up the quoter-calibrated
+    /// `ratio_conversion_factor` that `RamsesV2` applies, because a Pharaoh
+    /// factory is absent from `RAMSES_FACTORIES` and so has no calibrated
+    /// quoter to derive that factor from.
+    #[test]
+    fn ramses_cl_quotes_identically_to_uniswap_v3() {
+        let amount_in = U256::from(1_000_000_000_000u64);
+
+        let uniswap = pool_with_type(V3PoolType::UniswapV3)
+            .calculate_exact_input(&TOKEN0, amount_in)
+            .unwrap();
+        let ramses_cl = pool_with_type(V3PoolType::RamsesCL)
+            .calculate_exact_input(&TOKEN0, amount_in)
+            .unwrap();
+        let ramses_v2 = pool_with_type(V3PoolType::RamsesV2)
+            .calculate_exact_input(&TOKEN0, amount_in)
+            .unwrap();
+
+        // Guard against a vacuous 0 == 0 == 0 comparison.
+        assert!(uniswap > U256::ZERO, "fixture produced no output");
+        assert_eq!(
+            ramses_cl, uniswap,
+            "RamsesCL must use plain Uniswap V3 math"
+        );
+        assert_eq!(
+            ramses_v2,
+            uniswap * U256::from(2u8),
+            "RamsesV2 must still apply its ratio conversion factor"
+        );
     }
 }

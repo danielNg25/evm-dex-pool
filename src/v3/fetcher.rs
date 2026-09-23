@@ -4,6 +4,7 @@ use crate::contracts_rpc::RpcAlgebraV3Pool as AlgebraV3Pool;
 use crate::contracts_rpc::RpcCLPPool as CLPPool;
 use crate::contracts_rpc::RpcIQuoter as IQuoter;
 use crate::contracts_rpc::RpcIUniswapV3Pool as IUniswapV3Pool;
+use crate::contracts_rpc::RpcRamsesCLPool as RamsesCLPool;
 use crate::v3::{
     get_ramses_quoter, is_ramses_factory, Tick, UniswapV3Pool, V3PoolType, MAX_TICK_I32,
     MIN_TICK_I32, RAMSES_FACTOR,
@@ -36,6 +37,7 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
     let algebra_v3_pool_instance = AlgebraV3Pool::new(pool_address, &provider);
     let algebra_two_side_fee_pool_instance = AlgebraTwoSideFee::new(pool_address, &provider);
     let algebra_pool_fee_in_state_instance = AlgebraPoolFeeInState::new(pool_address, &provider);
+    let ramses_cl_pool_instance = RamsesCLPool::new(pool_address, &provider);
 
     let multicall_result = provider
         .multicall()
@@ -53,6 +55,7 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
         .add(algebra_two_side_fee_pool_instance.globalState()) // 10
         .add(algebra_two_side_fee_pool_instance.activeIncentive()) // 11
         .add(algebra_pool_fee_in_state_instance.globalState()) // 12
+        .add(ramses_cl_pool_instance.lastPeriod()) // 13
         .block(block_number)
         .try_aggregate(false)
         .await?;
@@ -193,6 +196,23 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
             )
         };
 
+    // Ramses-family CL forks (Pharaoh, Shadow, Nile, Cleo) are Uniswap V3-shaped
+    // -- they keep `slot0()`, so none of the Algebra branches above claim them --
+    // but their `fee()` is mutable and changes with no event the collector sees.
+    // `lastPeriod()` answering (via try_aggregate(false), so a revert is `Err`)
+    // is the marker.
+    //
+    // This runs only when nothing above classified the pool, so an Algebra
+    // variant keeps its classification and a true Ramses V2 pool -- caught by
+    // the `is_ramses_factory` check -- keeps `RamsesV2` and its quoter-calibrated
+    // ratio math. `UniswapV3` is the only fall-through value, and the guard is
+    // placed after the whole chain rather than inside its final `else` so it
+    // also covers a Ramses CL pool that decoded through the `CLPPool::slot0()`
+    // branch.
+    if v3_pool_type == V3PoolType::UniswapV3 && multicall_result.13.is_ok() {
+        v3_pool_type = V3PoolType::RamsesCL;
+    }
+
     // Create token objects (you'll need to fetch token details)
     let (token0, _) = token_info
         .get_or_fetch_token(provider, token0, multicall_address)
@@ -245,7 +265,10 @@ pub async fn fetch_v3_ticks<P: Provider + Send + Sync>(
     let mut tick_indices = Vec::new();
 
     match pool.pool_type {
-        V3PoolType::UniswapV3 | V3PoolType::RamsesV2 | V3PoolType::PancakeV3 => {
+        V3PoolType::UniswapV3
+        | V3PoolType::RamsesV2
+        | V3PoolType::RamsesCL
+        | V3PoolType::PancakeV3 => {
             // Fetch word bitmap
             let min_word = pool.tick_to_word(MIN_TICK_I32);
             let max_word = pool.tick_to_word(MAX_TICK_I32);
@@ -404,7 +427,10 @@ pub async fn fetch_v3_ticks<P: Provider + Send + Sync>(
     // Split tick fetching into chunks
     let mut all_ticks: BTreeMap<i32, Tick> = BTreeMap::new();
     match pool.pool_type {
-        V3PoolType::UniswapV3 | V3PoolType::RamsesV2 | V3PoolType::PancakeV3 => {
+        V3PoolType::UniswapV3
+        | V3PoolType::RamsesV2
+        | V3PoolType::RamsesCL
+        | V3PoolType::PancakeV3 => {
             let contract = IUniswapV3Pool::new(pool.address, provider);
             for chunk in tick_indices.chunks(250) {
                 let mut multicall =

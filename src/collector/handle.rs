@@ -6,7 +6,6 @@ use crate::collector::pool_fetcher::{fetch_pool, identify_pool_type};
 use crate::collector::unified_pool_updater::{UnifiedPoolUpdater, UpdaterMode};
 use crate::collector::websocket_listener::WebsocketListener;
 use crate::collector::CollectorConfig;
-use crate::v3::{UniswapV3Pool, V3PoolType};
 use crate::{PoolInterface, PoolRegistry, PoolType, TokenInfo};
 use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::Address;
@@ -146,7 +145,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
         let mut removed = 0usize;
         for addr in addresses {
             if self.pool_registry.remove_pool(addr).is_some() {
-                self.pool_registry.remove_algebra_v3_address(addr);
+                // `remove_pool` untracks the address for fee refetch itself.
                 removed += 1;
             }
         }
@@ -529,8 +528,7 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
         } else {
             let mut seq = Vec::with_capacity(chunk.len());
             for (i, &address) in chunk.iter().enumerate() {
-                let pool_type =
-                    identify_pool_type(provider, address, multicall_address).await?;
+                let pool_type = identify_pool_type(provider, address, multicall_address).await?;
                 seq.push(
                     fetch_pool(
                         provider,
@@ -545,12 +543,13 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                 if i + 1 < chunk.len() && config.wait_time_between_chunks > 0 {
                     info!(
                         "[Chain {}] Sequential mode: waiting {}ms before next pool ({}/{})",
-                        chain_id, config.wait_time_between_chunks, i + 1, chunk.len()
-                    );
-                    tokio::time::sleep(Duration::from_millis(
+                        chain_id,
                         config.wait_time_between_chunks,
-                    ))
-                    .await;
+                        i + 1,
+                        chunk.len()
+                    );
+                    tokio::time::sleep(Duration::from_millis(config.wait_time_between_chunks))
+                        .await;
                 }
             }
             seq
@@ -577,10 +576,7 @@ async fn fetch_pools_in_memory<P: Provider + Send + Sync, T: TokenInfo>(
                     "[Chain {}] Sequential mode: waiting {}ms before retrying next pool",
                     chain_id, config.wait_time_between_chunks
                 );
-                tokio::time::sleep(Duration::from_millis(
-                    config.wait_time_between_chunks,
-                ))
-                .await;
+                tokio::time::sleep(Duration::from_millis(config.wait_time_between_chunks)).await;
             }
             let mut success = false;
             for attempt in 1..=config.max_retries {
@@ -744,27 +740,17 @@ async fn catchup_registry_to_block<P: Provider + Send + Sync>(
 }
 
 /// Insert pool objects into the registry and register any previously unseen
-/// pool-type event topics. Also tracks Algebra V3 addresses for periodic fee
-/// refetch (see [`crate::collector::algebra_fee_refetch`]).
+/// pool-type event topics. Tracking mutable-fee pools for periodic fee refetch
+/// (see [`crate::collector::dynamic_fee_refetch`]) is handled by
+/// [`PoolRegistry::add_pool`], so every insertion path gets it.
 fn register_pools_and_topics(registry: &Arc<PoolRegistry>, pools: Vec<Box<dyn PoolInterface>>) {
     let mut new_pool_types: HashSet<PoolType> = HashSet::new();
     for pool in pools {
         new_pool_types.insert(pool.pool_type());
-        track_if_algebra_v3(registry, pool.as_ref());
         registry.add_pool(pool);
     }
     for pool_type in new_pool_types {
         registry.add_topics(pool_type.topics());
         registry.add_profitable_topics(pool_type.profitable_topics());
-    }
-}
-
-/// If `pool` is a `V3PoolType::AlgebraV3`, register its address with the
-/// registry so the collector can refetch its dynamic fee after each batch.
-pub(crate) fn track_if_algebra_v3(registry: &PoolRegistry, pool: &dyn PoolInterface) {
-    if let Some(v3) = pool.as_any().downcast_ref::<UniswapV3Pool>() {
-        if v3.pool_type == V3PoolType::AlgebraV3 {
-            registry.add_algebra_v3_address(v3.address);
-        }
     }
 }
