@@ -2,6 +2,52 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.7.1]
+
+### Fixed
+
+- **A V2 `fee()` reading above 10000 wrapped to near `U256::MAX`.** The
+  resolver treated any value over `REVERSE_FEE_MAX` as the complement of a
+  1e4-basis fee and computed `GET_FEE_MAX - fee` on unsigned `U256`. A pool
+  reporting 15000 underflowed, and every later `fee.to::<u128>()` panicked --
+  29,025 times in one 42-hour run, aborting the whole simulation task each
+  time and costing roughly 40% of all simulations. Such a value cannot be a
+  1e4-basis fee (over 100%) nor a complement (negative), so it is now
+  recognised as already being in the 1e6 basis the crate stores.
+
+- **An ambiguous reading was silently multiplied instead of resolved.** Three
+  conventions share one number space -- a fee in 1e4 basis (30 = 0.3%), its
+  complement (9970 = 0.3%), and a fee already in 1e6 basis (3000 = 0.3%) --
+  and magnitude cannot separate the last two. Where the pool exposes
+  `getAmountOut`, the fee is now back-solved from a quote it gives itself:
+
+      out = (ain*(1-f)*r1) / (r0 + ain*(1-f))   =>   f = 1 - out*r0/(ain*(r1-out))
+
+  an exact inversion of the curve, slippage included. Two reserve-proportional
+  probes go out in one multicall and must agree, so a pool on another curve
+  falls back rather than being priced on a guess. Small probes are unusable:
+  `getAmountOut` returns an integer, and truncation read 15169 where the fee
+  was 15000. Stable pools are excluded -- their curve is x^3y+y^3x -- as are
+  pools whose fee comes from a `factory_to_fee` override, which is an explicit
+  operator choice.
+
+  This one was silent. `0x903c3ed1` on Avalanche reports 5000 and charges 0.5%;
+  it was priced at 50% for a whole run, never panicking and never producing a
+  cycle.
+
+### Added
+
+- A fee resolving above 10% of notional now fails the pool's load, naming it.
+  A reading that large is a misparse, and an absent pool costs less than a
+  silently mispriced one.
+
+### Tests
+
+- `v2::fetcher::tests::no_reading_wraps` pins the regression: no input may
+  produce a fee beyond 100% of notional.
+- `tests/v2_fee_calibration.rs` (live, `--ignored`) resolves the three
+  Avalanche pools on factory `0x85448bf2` to 1.5%, 1.5% and 0.5%.
+
 ## [1.7.0]
 
 ### Removed

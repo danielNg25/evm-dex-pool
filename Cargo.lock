@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "evm-dex-pool"
-version = "1.7.0"
+version = "1.7.1"
 dependencies = [
  "alloy",
  "anyhow",
