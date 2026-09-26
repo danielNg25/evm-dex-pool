@@ -5,7 +5,7 @@ use alloy::primitives::{aliases::U24, Address, Signed, U160, U256};
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{anyhow, Result};
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::{collections::BTreeMap, fmt};
@@ -425,7 +425,10 @@ impl EventApplicable for UniswapV3Pool {
                         self.address, ev.oldFee, self.fee
                     );
                 }
-                debug!(
+                // Info, not debug: fee changes are rare and each one reprices every
+                // cycle through the pool. The per-block refetch this replaces logged
+                // each update at info too, so this keeps the same visibility.
+                info!(
                     "Applying FeeAdjustment to pool {}: {} -> {}",
                     self.address, ev.oldFee, ev.newFee
                 );
