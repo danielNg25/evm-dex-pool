@@ -92,7 +92,8 @@ sol! {
 // Ramses-family concentrated-liquidity forks (Pharaoh on Avalanche, Shadow,
 // Nile, Cleo, Ramses CL). These are Uniswap V3-shaped -- they keep `slot0()`,
 // so the Algebra discriminator `globalState()` is blind to them -- but their
-// `fee()` is mutable and changes without emitting an event the collector sees.
+// `fee()` is mutable. Each change emits `FeeAdjustment(oldFee, newFee)`
+// (bound in `crate::contracts`), which the pool applies in log order.
 //
 // `lastPeriod()` is the marker: it answers on Ramses-family CL pools and
 // reverts on both Uniswap V3 and Algebra. Verified on Avalanche:

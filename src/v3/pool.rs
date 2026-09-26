@@ -1,11 +1,11 @@
-use crate::contracts::{IAlgebraPoolSei, IPancakeV3Pool, IUniswapV3Pool};
+use crate::contracts::{IAlgebraPoolSei, IPancakeV3Pool, IRamsesCLPool, IUniswapV3Pool};
 use crate::pool::base::{EventApplicable, PoolInterface, PoolType, PoolTypeTrait, TopicList};
 use alloy::primitives::FixedBytes;
 use alloy::primitives::{aliases::U24, Address, Signed, U160, U256};
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::{anyhow, Result};
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::{collections::BTreeMap, fmt};
@@ -25,9 +25,9 @@ pub enum V3PoolType {
     AlgebraTwoSideFee,
     AlgebraPoolFeeInState,
     /// Ramses-family concentrated-liquidity fork (Pharaoh, Shadow, Nile, Cleo,
-    /// Ramses CL). Swap math is identical to [`V3PoolType::UniswapV3`]. The
-    /// variant exists only so the collector knows the pool's `fee()` is
-    /// mutable and must be refetched.
+    /// Ramses CL). Swap math is identical to [`V3PoolType::UniswapV3`]; what
+    /// differs is a mutable `fee()`. That fee is kept current by the pool's own
+    /// `FeeAdjustment` events, applied in `apply_log`, not by polling.
     ///
     /// New variants go at the end: `bincode` encodes enums by positional index,
     /// and consumers persist `UniswapV3Pool` with it.
@@ -408,6 +408,30 @@ impl EventApplicable for UniswapV3Pool {
                     swap_data.liquidity,
                 )
             }
+            // A Ramses-family pool changed its fee. Applied here, in log order,
+            // rather than read back by a poll after the block: any swap later in
+            // the same block executed at the new fee, and a post-block poll
+            // prices those swaps on the old one. That ordering gap is exactly
+            // what run 6's fork replay caught (5 stale-fee failures in 299).
+            Some(&IRamsesCLPool::FeeAdjustment::SIGNATURE_HASH) => {
+                let ev: IRamsesCLPool::FeeAdjustment = log.log_decode()?.inner.data;
+                // `oldFee` should equal what we hold. If it does not, an earlier
+                // adjustment was missed and the pool was mispriced until now --
+                // worth surfacing, since nothing else would.
+                if ev.oldFee != self.fee {
+                    warn!(
+                        "FeeAdjustment on pool {} expected old fee {} but held {}; \
+                         an earlier fee change was missed",
+                        self.address, ev.oldFee, self.fee
+                    );
+                }
+                debug!(
+                    "Applying FeeAdjustment to pool {}: {} -> {}",
+                    self.address, ev.oldFee, ev.newFee
+                );
+                self.set_fee(ev.newFee);
+                Ok(())
+            }
             Some(&IUniswapV3Pool::Mint::SIGNATURE_HASH) => {
                 let mint_data: IUniswapV3Pool::Mint = log.log_decode()?.inner.data;
                 debug!(
@@ -495,6 +519,10 @@ impl TopicList for UniswapV3Pool {
             IPancakeV3Pool::Swap::SIGNATURE_HASH,
             IAlgebraPoolSei::Swap::SIGNATURE_HASH,
             IAlgebraPoolSei::Burn::SIGNATURE_HASH,
+            // State, not a trigger: a fee change updates the pool but is not
+            // itself a reason to search for a cycle, so it is deliberately absent
+            // from `profitable_topics`.
+            IRamsesCLPool::FeeAdjustment::SIGNATURE_HASH,
         ]
     }
 
@@ -531,7 +559,7 @@ impl PoolTypeTrait for UniswapV3Pool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::address;
+    use alloy::primitives::{address, b256, LogData};
 
     const TOKEN0: Address = address!("0x0000000000000000000000000000000000000002");
     const TOKEN1: Address = address!("0x0000000000000000000000000000000000000003");
@@ -591,5 +619,66 @@ mod tests {
                 "{pool_type:?} must quote identically to UniswapV3 -- no post-scaling"
             );
         }
+    }
+
+    /// Real topic0 of `FeeAdjustment(uint24,uint24)`, as emitted on Avalanche.
+    const FEE_ADJUSTMENT_TOPIC: alloy::primitives::B256 =
+        b256!("0x0cba87189055d3b5ab05c96fbd641bc766576c9e7cf0d195bdfb58a0c6a6df24");
+
+    /// The real FeeAdjustment log from 0x71bd7525 at block 96081609 -- the
+    /// 800 -> 5500 jump that run 6 priced on the stale 800 and reverted on.
+    /// Built from raw bytes exactly as eth_getLogs returned them (topic0 plus
+    /// two data words), not via `encode_log_data`, so this proves the binding
+    /// decodes what the chain actually emits rather than round-tripping itself.
+    fn real_fee_adjustment_log() -> Log {
+        let mut data = vec![0u8; 64];
+        data[30..32].copy_from_slice(&800u16.to_be_bytes()); // oldFee
+        data[62..64].copy_from_slice(&5500u16.to_be_bytes()); // newFee
+        Log {
+            inner: alloy::primitives::Log {
+                address: address!("0x71bd752508936dea5a032991f4a2997a506b1cde"),
+                data: LogData::new_unchecked(vec![FEE_ADJUSTMENT_TOPIC], data.into()),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fee_adjustment_topic_matches_deployed_contract() {
+        assert_eq!(
+            IRamsesCLPool::FeeAdjustment::SIGNATURE_HASH,
+            FEE_ADJUSTMENT_TOPIC
+        );
+    }
+
+    #[test]
+    fn fee_adjustment_applies_the_new_fee() {
+        let mut pool = pool_with_type(V3PoolType::RamsesCL);
+        pool.set_fee(U24::from(800u32));
+        pool.apply_log(&real_fee_adjustment_log()).unwrap();
+        assert_eq!(pool.fee, U24::from(5500u32));
+    }
+
+    /// If an earlier adjustment was missed, the pool holds a fee that disagrees
+    /// with this event's `oldFee`. The event is still the authority on the new
+    /// fee -- the mismatch is warned about, never allowed to strand the pool on
+    /// a stale value.
+    #[test]
+    fn fee_adjustment_recovers_from_a_missed_earlier_change() {
+        let mut pool = pool_with_type(V3PoolType::RamsesCL); // holds 3000
+        pool.apply_log(&real_fee_adjustment_log()).unwrap(); // event says old was 800
+        assert_eq!(pool.fee, U24::from(5500u32));
+    }
+
+    /// A fee change is state, not an opportunity: it must be fetched so it is
+    /// applied, but must not by itself kick off a cycle search.
+    #[test]
+    fn fee_adjustment_is_fetched_but_does_not_trigger_a_search() {
+        let topic = IRamsesCLPool::FeeAdjustment::SIGNATURE_HASH;
+        assert!(UniswapV3Pool::topics().contains(&topic), "must be fetched");
+        assert!(
+            !UniswapV3Pool::profitable_topics().contains(&topic),
+            "must not trigger a search"
+        );
     }
 }

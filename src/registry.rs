@@ -89,16 +89,21 @@ impl PoolRegistry {
 
     /// Add a pool to the registry.
     ///
-    /// Mutable-fee pools are registered for periodic fee refetch here rather
-    /// than at the fetch site, so that *every* insertion path is covered by
+    /// Algebra pools are registered for periodic fee refetch here rather than
+    /// at the fetch site, so that *every* insertion path is covered by
     /// construction -- including a snapshot restore, which bypasses
     /// `fetch_pools_into_registry` entirely (that function skips addresses
     /// already in the registry).
+    ///
+    /// Ramses-family (`RamsesCL`) pools are deliberately NOT tracked: their fee
+    /// changes arrive as `FeeAdjustment` events and are applied in log order,
+    /// which is both cheaper than polling and correct within a block, where a
+    /// post-batch poll is not.
     pub fn add_pool(&self, pool: Box<dyn PoolInterface + Send + Sync>) {
         let address = pool.address();
         // Borrow ends before `pool` moves into the map below.
         if let Some(v3) = pool.as_any().downcast_ref::<UniswapV3Pool>() {
-            if matches!(v3.pool_type, V3PoolType::AlgebraV3 | V3PoolType::RamsesCL) {
+            if v3.pool_type == V3PoolType::AlgebraV3 {
                 self.add_dynamic_fee_address(address);
             }
         }
@@ -433,7 +438,11 @@ mod tests {
     /// bot restores pools from a local snapshot straight through `add_pool`, and
     /// `fetch_pools_into_registry` then skips those addresses as already
     /// present. If tracking lived only on the fetch path, snapshot-restored
-    /// Algebra and Ramses CL pools would never be refetched at all.
+    /// Algebra pools would never be refetched at all.
+    ///
+    /// Ramses CL is added too, to pin that it is NOT tracked: its fee is
+    /// event-driven, and polling it again would waste calls and re-open the
+    /// within-block ordering gap the events close.
     #[tokio::test]
     async fn add_pool_tracks_mutable_fee_pools() {
         let registry = PoolRegistry::new(1);
@@ -452,8 +461,8 @@ mod tests {
         tracked.sort();
         assert_eq!(
             tracked,
-            vec![algebra, ramses_cl],
-            "only AlgebraV3 and RamsesCL are mutable-fee"
+            vec![algebra],
+            "only AlgebraV3 is polled; RamsesCL fees are event-driven"
         );
         assert_eq!(registry.pool_count(), 4);
     }
@@ -461,11 +470,11 @@ mod tests {
     #[tokio::test]
     async fn remove_pool_untracks_mutable_fee_pools() {
         let registry = PoolRegistry::new(1);
-        let ramses_cl = address!("0x0000000000000000000000000000000000000002");
-        registry.add_pool(v3_pool(ramses_cl, V3PoolType::RamsesCL));
-        assert_eq!(registry.get_dynamic_fee_addresses(), vec![ramses_cl]);
+        let algebra = address!("0x0000000000000000000000000000000000000001");
+        registry.add_pool(v3_pool(algebra, V3PoolType::AlgebraV3));
+        assert_eq!(registry.get_dynamic_fee_addresses(), vec![algebra]);
 
-        assert!(registry.remove_pool(&ramses_cl).is_some());
+        assert!(registry.remove_pool(&algebra).is_some());
         assert!(
             registry.get_dynamic_fee_addresses().is_empty(),
             "remove_pool must not leak the refetch set"

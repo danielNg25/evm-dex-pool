@@ -1,10 +1,14 @@
-//! Periodic fee refetch for V3 pools whose fee is mutable.
+//! Periodic fee refetch for Algebra V3 pools.
 //!
-//! Two families need this. Some Algebra V3 deployments use a dynamic fee plugin
-//! that updates the swap fee every block via an external mechanism (e.g. a price
-//! oracle). Ramses-family CL forks (Pharaoh, Shadow, Nile, Cleo) likewise carry a
-//! mutable `fee()`. Neither emits an on-chain event the collector listens to, so
-//! the cached fee in the registry drifts from the on-chain fee over time.
+//! Some Algebra V3 deployments use a dynamic fee plugin that updates the swap
+//! fee every block via an external mechanism (e.g. a price oracle), and emit no
+//! event the collector consumes, so the cached fee drifts unless it is read back.
+//!
+//! Ramses-family CL pools are NOT handled here. Their fee also moves, but every
+//! change emits `FeeAdjustment(oldFee, newFee)`, which `UniswapV3Pool::apply_log`
+//! applies in log order. That is strictly better than this poll: the poll runs
+//! after a batch's swaps have been simulated, so it prices a block on the
+//! previous block's fee -- the cause of 5 of 9 failures in run 6's replay.
 //!
 //! When `CollectorConfig::refetch_algebra_fee` is enabled, the collector calls
 //! [`refetch_dynamic_fees`] after each event batch is applied. It does a single

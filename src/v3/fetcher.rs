@@ -191,7 +191,8 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
 
     // Ramses-family CL forks (Pharaoh, Shadow, Nile, Cleo) are Uniswap V3-shaped
     // -- they keep `slot0()`, so none of the Algebra branches above claim them --
-    // but their `fee()` is mutable and changes with no event the collector sees.
+    // but their `fee()` is mutable. Its changes arrive as `FeeAdjustment` events,
+    // which `apply_log` handles, so detection is what makes those events apply.
     // `lastPeriod()` answering (via try_aggregate(false), so a revert is `Err`)
     // is the marker.
     //

@@ -14,13 +14,12 @@ pub struct CollectorConfig {
     /// Polling interval in milliseconds for LatestBlock mode.
     pub wait_time: u64,
     /// If true, after each event batch the collector will multicall `fee()` on
-    /// every tracked mutable-fee pool and write the fresh fee back into the
-    /// registry. That covers both `V3PoolType::AlgebraV3` (whose fee plugin
-    /// updates per-block) and `V3PoolType::RamsesCL` (Pharaoh, Shadow, Nile,
-    /// Cleo), neither of which emits an event the collector listens to.
+    /// every tracked `V3PoolType::AlgebraV3` pool and write the fresh fee back
+    /// into the registry, since the Algebra fee plugin updates per-block without
+    /// an event the collector consumes.
     ///
-    /// The field name is kept as `refetch_algebra_fee` for config
-    /// compatibility, even though it is no longer Algebra-specific.
+    /// Ramses-family CL pools do not need this: their fee changes arrive as
+    /// `FeeAdjustment` events and are applied inline.
     pub refetch_algebra_fee: bool,
 }
 

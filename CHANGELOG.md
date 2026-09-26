@@ -2,6 +2,50 @@
 
 All notable changes to `evm-dex-pool` will be documented in this file.
 
+## [1.8.0]
+
+### Changed
+
+- **Ramses-family fee changes are applied from `FeeAdjustment` events, not
+  polled.** Every Ramses-family CL pool (Pharaoh, Shadow, Nile, Cleo) emits
+  `FeeAdjustment(uint24 oldFee, uint24 newFee)` when its fee moves.
+  `UniswapV3Pool::apply_log` now handles it, and the event is in
+  `UniswapV3Pool::topics()` so the collector fetches it.
+
+  This fixes an ordering bug, not only a cost. The per-batch refetch runs
+  after a batch's swaps have been forwarded to the simulator, so block N was
+  priced on block N-1's fee. A fork replay of run 6 found this behind 5 of 9
+  failing cycles out of 299. The worst was `0x71bd7525`, priced at fee 800
+  while the chain had moved to 5500 in that block. `process_confirmed_events`
+  applies a whole batch before forwarding any swap, so an event-driven fee is
+  current when the block's cycles are priced, and it follows log order within
+  the block.
+
+  A `FeeAdjustment` whose `oldFee` disagrees with the fee held logs a warning:
+  an earlier change was missed. The new fee is applied either way.
+
+- **`RamsesCL` pools are no longer tracked for fee refetch.** With their fees
+  event-driven, polling them only spends calls. `PoolRegistry::add_pool`
+  tracks `AlgebraV3` alone, since the Algebra fee plugin still emits nothing
+  the collector consumes.
+
+### Notes
+
+- `FeeAdjustment` is deliberately absent from `profitable_topics()`. A fee
+  change updates state but does not start a cycle search by itself.
+- Topics are registered at pool fetch time. A pool snapshot saved by 1.7.x
+  restores the old topic list, but 1.7.x snapshots cannot deserialize under
+  1.7+ anyway (`UniswapV3Pool` lost a field), so a clean fetch is already
+  required.
+
+### Tests
+
+- Four unit tests in `v3::pool`, built from the real `FeeAdjustment` log bytes
+  of block 96081609 rather than the binding's own encoding: topic pinned to
+  the deployed contract, fee applied, recovery from a missed earlier change,
+  and fetched-but-not-a-trigger.
+- `registry::tests` now pins that `RamsesCL` is not tracked.
+
 ## [1.7.1]
 
 ### Fixed

@@ -87,3 +87,14 @@ sol! {
     ILBFactory,
     "contracts/ABI/ILBFactory.json"
 }
+
+// Ramses-family CL pools (Pharaoh, Shadow, Nile, Cleo) emit this whenever their
+// mutable fee changes, carrying both the old and the new value. Verified on
+// Avalanche against every fee change in run 6's failing replay blocks (6/6),
+// e.g. 0x71bd7525 at block 96081609: FeeAdjustment(800, 5500), topic0
+// 0x0cba8718...df24. See `fee_adjustment_topic_matches_deployed_contract`.
+sol! {
+    interface IRamsesCLPool {
+        event FeeAdjustment(uint24 oldFee, uint24 newFee);
+    }
+}
