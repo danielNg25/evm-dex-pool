@@ -632,6 +632,23 @@ impl EventApplicable for LBPool {
                 self.last_updated = chrono::Utc::now().timestamp() as u64;
                 Ok(())
             }
+            Some(&ILBPair::CompositionFees::SIGNATURE_HASH) => {
+                // A mint into the active bin that pays a composition fee also
+                // runs `updateVolatilityParameters(activeId, block.timestamp)`
+                // on the pair (LBPair v2.1 `_updateBin`): the references, the
+                // accumulator for that bin, and timeOfLastUpdate all move.
+                // Reserves are NOT touched: the same transaction's
+                // DepositedToBins already carries the fee-inclusive amounts.
+                let data: ILBPair::CompositionFees = event.log_decode()?.inner.data;
+                let id: u32 = data.id.to();
+                let ts = Self::log_timestamp(event);
+                let (vol_ref, id_ref) = self.update_references(ts);
+                self.volatility_reference = vol_ref;
+                self.id_reference = id_ref;
+                self.volatility_accumulator = self.compute_volatility_accumulator(id, vol_ref, id_ref);
+                self.time_of_last_update = ts;
+                Ok(())
+            }
             Some(&ILBPair::DepositedToBins::SIGNATURE_HASH) => {
                 let data: ILBPair::DepositedToBins = event.log_decode()?.inner.data;
                 for (i, id_u256) in data.ids.iter().enumerate() {
@@ -895,6 +912,11 @@ impl TopicList for LBPool {
     /// v2.1+ reaches the same conclusion from the other direction: its
     /// `CompositionFees` rides the same transaction as a fee-INCLUSIVE
     /// `DepositedToBins`, so handling it would double-count too.
+    ///
+    /// `CompositionFees` IS fetched since run 8, but only for the variable-fee
+    /// clock: the same mint moves the pair's volatility parameters, and
+    /// missing that repriced 0x864d from the next swap on. Its arm never
+    /// credits a bin.
     fn topics() -> Vec<Topic> {
         vec![
             ILBPair::Swap::SIGNATURE_HASH,
@@ -906,6 +928,8 @@ impl TopicList for LBPool {
             // only signal that the bin moved. v2.0 has no counterpart in
             // `ILBPairV20` — see `flash_loan_has_no_v20_counterpart` below.
             ILBPair::FlashLoan::SIGNATURE_HASH,
+            // For the fee clock only; its arm never touches a bin.
+            ILBPair::CompositionFees::SIGNATURE_HASH,
             ILBPairV20::Swap::SIGNATURE_HASH,
             ILBPairV20::DepositedToBin::SIGNATURE_HASH,
             ILBPairV20::WithdrawnFromBin::SIGNATURE_HASH,
@@ -1323,7 +1347,7 @@ mod tests {
     fn v20_composition_fee_is_not_subscribed() {
         use crate::contracts::ILBPairV20;
         assert!(!LBPool::topics().contains(&ILBPairV20::CompositionFee::SIGNATURE_HASH));
-        assert_eq!(LBPool::topics().len(), 8);
+        assert_eq!(LBPool::topics().len(), 9);
     }
 
     // ─── FlashLoan ───────────────────────────────────────────────────────────
@@ -1462,5 +1486,95 @@ mod tests {
             "ILBPairV20.json gained a FlashLoan entry — wire an apply_log arm \
              and a topics() entry for it, or this event is silently dropped"
         );
+    }
+
+    // ─── CompositionFees ─────────────────────────────────────────────────────
+
+    fn composition_fees_log(id: u32, block_timestamp: u64) -> Log {
+        let event = ILBPair::CompositionFees {
+            sender: Address::ZERO,
+            id: id.try_into().unwrap(),
+            totalFees: B256::ZERO,
+            protocolFees: B256::ZERO,
+        };
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_timestamp: Some(block_timestamp),
+            ..Default::default()
+        }
+    }
+
+    fn swap_log_at(id: u32, volatility_accumulator: u32, block_timestamp: u64) -> Log {
+        let event = ILBPair::Swap {
+            sender: Address::ZERO,
+            to: Address::ZERO,
+            id: id.try_into().unwrap(),
+            amountsIn: B256::ZERO,
+            amountsOut: B256::ZERO,
+            volatilityAccumulator: volatility_accumulator.try_into().unwrap(),
+            totalFees: B256::ZERO,
+            protocolFees: B256::ZERO,
+        };
+        Log {
+            inner: alloy::primitives::Log {
+                address: Address::ZERO,
+                data: event.encode_log_data(),
+            },
+            block_timestamp: Some(block_timestamp),
+            ..Default::default()
+        }
+    }
+
+    /// Avalanche pair 0x864d…16ea, blocks 96,226,717-96,226,737 (run 8 fixtures
+    /// bulk_039#115/#117). A mint into the active bin at t=1790469496 paid a
+    /// composition fee, which runs `updateVolatilityParameters` and moved the
+    /// pair's timeOfLastUpdate from 1790469487 to 1790469496. The next swap, at
+    /// t=1790469520, is then 24 s after the last update -- inside filterPeriod
+    /// 30 -- so the chain kept volatilityReference 8323 / idReference 8363353.
+    /// Without the mint applied the model saw 33 s, reset them to 19161 /
+    /// 8363350, and every later quote paid ~0.02 bps too much fee.
+    #[test]
+    fn a_composition_fee_mint_moves_the_fee_clock() {
+        let mut pool = LBPool::new(
+            address!("864d4e5Ee7318e97483DB7EB0912E09F161516EA"),
+            address!("B31f66AA3C1e785363F0875A1B74E27b85FD66c7"), // WAVAX
+            address!("B97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"), // USDC
+            10,
+            8_363_350,
+            BTreeMap::new(),
+            5_000,
+            30,
+            600,
+            5_000,
+            40_000,
+            1_000,
+            350_000,
+            38_323,
+            8_323,
+            8_363_353,
+            1_790_469_487,
+        );
+        pool.update_bin(8_363_350, 1_000_000_000_000_000_000, 1_000_000);
+
+        pool.apply_log(&composition_fees_log(8_363_350, 1_790_469_496)).unwrap();
+        assert_eq!(pool.time_of_last_update, 1_790_469_496);
+        assert_eq!(pool.volatility_accumulator, 38_323);
+
+        pool.apply_log(&swap_log_at(8_363_350, 38_323, 1_790_469_520)).unwrap();
+        assert_eq!(
+            (pool.volatility_reference, pool.id_reference),
+            (8_323, 8_363_353),
+            "24 s after the mint is inside filterPeriod: the chain kept its references"
+        );
+    }
+
+    #[test]
+    fn composition_fees_is_fetched_but_does_not_trigger_a_search() {
+        let topic = ILBPair::CompositionFees::SIGNATURE_HASH;
+        assert!(LBPool::topics().contains(&topic), "must be fetched");
+        assert!(!LBPool::profitable_topics().contains(&topic), "must not trigger a search");
     }
 }

@@ -6,6 +6,14 @@ All notable changes to `evm-dex-pool` will be documented in this file.
 
 ### Changed
 
+- **LB `CompositionFees` moves the variable-fee clock.** A v2.1+ mint into
+  the active bin that pays a composition fee also runs
+  `updateVolatilityParameters`, moving the references, the accumulator and
+  `timeOfLastUpdate`. The model ignored it, so its clock lagged and a later
+  swap reset references the chain kept; run 8 quoted 0x864d ~0.02 bps high
+  (bulk_039#115/#117, reproduced to the wei). v2.0's `CompositionFee` is not
+  handled here: unverified.
+
 - **Ramses-family fee changes are applied from `FeeAdjustment` events, not
   polled.** Every Ramses-family CL pool (Pharaoh, Shadow, Nile, Cleo) emits
   `FeeAdjustment(uint24 oldFee, uint24 newFee)` when its fee moves.
