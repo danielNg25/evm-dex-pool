@@ -14,6 +14,12 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   (bulk_039#115/#117, reproduced to the wei). v2.0's `CompositionFee` is not
   handled here: unverified.
 
+- **Algebra Integral fee events are applied.** `Fee(uint16)` sets the fee of
+  a pool whose `fee()` is the stored fee (every Avalanche Algebra pool:
+  `DYNAMIC_FEE` off; 3 such events in 38 days, each matching a `fee()`
+  change). `PluginConfig`/`Plugin` reset the pool's `FeeSource` to `Unknown`
+  so the fee reader re-classifies it.
+
 - **Ramses-family fee changes are applied from `FeeAdjustment` events, not
   polled.** Every Ramses-family CL pool (Pharaoh, Shadow, Nile, Cleo) emits
   `FeeAdjustment(uint24 oldFee, uint24 newFee)` when its fee moves.

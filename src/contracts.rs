@@ -114,3 +114,16 @@ sol! {
         );
     }
 }
+
+// Algebra Integral pool events that change or report the swap fee (core
+// IAlgebraPoolEvents). Verified live: Fee on Avalanche 0x259d… at block
+// 96050122 (5000 -> 500); SwapFee beside every Integral swap on both
+// Avalanche and Flare; Plugin and PluginConfig on Flare 0x1922… at 70513172.
+sol! {
+    interface IAlgebraIntegralPool {
+        event Fee(uint16 fee);
+        event PluginConfig(uint8 newPluginConfig);
+        event Plugin(address newPluginAddress);
+        event SwapFee(address indexed sender, uint24 overrideFee, uint24 pluginFee);
+    }
+}

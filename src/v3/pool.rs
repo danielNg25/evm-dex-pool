@@ -1,4 +1,6 @@
-use crate::contracts::{IAlgebraPoolSei, IPancakeV3Pool, IRamsesCLPool, IUniswapV3Pool};
+use crate::contracts::{
+    IAlgebraIntegralPool, IAlgebraPoolSei, IPancakeV3Pool, IRamsesCLPool, IUniswapV3Pool,
+};
 use crate::pool::base::{EventApplicable, PoolInterface, PoolType, PoolTypeTrait, TopicList};
 use alloy::primitives::FixedBytes;
 use alloy::primitives::{aliases::U24, Address, Signed, U160, U256};
@@ -619,6 +621,32 @@ impl EventApplicable for UniswapV3Pool {
                     burn_data.liquidityAmount,
                 )
             }
+            // The stored fee changed through `setFee`. It is what swaps pay
+            // only when the plugin does not compute the fee.
+            Some(&IAlgebraIntegralPool::Fee::SIGNATURE_HASH) => {
+                let ev: IAlgebraIntegralPool::Fee = log.log_decode()?.inner.data;
+                if self.fee_source != FeeSource::ReadFee {
+                    info!(
+                        "Applying Algebra Fee to pool {}: {} -> {}",
+                        self.address, self.fee, ev.fee
+                    );
+                    self.set_fee(U24::from(ev.fee));
+                }
+                Ok(())
+            }
+            // A new plugin or plugin config can switch `fee()` between the
+            // stored fee and the plugin's. Forget the classification; the
+            // collector queues this pool, and the fee reader re-classifies it
+            // with one read.
+            Some(&IAlgebraIntegralPool::PluginConfig::SIGNATURE_HASH)
+            | Some(&IAlgebraIntegralPool::Plugin::SIGNATURE_HASH) => {
+                info!(
+                    "Algebra pool {} changed its plugin configuration; fee source reset",
+                    self.address
+                );
+                self.fee_source = FeeSource::Unknown;
+                Ok(())
+            }
             _ => {
                 trace!("Ignoring non-V3 event for V3 pool");
                 Ok(())
@@ -642,6 +670,10 @@ impl TopicList for UniswapV3Pool {
             IRamsesCLPool::FeeAdjustment::SIGNATURE_HASH,
             // Ramses V3 Mint (with position index): state, not a trigger.
             IRamsesCLPool::Mint::SIGNATURE_HASH,
+            // Algebra Integral fee state; none is a trigger.
+            IAlgebraIntegralPool::Fee::SIGNATURE_HASH,
+            IAlgebraIntegralPool::PluginConfig::SIGNATURE_HASH,
+            IAlgebraIntegralPool::Plugin::SIGNATURE_HASH,
         ]
     }
 
@@ -1059,5 +1091,76 @@ mod tests {
         assert!(json.get("fee_source").is_none());
         let restored: UniswapV3Pool = serde_json::from_value(json).unwrap();
         assert_eq!(restored.fee_source, FeeSource::Unknown);
+    }
+
+    const ALGEBRA_FEE_TOPIC: alloy::primitives::B256 =
+        b256!("0x598b9f043c813aa6be3426ca60d1c65d17256312890be5118dab55b0775ebe2a");
+    const ALGEBRA_PLUGIN_CONFIG_TOPIC: alloy::primitives::B256 =
+        b256!("0x3a6271b36c1b44bd6a0a0d56230602dc6919b7c17af57254306fadf5fee69dc3");
+    const ALGEBRA_PLUGIN_TOPIC: alloy::primitives::B256 =
+        b256!("0x27a3944eff2135a57675f17e72501038982b73620d01f794c72e93d61a3932a2");
+
+    fn one_word_log(topic: alloy::primitives::B256, word: [u8; 32]) -> Log {
+        Log {
+            inner: alloy::primitives::Log {
+                address: address!("0x0000000000000000000000000000000000000001"),
+                data: LogData::new_unchecked(vec![topic], word.to_vec().into()),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn algebra_event_topics_match_deployed_contracts() {
+        assert_eq!(IAlgebraIntegralPool::Fee::SIGNATURE_HASH, ALGEBRA_FEE_TOPIC);
+        assert_eq!(IAlgebraIntegralPool::PluginConfig::SIGNATURE_HASH, ALGEBRA_PLUGIN_CONFIG_TOPIC);
+        assert_eq!(IAlgebraIntegralPool::Plugin::SIGNATURE_HASH, ALGEBRA_PLUGIN_TOPIC);
+    }
+
+    /// Avalanche 0x259d… at block 96,050,122: Fee(500), down from 5000. With
+    /// DYNAMIC_FEE off this is the only way the fee moves.
+    #[test]
+    fn an_algebra_fee_event_sets_a_stored_fee() {
+        let mut pool = pool_with_type(V3PoolType::AlgebraV3);
+        pool.fee_source = FeeSource::Events;
+        pool.set_fee(U24::from(5000u32));
+        pool.apply_log(&one_word_log(ALGEBRA_FEE_TOPIC, uint_word(500))).unwrap();
+        assert_eq!(pool.fee, U24::from(500u32));
+    }
+
+    /// With DYNAMIC_FEE on, `fee()` is the plugin's; the stored fee this event
+    /// reports is not what swaps pay and must not overwrite the read value.
+    #[test]
+    fn an_algebra_fee_event_is_ignored_when_the_plugin_sets_the_fee() {
+        let mut pool = pool_with_type(V3PoolType::AlgebraV3);
+        pool.fee_source = FeeSource::ReadFee;
+        pool.set_fee(U24::from(222u32));
+        pool.apply_log(&one_word_log(ALGEBRA_FEE_TOPIC, uint_word(500))).unwrap();
+        assert_eq!(pool.fee, U24::from(222u32));
+    }
+
+    /// Flare 0x1922… at block 70,513,172: Plugin(new), PluginConfig(0),
+    /// PluginConfig(215). Either event can switch `fee()` between the stored
+    /// fee and the plugin's, so the pool forgets its classification.
+    #[test]
+    fn a_plugin_change_resets_the_fee_source() {
+        for topic in [ALGEBRA_PLUGIN_TOPIC, ALGEBRA_PLUGIN_CONFIG_TOPIC] {
+            let mut pool = pool_with_type(V3PoolType::AlgebraV3);
+            pool.fee_source = FeeSource::Events;
+            pool.apply_log(&one_word_log(topic, uint_word(215))).unwrap();
+            assert_eq!(pool.fee_source, FeeSource::Unknown);
+        }
+    }
+
+    #[test]
+    fn algebra_fee_events_are_fetched_but_do_not_trigger_a_search() {
+        for topic in [
+            IAlgebraIntegralPool::Fee::SIGNATURE_HASH,
+            IAlgebraIntegralPool::PluginConfig::SIGNATURE_HASH,
+            IAlgebraIntegralPool::Plugin::SIGNATURE_HASH,
+        ] {
+            assert!(UniswapV3Pool::topics().contains(&topic), "must be fetched");
+            assert!(!UniswapV3Pool::profitable_topics().contains(&topic));
+        }
     }
 }
