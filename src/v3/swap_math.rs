@@ -234,13 +234,20 @@ pub fn v3_swap(
         }
 
         // A zero step is legitimate when the price already sits on the step's
-        // target: a zeroForOne search includes the current tick, so a price
-        // exactly on a word edge or an initialized tick first steps to itself
-        // and crosses. Only a zero step that did not reach its target is stuck.
+        // target and crossing it moves the tick: a zeroForOne search includes
+        // the current tick, so a price exactly on a word edge or an
+        // initialized tick first steps to itself and crosses into the range
+        // below. Upward is not symmetric: `NextInitialized`'s upward arm
+        // falls back to the current tick itself when nothing above it is
+        // initialized, and an upward crossing sets tick_current = tick_next
+        // with no decrement (below), so that fallback would sit on the same
+        // tick forever. The second clause is what stops that fallback from
+        // passing as "reached its target".
         if step.amount_in.is_zero()
             && step.amount_out.is_zero()
             && step.fee_amount.is_zero()
-            && state.sqrt_price_x96 != step.sqrt_price_next_x96
+            && (state.sqrt_price_x96 != step.sqrt_price_next_x96
+                || (!zero_for_one && step.tick_next <= state.tick_current))
         {
             return Err(anyhow!(
                 "v3_swap: no progress (zero amounts, liquidity={}, tick={})",

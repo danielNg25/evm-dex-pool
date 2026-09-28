@@ -29,10 +29,14 @@ pub enum TickSearch {
     /// (PancakeV3, Ramses CL) end a step at every word edge, and each step
     /// rounds its input and fee up, so skipping the edge overstated the output
     /// by one to two input units -- 49 of run 8's 99 non-exact replays, up to
-    /// 3.6% of a cycle's profit where one unit is a satoshi.
+    /// 3.6% of a cycle's profit where one unit is a satoshi. Algebra V1/V1.9
+    /// (`AlgebraTwoSideFee`, `AlgebraPoolFeeInState`) step the same way: their
+    /// `TickTable.nextTickInTheSameRow` stops at the edge of a
+    /// 256-compressed-tick row exactly as the bitmap stops at a word edge.
     WordBounded { tick_spacing: i32 },
-    /// The next initialized tick wherever it is. Algebra Integral walks a
-    /// linked list of initialized ticks and never stops at a word edge.
+    /// The next initialized tick wherever it is. Algebra Integral
+    /// (`AlgebraV3`) walks a linked list of initialized ticks and never
+    /// stops at a word edge.
     NextInitialized,
 }
 

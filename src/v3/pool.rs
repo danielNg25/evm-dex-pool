@@ -145,14 +145,20 @@ impl UniswapV3Pool {
     /// How this pool's swap loop finds where a step ends. See [`TickSearch`].
     pub fn tick_search(&self) -> TickSearch {
         match self.pool_type {
-            V3PoolType::UniswapV3 | V3PoolType::PancakeV3 | V3PoolType::RamsesCL => {
-                TickSearch::WordBounded {
-                    tick_spacing: self.tick_spacing,
-                }
-            }
-            V3PoolType::AlgebraV3
+            // Algebra V1/V1.9's `TickTable.nextTickInTheSameRow` stops at the
+            // edge of a 256-compressed-tick row exactly as
+            // `TickBitmap.nextInitializedTickWithinOneWord` stops at a word
+            // edge, so these two step the same as Uniswap V3 and its forks.
+            // Only Algebra Integral (`AlgebraV3`) walks a linked list of
+            // initialized ticks and never stops at an edge.
+            V3PoolType::UniswapV3
+            | V3PoolType::PancakeV3
+            | V3PoolType::RamsesCL
             | V3PoolType::AlgebraTwoSideFee
-            | V3PoolType::AlgebraPoolFeeInState => TickSearch::NextInitialized,
+            | V3PoolType::AlgebraPoolFeeInState => TickSearch::WordBounded {
+                tick_spacing: self.tick_spacing,
+            },
+            V3PoolType::AlgebraV3 => TickSearch::NextInitialized,
         }
     }
 
@@ -907,5 +913,66 @@ mod tests {
             .calculate_exact_input(&TOKEN1, U256::from(8_172_733u64))
             .unwrap();
         assert_eq!(out, U256::from(256_578_691_550_243_836_051u128));
+    }
+
+    /// Review regression: an AlgebraV3 pool with liquidity above the current
+    /// tick but no initialized tick above it (e.g. a map that lost its upper
+    /// tick). A oneForZero quote used to spin forever: `next_initialized_tick`'s
+    /// `NextInitialized` arm falls back to the current tick itself when
+    /// nothing is initialized above, and an upward crossing does not
+    /// decrement it, so the old guard accepted that zero-amount step as
+    /// "reached its target" and looped on the same tick forever. It must
+    /// fail promptly instead.
+    #[test]
+    fn one_for_zero_errors_instead_of_spinning_with_nothing_initialized_above() {
+        const LIQUIDITY: u128 = 1_000_000_000_000_000_000;
+        let mut pool = UniswapV3Pool::new(
+            address!("0x00000000000000000000000000000000000000aa"),
+            TOKEN0,
+            TOKEN1,
+            U24::from(500u32),
+            60,
+            U160::from(Q96_U128),
+            0,
+            LIQUIDITY,
+            Address::ZERO,
+            V3PoolType::AlgebraV3,
+        );
+        pool.ticks.insert(
+            -600,
+            Tick {
+                index: -600,
+                liquidity_net: LIQUIDITY as i128,
+                liquidity_gross: LIQUIDITY,
+            },
+        );
+
+        assert!(pool
+            .calculate_exact_input(&TOKEN1, U256::from(1_000_000u64))
+            .is_err());
+    }
+
+    /// Every `V3PoolType` maps to exactly the search its on-chain swap loop
+    /// uses; a new variant added without updating this match, and this test,
+    /// would silently misprice it.
+    #[test]
+    fn tick_search_covers_every_pool_type() {
+        for pool_type in [
+            V3PoolType::UniswapV3,
+            V3PoolType::PancakeV3,
+            V3PoolType::RamsesCL,
+            V3PoolType::AlgebraTwoSideFee,
+            V3PoolType::AlgebraPoolFeeInState,
+        ] {
+            assert_eq!(
+                pool_with_type(pool_type).tick_search(),
+                TickSearch::WordBounded { tick_spacing: 60 },
+                "{pool_type:?} must be word-bounded"
+            );
+        }
+        assert_eq!(
+            pool_with_type(V3PoolType::AlgebraV3).tick_search(),
+            TickSearch::NextInitialized
+        );
     }
 }
