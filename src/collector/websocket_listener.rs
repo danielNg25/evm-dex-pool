@@ -199,6 +199,18 @@ impl WebsocketListener {
                             chain_id, ws_url_clone
                         );
                     }
+                    // The server answered, so the connection is alive; it just
+                    // does not serve this method over websocket. Avalanche's
+                    // public endpoint answers eth_blockNumber with -32601, and
+                    // counting that as a failure reconnected every 90 s
+                    // (run 10, 2026-09-28), dropping logs across each gap.
+                    Err(e) if e.as_error_resp().is_some() => {
+                        ping_failures = 0;
+                        debug!(
+                            "[Chain {}] Heartbeat answered with an error, connection alive at {}: {}",
+                            chain_id, ws_url_clone, e
+                        );
+                    }
                     Err(e) => {
                         ping_failures += 1;
                         error!(
