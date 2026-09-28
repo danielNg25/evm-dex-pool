@@ -4,9 +4,7 @@ use crate::contracts_rpc::RpcAlgebraV3Pool as AlgebraV3Pool;
 use crate::contracts_rpc::RpcCLPPool as CLPPool;
 use crate::contracts_rpc::RpcIUniswapV3Pool as IUniswapV3Pool;
 use crate::contracts_rpc::RpcRamsesCLPool as RamsesCLPool;
-use crate::v3::{
-    classify_fee_source, Tick, UniswapV3Pool, V3PoolType, MAX_TICK_I32, MIN_TICK_I32,
-};
+use crate::v3::{classify_fee_source, Tick, UniswapV3Pool, V3PoolType, MAX_TICK_I32, MIN_TICK_I32};
 use crate::TokenInfo;
 use alloy::primitives::U128;
 use alloy::primitives::{aliases::U24, Address, Signed, U160, U256};
@@ -248,7 +246,8 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
         factory,
         v3_pool_type,
     );
-    pool.fee_source = classify_fee_source(v3_pool_type, algebra_plugin_config, current_fee.is_some());
+    pool.fee_source =
+        classify_fee_source(v3_pool_type, algebra_plugin_config, current_fee.is_some());
 
     fetch_v3_ticks(provider, &mut pool, block_number, multicall_address).await?;
 

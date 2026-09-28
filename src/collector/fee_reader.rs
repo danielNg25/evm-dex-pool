@@ -244,9 +244,14 @@ impl<P: Provider + Send + Sync + 'static> FeeReader<P> {
                     addresses.sort();
                     addresses.dedup();
                 }
-                let result =
-                    read_fees(&provider, &registry, &addresses, multicall_address, chain_id)
-                        .await;
+                let result = read_fees(
+                    &provider,
+                    &registry,
+                    &addresses,
+                    multicall_address,
+                    chain_id,
+                )
+                .await;
                 (addresses.len(), result)
             })
             .await;
@@ -351,7 +356,9 @@ pub async fn read_fees<P: Provider + Send + Sync>(
         return Ok(());
     }
 
-    let block = BlockId::Number(BlockNumberOrTag::Number(registry.get_last_processed_block()));
+    let block = BlockId::Number(BlockNumberOrTag::Number(
+        registry.get_last_processed_block(),
+    ));
     let (fees, configs, current_fees) = tokio::try_join!(
         read_fee_calls(provider, &want_fee, multicall_address, block),
         read_plugin_configs(provider, &want_config, multicall_address, block),
@@ -361,7 +368,10 @@ pub async fn read_fees<P: Provider + Send + Sync>(
     let (mut changed, mut classified) = (0usize, 0usize);
     for (i, address) in want_fee.iter().enumerate() {
         let Some(fee) = fees[i] else {
-            warn!("[Chain {}] Fee reader: fee() failed for {}", chain_id, address);
+            warn!(
+                "[Chain {}] Fee reader: fee() failed for {}",
+                chain_id, address
+            );
             continue;
         };
         let config = want_config
@@ -652,12 +662,33 @@ mod tests {
         let read_fee_algebra = address!("0x00000000000000000000000000000000000001e2");
         let unknown_ramses = address!("0x00000000000000000000000000000000000001e3");
         let events_uniswap = address!("0x00000000000000000000000000000000000001e4");
-        registry.add_pool(v3_pool(events_algebra, V3PoolType::AlgebraV3, FeeSource::Events));
-        registry.add_pool(v3_pool(read_fee_algebra, V3PoolType::AlgebraV3, FeeSource::ReadFee));
-        registry.add_pool(v3_pool(unknown_ramses, V3PoolType::RamsesCL, FeeSource::Unknown));
-        registry.add_pool(v3_pool(events_uniswap, V3PoolType::UniswapV3, FeeSource::Events));
+        registry.add_pool(v3_pool(
+            events_algebra,
+            V3PoolType::AlgebraV3,
+            FeeSource::Events,
+        ));
+        registry.add_pool(v3_pool(
+            read_fee_algebra,
+            V3PoolType::AlgebraV3,
+            FeeSource::ReadFee,
+        ));
+        registry.add_pool(v3_pool(
+            unknown_ramses,
+            V3PoolType::RamsesCL,
+            FeeSource::Unknown,
+        ));
+        registry.add_pool(v3_pool(
+            events_uniswap,
+            V3PoolType::UniswapV3,
+            FeeSource::Events,
+        ));
 
-        let addresses = [events_algebra, read_fee_algebra, unknown_ramses, events_uniswap];
+        let addresses = [
+            events_algebra,
+            read_fee_algebra,
+            unknown_ramses,
+            events_uniswap,
+        ];
         let plan = plan_reads(&registry, &addresses).await;
 
         assert_eq!(

@@ -182,7 +182,11 @@ impl UniswapV3Pool {
     /// the bot would price with is not what the pool charges, so it must not
     /// quote. The simulator treats a quote error as "skip this cycle".
     pub fn fee_unpredictable(&self) -> bool {
-        self.swap_fee_misses.iter().filter(|&&missed| missed).count() >= SWAP_FEE_MISSES_TO_STOP
+        self.swap_fee_misses
+            .iter()
+            .filter(|&&missed| missed)
+            .count()
+            >= SWAP_FEE_MISSES_TO_STOP
     }
 
     fn record_swap_fee(&mut self, missed: bool) {
@@ -722,7 +726,11 @@ impl EventApplicable for UniswapV3Pool {
                 let ev: IAlgebraIntegralPool::SwapFee = log.log_decode()?.inner.data;
                 let held = self.fee.to::<u32>();
                 let override_fee = ev.overrideFee.to::<u32>();
-                let base = if override_fee != 0 { override_fee } else { held };
+                let base = if override_fee != 0 {
+                    override_fee
+                } else {
+                    held
+                };
                 let paid = base + ev.pluginFee.to::<u32>();
                 self.record_swap_fee(paid > held);
                 Ok(())
@@ -962,7 +970,12 @@ mod tests {
             inner: alloy::primitives::Log {
                 address: address!("0xf01449c0ba930b6e2caca3def3ccbd7a3e589534"),
                 data: LogData::new_unchecked(
-                    vec![RAMSES_MINT_TOPIC, owner_word, int_word(-252_550), int_word(-252_540)],
+                    vec![
+                        RAMSES_MINT_TOPIC,
+                        owner_word,
+                        int_word(-252_550),
+                        int_word(-252_540),
+                    ],
                     data.into(),
                 ),
             },
@@ -990,9 +1003,18 @@ mod tests {
         let amount = 1_166_100_850_557_528_561u128;
         let lower = pool.ticks.get(&-252_550).expect("lower tick added");
         let upper = pool.ticks.get(&-252_540).expect("upper tick added");
-        assert_eq!((lower.liquidity_net, lower.liquidity_gross), (amount as i128, amount));
-        assert_eq!((upper.liquidity_net, upper.liquidity_gross), (-(amount as i128), amount));
-        assert_eq!(pool.liquidity, liquidity_before, "the range lies below tick 0");
+        assert_eq!(
+            (lower.liquidity_net, lower.liquidity_gross),
+            (amount as i128, amount)
+        );
+        assert_eq!(
+            (upper.liquidity_net, upper.liquidity_gross),
+            (-(amount as i128), amount)
+        );
+        assert_eq!(
+            pool.liquidity, liquidity_before,
+            "the range lies below tick 0"
+        );
     }
 
     #[test]
@@ -1167,13 +1189,34 @@ mod tests {
     fn fee_source_follows_what_the_pool_reports() {
         use V3PoolType::*;
         // pluginConfig 215 (Flare SparkDEX) has DYNAMIC_FEE; 2 and 87 (Avalanche) do not.
-        assert_eq!(classify_fee_source(AlgebraV3, Some(215), false), FeeSource::ReadFee);
-        assert_eq!(classify_fee_source(AlgebraV3, Some(2), false), FeeSource::Events);
-        assert_eq!(classify_fee_source(AlgebraV3, Some(87), false), FeeSource::Events);
-        assert_eq!(classify_fee_source(AlgebraV3, None, false), FeeSource::Unknown);
-        assert_eq!(classify_fee_source(RamsesCL, None, true), FeeSource::ReadCurrentFee);
-        assert_eq!(classify_fee_source(RamsesCL, None, false), FeeSource::Events);
-        assert_eq!(classify_fee_source(UniswapV3, None, false), FeeSource::Events);
+        assert_eq!(
+            classify_fee_source(AlgebraV3, Some(215), false),
+            FeeSource::ReadFee
+        );
+        assert_eq!(
+            classify_fee_source(AlgebraV3, Some(2), false),
+            FeeSource::Events
+        );
+        assert_eq!(
+            classify_fee_source(AlgebraV3, Some(87), false),
+            FeeSource::Events
+        );
+        assert_eq!(
+            classify_fee_source(AlgebraV3, None, false),
+            FeeSource::Unknown
+        );
+        assert_eq!(
+            classify_fee_source(RamsesCL, None, true),
+            FeeSource::ReadCurrentFee
+        );
+        assert_eq!(
+            classify_fee_source(RamsesCL, None, false),
+            FeeSource::Events
+        );
+        assert_eq!(
+            classify_fee_source(UniswapV3, None, false),
+            FeeSource::Events
+        );
     }
 
     /// `fee_source` is runtime state: it must not change how a pool persists,
@@ -1231,8 +1274,14 @@ mod tests {
     #[test]
     fn algebra_event_topics_match_deployed_contracts() {
         assert_eq!(IAlgebraIntegralPool::Fee::SIGNATURE_HASH, ALGEBRA_FEE_TOPIC);
-        assert_eq!(IAlgebraIntegralPool::PluginConfig::SIGNATURE_HASH, ALGEBRA_PLUGIN_CONFIG_TOPIC);
-        assert_eq!(IAlgebraIntegralPool::Plugin::SIGNATURE_HASH, ALGEBRA_PLUGIN_TOPIC);
+        assert_eq!(
+            IAlgebraIntegralPool::PluginConfig::SIGNATURE_HASH,
+            ALGEBRA_PLUGIN_CONFIG_TOPIC
+        );
+        assert_eq!(
+            IAlgebraIntegralPool::Plugin::SIGNATURE_HASH,
+            ALGEBRA_PLUGIN_TOPIC
+        );
     }
 
     /// Avalanche 0x259d… at block 96,050,122: Fee(500), down from 5000. With
@@ -1242,7 +1291,8 @@ mod tests {
         let mut pool = pool_with_type(V3PoolType::AlgebraV3);
         pool.fee_source = FeeSource::Events;
         pool.set_fee(U24::from(5000u32));
-        pool.apply_log(&one_word_log(ALGEBRA_FEE_TOPIC, uint_word(500))).unwrap();
+        pool.apply_log(&one_word_log(ALGEBRA_FEE_TOPIC, uint_word(500)))
+            .unwrap();
         assert_eq!(pool.fee, U24::from(500u32));
     }
 
@@ -1253,7 +1303,8 @@ mod tests {
         let mut pool = pool_with_type(V3PoolType::AlgebraV3);
         pool.fee_source = FeeSource::ReadFee;
         pool.set_fee(U24::from(222u32));
-        pool.apply_log(&one_word_log(ALGEBRA_FEE_TOPIC, uint_word(500))).unwrap();
+        pool.apply_log(&one_word_log(ALGEBRA_FEE_TOPIC, uint_word(500)))
+            .unwrap();
         assert_eq!(pool.fee, U24::from(222u32));
     }
 
@@ -1265,14 +1316,18 @@ mod tests {
         for topic in [ALGEBRA_PLUGIN_TOPIC, ALGEBRA_PLUGIN_CONFIG_TOPIC] {
             let mut pool = pool_with_type(V3PoolType::AlgebraV3);
             pool.fee_source = FeeSource::Events;
-            pool.apply_log(&one_word_log(topic, uint_word(215))).unwrap();
+            pool.apply_log(&one_word_log(topic, uint_word(215)))
+                .unwrap();
             assert_eq!(pool.fee_source, FeeSource::Unknown);
         }
     }
 
     #[test]
     fn swap_fee_topic_matches_deployed_contract() {
-        assert_eq!(IAlgebraIntegralPool::SwapFee::SIGNATURE_HASH, SWAP_FEE_TOPIC);
+        assert_eq!(
+            IAlgebraIntegralPool::SwapFee::SIGNATURE_HASH,
+            SWAP_FEE_TOPIC
+        );
     }
 
     /// Flare 0x1922… (SparkDEX FTSO-PMM): `fee()` reads the 1000 floor while
@@ -1297,7 +1352,8 @@ mod tests {
         let mut pool = pool_with_type(V3PoolType::AlgebraV3);
         pool.set_fee(U24::from(100u32));
         for (override_fee, plugin_fee) in [(1u32, 0u32), (100, 0), (0, 0), (60, 0), (1, 0)] {
-            pool.apply_log(&swap_fee_log(override_fee, plugin_fee)).unwrap();
+            pool.apply_log(&swap_fee_log(override_fee, plugin_fee))
+                .unwrap();
         }
         assert!(!pool.fee_unpredictable());
         assert!(pool
@@ -1328,7 +1384,10 @@ mod tests {
         for _ in 0..8 {
             pool.apply_log(&swap_fee_log(1000, 0)).unwrap();
         }
-        assert!(!pool.fee_unpredictable(), "2 misses left in the last 10 swaps");
+        assert!(
+            !pool.fee_unpredictable(),
+            "2 misses left in the last 10 swaps"
+        );
     }
 
     #[test]

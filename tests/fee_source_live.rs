@@ -79,8 +79,14 @@ async fn one_read_classifies_restored_pools() -> Result<()> {
     registry.set_last_processed_block(block);
     assert_eq!(registry.get_dynamic_fee_addresses().len(), 2);
 
-    read_fees(&provider, &registry, &[ALGEBRA_STATIC_FEE, CURRENT_FEE_POOL], MULTICALL, CHAIN_ID)
-        .await?;
+    read_fees(
+        &provider,
+        &registry,
+        &[ALGEBRA_STATIC_FEE, CURRENT_FEE_POOL],
+        MULTICALL,
+        CHAIN_ID,
+    )
+    .await?;
 
     assert_eq!(registry.get_dynamic_fee_addresses(), vec![CURRENT_FEE_POOL]);
     for (address, want) in [

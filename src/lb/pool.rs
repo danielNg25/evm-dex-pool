@@ -645,7 +645,8 @@ impl EventApplicable for LBPool {
                 let (vol_ref, id_ref) = self.update_references(ts);
                 self.volatility_reference = vol_ref;
                 self.id_reference = id_ref;
-                self.volatility_accumulator = self.compute_volatility_accumulator(id, vol_ref, id_ref);
+                self.volatility_accumulator =
+                    self.compute_volatility_accumulator(id, vol_ref, id_ref);
                 self.time_of_last_update = ts;
                 Ok(())
             }
@@ -1559,11 +1560,13 @@ mod tests {
         );
         pool.update_bin(8_363_350, 1_000_000_000_000_000_000, 1_000_000);
 
-        pool.apply_log(&composition_fees_log(8_363_350, 1_790_469_496)).unwrap();
+        pool.apply_log(&composition_fees_log(8_363_350, 1_790_469_496))
+            .unwrap();
         assert_eq!(pool.time_of_last_update, 1_790_469_496);
         assert_eq!(pool.volatility_accumulator, 38_323);
 
-        pool.apply_log(&swap_log_at(8_363_350, 38_323, 1_790_469_520)).unwrap();
+        pool.apply_log(&swap_log_at(8_363_350, 38_323, 1_790_469_520))
+            .unwrap();
         assert_eq!(
             (pool.volatility_reference, pool.id_reference),
             (8_323, 8_363_353),
@@ -1575,6 +1578,9 @@ mod tests {
     fn composition_fees_is_fetched_but_does_not_trigger_a_search() {
         let topic = ILBPair::CompositionFees::SIGNATURE_HASH;
         assert!(LBPool::topics().contains(&topic), "must be fetched");
-        assert!(!LBPool::profitable_topics().contains(&topic), "must not trigger a search");
+        assert!(
+            !LBPool::profitable_topics().contains(&topic),
+            "must not trigger a search"
+        );
     }
 }
