@@ -57,6 +57,15 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   up to the full mispricing while `fee()` reads the floor. Swaps paying less
   (a backrunner at 1 ppm, discounts) never count.
 
+- **A background fee reader replaces the per-batch Algebra refetch.** The
+  updater used to await a `fee()` multicall over every Algebra pool after
+  each batch -- 30,659 of them in run 8's 12 hours on Avalanche, where no fee
+  changed and every Algebra pool announces changes by event. The reader
+  (`collector::fee_reader`) reads only pools whose `FeeSource` needs it:
+  after a batch in which they had events, and all of them every 30 s. It is
+  spawned, never awaited. `refetch_dynamic_fees` is removed; the
+  `refetch_algebra_fee` config flag now switches the reader.
+
 - **Ramses V3 `Mint` is applied.** Ramses-family pools emit Uniswap V3's
   `Mint` with an NFT position `index` added (topic `0xd78218c0…`), which was
   never fetched while their unchanged `Burn` was applied. Run 8 logged 588

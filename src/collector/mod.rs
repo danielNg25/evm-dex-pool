@@ -1,9 +1,9 @@
 pub mod block_source;
 pub mod bootstrap;
 pub mod config;
-pub mod dynamic_fee_refetch;
 pub mod event_processor;
 pub mod event_queue;
+pub mod fee_reader;
 pub mod handle;
 pub mod metrics;
 pub mod multicall;
@@ -18,9 +18,11 @@ pub use block_source::{
 };
 pub use bootstrap::start_collector;
 pub use config::{CollectorConfig, PoolFetchConfig};
-pub use dynamic_fee_refetch::refetch_dynamic_fees;
 pub use event_processor::{fetch_events_with_retry, EventProcessor, PendingEvent};
 pub use event_queue::{create_event_queue, EventQueue, EventSender};
+pub use fee_reader::{
+    fee_read_candidates, read_fees, FeeReadSchedule, FeeReader, FULL_READ_INTERVAL,
+};
 pub use handle::CollectorHandle;
 pub use metrics::CollectorMetrics;
 pub use multicall::resolve_multicall_address;

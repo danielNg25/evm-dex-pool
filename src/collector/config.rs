@@ -13,13 +13,12 @@ pub struct CollectorConfig {
     pub websocket_urls: Vec<String>,
     /// Polling interval in milliseconds for LatestBlock mode.
     pub wait_time: u64,
-    /// If true, after each event batch the collector will multicall `fee()` on
-    /// every tracked `V3PoolType::AlgebraV3` pool and write the fresh fee back
-    /// into the registry, since the Algebra fee plugin updates per-block without
-    /// an event the collector consumes.
-    ///
-    /// Ramses-family CL pools do not need this: their fee changes arrive as
-    /// `FeeAdjustment` events and are applied inline.
+    /// Run the background fee reader (`collector::fee_reader`): pools whose
+    /// fee no event announces -- Algebra with `DYNAMIC_FEE` on, Ramses-family
+    /// pools answering `currentFee()` -- are re-read off the hot path, after a
+    /// batch that touched them and every 30 s. Reads nothing on a chain with
+    /// no such pools. The name predates the reader; it is kept so existing
+    /// configs still load.
     pub refetch_algebra_fee: bool,
 }
 

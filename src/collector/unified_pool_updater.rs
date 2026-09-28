@@ -1,5 +1,4 @@
 use crate::PoolRegistry;
-use alloy::primitives::Address;
 use alloy::providers::Provider;
 use anyhow::Result;
 use log::{debug, error, info, warn};
@@ -11,8 +10,8 @@ use super::block_source::{
     BlockSource, EventBatch, LatestBlockSource, PendingBlockSource, ProcessingMode,
     WebsocketBlockSource,
 };
-use super::dynamic_fee_refetch::refetch_dynamic_fees;
 use super::event_processor::{EventProcessor, PendingEvent};
+use super::fee_reader::{fee_read_candidates, FeeReader};
 use super::metrics::CollectorMetrics;
 use super::multicall::resolve_multicall_address;
 use super::EventQueue;
@@ -29,23 +28,14 @@ pub enum UpdaterMode {
 /// Replaces the three separate updaters (PoolUpdater, PoolUpdaterLatestBlock,
 /// PoolUpdaterLatestBlockWs) with a single implementation.
 pub struct UnifiedPoolUpdater<P: Provider + Send + Sync + 'static> {
-    provider: Arc<P>,
     source: Box<dyn BlockSource>,
     event_processor: EventProcessor,
     pool_registry: Arc<PoolRegistry>,
     chain_id: u64,
     cancel_rx: oneshot::Receiver<()>,
-    /// If true, multicall `fee()` for every tracked Algebra V3 pool after each
-    /// batch and write the fresh fee back into the registry.
-    refetch_algebra_fee: bool,
-    /// Optional dedicated provider for the Algebra fee refetch. If `None`,
-    /// the refetch reuses the main `provider`. Lets callers point the
-    /// (potentially heavy) per-batch refetch at a different RPC endpoint
-    /// than the one driving event ingestion.
-    algebra_refetch_provider: Option<Arc<P>>,
-    /// Resolved multicall3 address for this chain. Used by the post-batch
-    /// Algebra fee refetch.
-    multicall_address: Address,
+    /// Reads, in the background, the fees no event announces. `None` when the
+    /// collector config turns it off (`refetch_algebra_fee = false`).
+    fee_reader: Option<FeeReader<P>>,
 }
 
 impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
@@ -113,18 +103,23 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
             )),
         };
 
-        let multicall_address = resolve_multicall_address(chain_id, None);
+        // Cheap to leave on: on a chain whose pools all announce their fee
+        // changes it tracks nothing and reads nothing.
+        let fee_reader = refetch_algebra_fee.then(|| {
+            FeeReader::new(
+                algebra_refetch_provider.unwrap_or_else(|| Arc::clone(&provider)),
+                Arc::clone(&pool_registry),
+                resolve_multicall_address(chain_id, None),
+            )
+        });
 
         Self {
-            provider,
             source,
             event_processor,
             pool_registry,
             chain_id,
             cancel_rx,
-            refetch_algebra_fee,
-            algebra_refetch_provider,
-            multicall_address,
+            fee_reader,
         }
     }
 
@@ -165,6 +160,11 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
                     processed_through_block,
                 }) => {
                     let event_count = events.len();
+                    // Taken before `events` is consumed by the processing below.
+                    let fee_candidates = self
+                        .fee_reader
+                        .as_ref()
+                        .map(|_| fee_read_candidates(&events, &self.pool_registry));
                     debug!(
                         "[Chain {}] UnifiedPoolUpdater: received batch with {} events",
                         chain_id, event_count
@@ -194,31 +194,10 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
                         }
                     }
 
-                    if self.refetch_algebra_fee {
-                        if let Some(block) = processed_through_block {
-                            let addresses = self.pool_registry.get_dynamic_fee_addresses();
-                            if !addresses.is_empty() {
-                                let refetch_provider = self
-                                    .algebra_refetch_provider
-                                    .as_ref()
-                                    .unwrap_or(&self.provider);
-                                if let Err(e) = refetch_dynamic_fees(
-                                    refetch_provider,
-                                    &self.pool_registry,
-                                    &addresses,
-                                    self.multicall_address,
-                                    chain_id,
-                                    block,
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        "[Chain {}] Algebra V3 fee refetch failed: {}",
-                                        chain_id, e
-                                    );
-                                }
-                            }
-                        }
+                    if let (Some(reader), Some(candidates)) =
+                        (self.fee_reader.as_mut(), fee_candidates)
+                    {
+                        reader.after_batch(candidates);
                     }
 
                     if let Some(block) = processed_through_block {
