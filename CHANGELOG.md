@@ -115,11 +115,6 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   the current tick: without this guard that fallback quoted a same-tick step
   forever instead of failing.
 
-- **`add_profitable_topics` skips duplicates**, as `add_topics` already did.
-  Every dynamic pool addition passed a pool type's list again, so the list
-  grew without bound; a snapshot restore now also merges today's list into
-  the stored one.
-
 ### Notes
 
 - `FeeAdjustment` is deliberately absent from `profitable_topics()`. A fee

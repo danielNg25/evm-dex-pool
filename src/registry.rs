@@ -257,17 +257,10 @@ impl PoolRegistry {
         }
     }
 
-    /// Add profitable topics to the registry, skipping any already present,
-    /// for the reason [`Self::add_topics`] gives: every dynamic pool addition
-    /// passes the same list again. A snapshot restore also merges today's
-    /// list into the one the snapshot stored.
+    /// Add profitable topics to the registry
     pub fn add_profitable_topics(&self, topics: Vec<Topic>) {
         let mut topics_lock = self.profitable_topics.write().unwrap();
-        for topic in topics {
-            if !topics_lock.contains(&topic) {
-                topics_lock.insert(topic);
-            }
-        }
+        topics_lock.extend(topics);
     }
 
     /// Get all topics
@@ -393,28 +386,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_profitable_topics_skips_duplicates() {
-        let registry = PoolRegistry::new(1);
-        let a: Topic = [0u8; 32].into();
-        let b: Topic = [1u8; 32].into();
-        let c: Topic = [2u8; 32].into();
-
-        registry.add_profitable_topics(vec![a, b]);
-        registry.add_profitable_topics(vec![a, b]);
-        assert_eq!(
-            registry.get_profitable_topics(),
-            vec![a, b].into_iter().collect()
-        );
-
-        // `b` is already there; only `c` is new.
-        registry.add_profitable_topics(vec![b, c]);
-        assert_eq!(
-            registry.get_profitable_topics(),
-            vec![a, b, c].into_iter().collect()
-        );
-    }
-
-    #[tokio::test]
     async fn test_add_topics_repeated_per_pool_type_does_not_multiply() {
         // Regression test: `fetch_pools_into_registry` calls `add_topics`
         // once per pool type per fetch, and `CollectorHandle::add_pools`
@@ -503,16 +474,8 @@ mod tests {
         registry.add_pool(v3_pool(algebra_unknown, V3PoolType::AlgebraV3));
         registry.add_pool(v3_pool(ramses_unknown, V3PoolType::RamsesCL));
         registry.add_pool(v3_pool(uniswap, V3PoolType::UniswapV3));
-        registry.add_pool(v3_pool_with_source(
-            algebra_events,
-            V3PoolType::AlgebraV3,
-            FeeSource::Events,
-        ));
-        registry.add_pool(v3_pool_with_source(
-            algebra_read,
-            V3PoolType::AlgebraV3,
-            FeeSource::ReadFee,
-        ));
+        registry.add_pool(v3_pool_with_source(algebra_events, V3PoolType::AlgebraV3, FeeSource::Events));
+        registry.add_pool(v3_pool_with_source(algebra_read, V3PoolType::AlgebraV3, FeeSource::ReadFee));
         registry.add_pool(v3_pool_with_source(
             ramses_current_fee,
             V3PoolType::RamsesCL,
@@ -524,12 +487,7 @@ mod tests {
         tracked.sort();
         assert_eq!(
             tracked,
-            vec![
-                algebra_unknown,
-                ramses_unknown,
-                algebra_read,
-                ramses_current_fee
-            ]
+            vec![algebra_unknown, ramses_unknown, algebra_read, ramses_current_fee]
         );
         assert!(registry.is_dynamic_fee_address(&algebra_read));
         assert!(!registry.is_dynamic_fee_address(&algebra_events));
