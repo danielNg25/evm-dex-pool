@@ -1,4 +1,4 @@
-use crate::v3::{UniswapV3Pool, V3PoolType};
+use crate::v3::UniswapV3Pool;
 use crate::{PoolInterface, PoolType, Topic};
 use alloy::primitives::Address;
 use dashmap::DashMap;
@@ -72,6 +72,11 @@ impl PoolRegistry {
             .collect()
     }
 
+    /// Whether the fee reader tracks `address`.
+    pub fn is_dynamic_fee_address(&self, address: &Address) -> bool {
+        self.dynamic_fee_addresses.contains_key(address)
+    }
+
     /// Set network ID for this registry
     pub fn set_network_id(&mut self, network_id: u64) {
         self.network_id = network_id;
@@ -89,21 +94,16 @@ impl PoolRegistry {
 
     /// Add a pool to the registry.
     ///
-    /// Algebra pools are registered for periodic fee refetch here rather than
-    /// at the fetch site, so that *every* insertion path is covered by
-    /// construction -- including a snapshot restore, which bypasses
-    /// `fetch_pools_into_registry` entirely (that function skips addresses
-    /// already in the registry).
-    ///
-    /// Ramses-family (`RamsesCL`) pools are deliberately NOT tracked: their fee
-    /// changes arrive as `FeeAdjustment` events and are applied in log order,
-    /// which is both cheaper than polling and correct within a block, where a
-    /// post-batch poll is not.
+    /// V3 pools whose fee must be read are tracked for the collector's fee
+    /// reader here rather than at the fetch site, so that *every* insertion
+    /// path is covered by construction -- including a snapshot restore, which
+    /// bypasses `fetch_pools_into_registry` entirely and leaves `fee_source`
+    /// `Unknown`. See `UniswapV3Pool::fee_needs_reading`.
     pub fn add_pool(&self, pool: Box<dyn PoolInterface + Send + Sync>) {
         let address = pool.address();
         // Borrow ends before `pool` moves into the map below.
         if let Some(v3) = pool.as_any().downcast_ref::<UniswapV3Pool>() {
-            if v3.pool_type == V3PoolType::AlgebraV3 {
+            if v3.fee_needs_reading() {
                 self.add_dynamic_fee_address(address);
             }
         }
@@ -306,6 +306,7 @@ impl std::fmt::Debug for PoolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::v3::{FeeSource, V3PoolType};
     use crate::MockPool;
     use alloy::primitives::{address, aliases::U24, U160};
 
@@ -434,37 +435,63 @@ mod tests {
         ))
     }
 
-    /// Tracking must happen in `add_pool`, not at the fetch site: the consuming
-    /// bot restores pools from a local snapshot straight through `add_pool`, and
-    /// `fetch_pools_into_registry` then skips those addresses as already
-    /// present. If tracking lived only on the fetch path, snapshot-restored
-    /// Algebra pools would never be refetched at all.
-    ///
-    /// Ramses CL is added too, to pin that it is NOT tracked: its fee is
-    /// event-driven, and polling it again would waste calls and re-open the
-    /// within-block ordering gap the events close.
-    #[tokio::test]
-    async fn add_pool_tracks_mutable_fee_pools() {
-        let registry = PoolRegistry::new(1);
-        let algebra = address!("0x0000000000000000000000000000000000000001");
-        let ramses_cl = address!("0x0000000000000000000000000000000000000002");
-        let uniswap = address!("0x0000000000000000000000000000000000000003");
+    fn v3_pool_with_source(
+        addr: Address,
+        pool_type: V3PoolType,
+        source: FeeSource,
+    ) -> Box<dyn PoolInterface + Send + Sync> {
+        let mut pool = UniswapV3Pool::new(
+            addr,
+            Address::ZERO,
+            Address::ZERO,
+            U24::from(3000u32),
+            60,
+            U160::ZERO,
+            0,
+            0,
+            Address::ZERO,
+            pool_type,
+        );
+        pool.fee_source = source;
+        Box::new(pool)
+    }
 
-        // No fetch path involved -- this is the snapshot-restore shape.
-        registry.add_pool(v3_pool(algebra, V3PoolType::AlgebraV3));
-        registry.add_pool(v3_pool(ramses_cl, V3PoolType::RamsesCL));
+    /// Tracking happens in `add_pool`, not at the fetch site: the bot restores
+    /// pools from a snapshot straight through `add_pool`, and a restored pool's
+    /// `fee_source` is `Unknown`. Unclassified Algebra and Ramses pools are
+    /// tracked so the fee reader can classify them with one read; classified
+    /// pools are tracked only when their source is a read.
+    #[tokio::test]
+    async fn add_pool_tracks_pools_whose_fee_must_be_read() {
+        let registry = PoolRegistry::new(1);
+        let algebra_unknown = address!("0x0000000000000000000000000000000000000001");
+        let ramses_unknown = address!("0x0000000000000000000000000000000000000002");
+        let uniswap = address!("0x0000000000000000000000000000000000000003");
+        let algebra_events = address!("0x0000000000000000000000000000000000000004");
+        let algebra_read = address!("0x0000000000000000000000000000000000000005");
+        let ramses_current_fee = address!("0x0000000000000000000000000000000000000006");
+
+        registry.add_pool(v3_pool(algebra_unknown, V3PoolType::AlgebraV3));
+        registry.add_pool(v3_pool(ramses_unknown, V3PoolType::RamsesCL));
         registry.add_pool(v3_pool(uniswap, V3PoolType::UniswapV3));
-        // A non-V3 pool must not be tracked either.
+        registry.add_pool(v3_pool_with_source(algebra_events, V3PoolType::AlgebraV3, FeeSource::Events));
+        registry.add_pool(v3_pool_with_source(algebra_read, V3PoolType::AlgebraV3, FeeSource::ReadFee));
+        registry.add_pool(v3_pool_with_source(
+            ramses_current_fee,
+            V3PoolType::RamsesCL,
+            FeeSource::ReadCurrentFee,
+        ));
         registry.add_pool(MockPool::new_boxed());
 
         let mut tracked = registry.get_dynamic_fee_addresses();
         tracked.sort();
         assert_eq!(
             tracked,
-            vec![algebra],
-            "only AlgebraV3 is polled; RamsesCL fees are event-driven"
+            vec![algebra_unknown, ramses_unknown, algebra_read, ramses_current_fee]
         );
-        assert_eq!(registry.pool_count(), 4);
+        assert!(registry.is_dynamic_fee_address(&algebra_read));
+        assert!(!registry.is_dynamic_fee_address(&algebra_events));
+        assert_eq!(registry.pool_count(), 7);
     }
 
     #[tokio::test]

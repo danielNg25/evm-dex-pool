@@ -104,6 +104,10 @@ sol! {
     #[sol(rpc)]
     interface RpcRamsesCLPool {
         function lastPeriod() external view returns (uint256);
+        /// Answers only on some Ramses-family pools; where it does, swaps pay
+        /// it instead of `fee()`. Verified on Avalanche 0x0021368B: 75 while
+        /// `fee()` reads 50, both constant over run 8's 12 hours.
+        function currentFee() external view returns (uint24);
     }
 }
 
@@ -167,6 +171,13 @@ mod tests {
     #[test]
     fn last_period_selector_matches_deployed_contracts() {
         assert_eq!(RpcRamsesCLPool::lastPeriodCall::SELECTOR, hex!("d340ef8a"));
+    }
+
+    /// `currentFee()` is what a Ramses-family pool's swaps charge when it
+    /// answers; `fetch_v3_pool` reads it beside `lastPeriod()`.
+    #[test]
+    fn current_fee_selector_matches_deployed_contract() {
+        assert_eq!(RpcRamsesCLPool::currentFeeCall::SELECTOR, hex!("da3c300d"));
     }
 
     #[test]

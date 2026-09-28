@@ -32,10 +32,15 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   A `FeeAdjustment` whose `oldFee` disagrees with the fee held logs a warning:
   an earlier change was missed. The new fee is applied either way.
 
-- **`RamsesCL` pools are no longer tracked for fee refetch.** With their fees
-  event-driven, polling them only spends calls. `PoolRegistry::add_pool`
-  tracks `AlgebraV3` alone, since the Algebra fee plugin still emits nothing
-  the collector consumes.
+- **Every V3 pool carries a fee source, classified at fetch.** `FeeSource`
+  (runtime-only, `#[serde(skip)]`): `Events` when fee changes are announced,
+  `ReadFee` for Algebra with `DYNAMIC_FEE` on (from `globalState()`'s
+  `pluginConfig`, already read), `ReadCurrentFee` for a Ramses-family pool
+  that answers `currentFee()` (one more call in the same fetch multicall;
+  its value becomes the pool's fee), `Unknown` after a snapshot restore.
+  `PoolRegistry::add_pool` tracks the pools whose fee must be read. Run 8
+  reverted on 0x0021368B, which swaps at `currentFee()` = 75 while `fee()`
+  reads 50.
 
 - **Ramses V3 `Mint` is applied.** Ramses-family pools emit Uniswap V3's
   `Mint` with an NFT position `index` added (topic `0xd78218c0…`), which was

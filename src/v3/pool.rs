@@ -34,6 +34,49 @@ pub enum V3PoolType {
     RamsesCL,
 }
 
+/// Where a V3 pool's swap fee comes from, which decides how it is kept current.
+///
+/// Runtime-only: the pool field holding it is `#[serde(skip)]`, so persisted
+/// snapshots keep their encoding and a restored pool comes back `Unknown`
+/// until the collector's fee reader classifies it with one read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FeeSource {
+    /// Not classified yet: restored from a snapshot, or reconfigured on chain.
+    #[default]
+    Unknown,
+    /// Fixed until an event changes it: Uniswap V3, PancakeV3, Ramses
+    /// `FeeAdjustment`, Algebra with DYNAMIC_FEE off (`Fee(uint16)`). No reads.
+    Events,
+    /// Algebra with DYNAMIC_FEE on: the plugin computes `fee()` on demand and
+    /// nothing announces a change, so it is read in the background. Flare's
+    /// adaptive pools drift with time alone (0x9af6: 200 -> 224 in ~80 min).
+    ReadFee,
+    /// A Ramses-family pool that answers `currentFee()`: its swaps pay that,
+    /// whatever `fee()` says (0x0021368B: 75 against 50).
+    ReadCurrentFee,
+}
+
+/// Algebra Integral `globalState().pluginConfig` bit: `fee()` comes from the
+/// plugin, not the stored `lastFee`.
+pub const ALGEBRA_DYNAMIC_FEE_FLAG: u8 = 0x80;
+
+/// A freshly fetched pool's fee source, from what the fetch already read.
+pub fn classify_fee_source(
+    pool_type: V3PoolType,
+    algebra_plugin_config: Option<u8>,
+    answers_current_fee: bool,
+) -> FeeSource {
+    match pool_type {
+        V3PoolType::AlgebraV3 => match algebra_plugin_config {
+            Some(config) if config & ALGEBRA_DYNAMIC_FEE_FLAG != 0 => FeeSource::ReadFee,
+            Some(_) => FeeSource::Events,
+            None => FeeSource::Unknown,
+        },
+        V3PoolType::RamsesCL if answers_current_fee => FeeSource::ReadCurrentFee,
+        _ => FeeSource::Events,
+    }
+}
+
 /// Struct containing V3 pool information including tick data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UniswapV3Pool {
@@ -63,6 +106,9 @@ pub struct UniswapV3Pool {
     pub last_updated: u64,
     /// Creation timestamp or block
     pub created_at: u64,
+    /// See [`FeeSource`]. Runtime-only: skipped by serde, and so by bincode.
+    #[serde(skip)]
+    pub fee_source: FeeSource,
 }
 
 impl UniswapV3Pool {
@@ -94,11 +140,25 @@ impl UniswapV3Pool {
             last_updated: current_time,
             created_at: current_time,
             factory,
+            fee_source: FeeSource::Unknown,
         }
     }
 
     pub fn set_fee(&mut self, fee: U24) {
         self.fee = fee;
+    }
+
+    /// Whether the collector's fee reader must fetch this pool's fee: its
+    /// source is a read, or it is an unclassified pool of a type that may turn
+    /// out to need one.
+    pub fn fee_needs_reading(&self) -> bool {
+        match self.fee_source {
+            FeeSource::ReadFee | FeeSource::ReadCurrentFee => true,
+            FeeSource::Unknown => {
+                matches!(self.pool_type, V3PoolType::AlgebraV3 | V3PoolType::RamsesCL)
+            }
+            FeeSource::Events => false,
+        }
     }
 
     /// Update pool state based on swap event
@@ -974,5 +1034,30 @@ mod tests {
             pool_with_type(V3PoolType::AlgebraV3).tick_search(),
             TickSearch::NextInitialized
         );
+    }
+
+    #[test]
+    fn fee_source_follows_what_the_pool_reports() {
+        use V3PoolType::*;
+        // pluginConfig 215 (Flare SparkDEX) has DYNAMIC_FEE; 2 and 87 (Avalanche) do not.
+        assert_eq!(classify_fee_source(AlgebraV3, Some(215), false), FeeSource::ReadFee);
+        assert_eq!(classify_fee_source(AlgebraV3, Some(2), false), FeeSource::Events);
+        assert_eq!(classify_fee_source(AlgebraV3, Some(87), false), FeeSource::Events);
+        assert_eq!(classify_fee_source(AlgebraV3, None, false), FeeSource::Unknown);
+        assert_eq!(classify_fee_source(RamsesCL, None, true), FeeSource::ReadCurrentFee);
+        assert_eq!(classify_fee_source(RamsesCL, None, false), FeeSource::Events);
+        assert_eq!(classify_fee_source(UniswapV3, None, false), FeeSource::Events);
+    }
+
+    /// `fee_source` is runtime state: it must not change how a pool persists,
+    /// and a restored pool must come back unclassified.
+    #[test]
+    fn fee_source_is_not_persisted() {
+        let mut pool = pool_with_type(V3PoolType::AlgebraV3);
+        pool.fee_source = FeeSource::ReadFee;
+        let json = serde_json::to_value(&pool).unwrap();
+        assert!(json.get("fee_source").is_none());
+        let restored: UniswapV3Pool = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.fee_source, FeeSource::Unknown);
     }
 }

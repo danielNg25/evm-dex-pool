@@ -4,7 +4,9 @@ use crate::contracts_rpc::RpcAlgebraV3Pool as AlgebraV3Pool;
 use crate::contracts_rpc::RpcCLPPool as CLPPool;
 use crate::contracts_rpc::RpcIUniswapV3Pool as IUniswapV3Pool;
 use crate::contracts_rpc::RpcRamsesCLPool as RamsesCLPool;
-use crate::v3::{Tick, UniswapV3Pool, V3PoolType, MAX_TICK_I32, MIN_TICK_I32};
+use crate::v3::{
+    classify_fee_source, Tick, UniswapV3Pool, V3PoolType, MAX_TICK_I32, MIN_TICK_I32,
+};
 use crate::TokenInfo;
 use alloy::primitives::U128;
 use alloy::primitives::{aliases::U24, Address, Signed, U160, U256};
@@ -28,6 +30,8 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
 ) -> Result<UniswapV3Pool> {
     info!("[Chain {}] Fetching V3 pool: {}", chain_id, pool_address);
     let mut v3_pool_type = V3PoolType::UniswapV3;
+    // `globalState().pluginConfig`, when the pool is Algebra Integral.
+    let mut algebra_plugin_config: Option<u8> = None;
     let uniswapv3_pool_instance = IUniswapV3Pool::new(pool_address, &provider);
     let clp_pool_instance = CLPPool::new(pool_address, &provider);
     let algebra_v3_pool_instance = AlgebraV3Pool::new(pool_address, &provider);
@@ -52,10 +56,11 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
         .add(algebra_two_side_fee_pool_instance.activeIncentive()) // 11
         .add(algebra_pool_fee_in_state_instance.globalState()) // 12
         .add(ramses_cl_pool_instance.lastPeriod()) // 13
+        .add(ramses_cl_pool_instance.currentFee()) // 14
         .block(block_number)
         .try_aggregate(false)
         .await?;
-    let (token0, token1, fee, tick_spacing, sqrt_price_x96, tick, liquidity, factory) =
+    let (token0, token1, mut fee, tick_spacing, sqrt_price_x96, tick, liquidity, factory) =
         if let Ok(slot0_result) = multicall_result.7 {
             (
                 multicall_result
@@ -138,6 +143,7 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
             )
         } else if let Ok(slot0_result) = multicall_result.9 {
             v3_pool_type = V3PoolType::AlgebraV3;
+            algebra_plugin_config = Some(slot0_result.pluginConfig);
             (
                 multicall_result
                     .0
@@ -205,6 +211,18 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
         v3_pool_type = V3PoolType::RamsesCL;
     }
 
+    // A Ramses-family pool that answers `currentFee()` charges that, whatever
+    // `fee()` says: 0x0021368B swaps at 75 while `fee()` reads 50, and run 8
+    // reverted on the gap (bulk_001#32). Read in the multicall above, so it
+    // costs no extra round trip.
+    let current_fee = match (&v3_pool_type, &multicall_result.14) {
+        (V3PoolType::RamsesCL, Ok(current)) => Some(*current),
+        _ => None,
+    };
+    if let Some(current) = current_fee {
+        fee = current;
+    }
+
     // Create token objects (you'll need to fetch token details)
     let (token0, _) = token_info
         .get_or_fetch_token(provider, token0, multicall_address)
@@ -230,6 +248,7 @@ pub async fn fetch_v3_pool<P: Provider + Send + Sync, T: TokenInfo>(
         factory,
         v3_pool_type,
     );
+    pool.fee_source = classify_fee_source(v3_pool_type, algebra_plugin_config, current_fee.is_some());
 
     fetch_v3_ticks(provider, &mut pool, block_number, multicall_address).await?;
 
