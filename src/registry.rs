@@ -40,7 +40,7 @@ impl PoolRegistry {
         }
     }
 
-    /// Track a mutable-fee pool address for periodic fee refetch.
+    /// Track a mutable-fee pool address for the collector's fee reader.
     pub fn add_dynamic_fee_address(&self, address: Address) {
         if self.dynamic_fee_addresses.insert(address, ()).is_none() {
             info!(

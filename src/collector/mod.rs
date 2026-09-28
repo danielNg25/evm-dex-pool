@@ -21,7 +21,8 @@ pub use config::{CollectorConfig, PoolFetchConfig};
 pub use event_processor::{fetch_events_with_retry, EventProcessor, PendingEvent};
 pub use event_queue::{create_event_queue, EventQueue, EventSender};
 pub use fee_reader::{
-    fee_read_candidates, read_fees, FeeReadSchedule, FeeReader, FULL_READ_INTERVAL,
+    fee_read_candidates, pools_needing_reads, read_fees, FeeRead, FeeReadSchedule, FeeReader,
+    FULL_READ_INTERVAL,
 };
 pub use handle::CollectorHandle;
 pub use metrics::CollectorMetrics;

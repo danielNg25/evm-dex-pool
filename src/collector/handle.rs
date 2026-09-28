@@ -750,8 +750,8 @@ async fn catchup_registry_to_block<P: Provider + Send + Sync>(
 }
 
 /// Insert pool objects into the registry and register any previously unseen
-/// pool-type event topics. Tracking mutable-fee pools for periodic fee refetch
-/// (see [`crate::collector::dynamic_fee_refetch`]) is handled by
+/// pool-type event topics. Tracking mutable-fee pools for the background fee
+/// reader (see [`crate::collector::fee_reader`]) is handled by
 /// [`PoolRegistry::add_pool`], so every insertion path gets it.
 fn register_pools_and_topics(registry: &Arc<PoolRegistry>, pools: Vec<Box<dyn PoolInterface>>) {
     let mut new_pool_types: HashSet<PoolType> = HashSet::new();

@@ -136,7 +136,11 @@ pub struct FeeReadSchedule {
 
 impl FeeReadSchedule {
     /// Queue `touched`. Unless `busy`, return everything queued -- plus every
-    /// `tracked` pool when a full pass is due -- or `None` if that is nothing.
+    /// `tracked` pool when a full pass is due. A due pass always returns
+    /// `Some`, even with nothing to read: it must still run on schedule when
+    /// nothing is tracked yet, which is exactly when [`pools_needing_reads`]
+    /// (called by the due full pass) is what finds a pool a bypassed path
+    /// reset. Otherwise, `None` when nothing is queued.
     pub fn next_read(
         &mut self,
         touched: impl IntoIterator<Item = Address>,
@@ -154,8 +158,7 @@ impl FeeReadSchedule {
         if full_due {
             self.queued.extend(tracked());
             self.last_full_read = Some(now);
-        }
-        if self.queued.is_empty() {
+        } else if self.queued.is_empty() {
             return None;
         }
         Some(FeeRead {
@@ -223,32 +226,40 @@ impl<P: Provider + Send + Sync + 'static> FeeReader<P> {
         let (multicall_address, chain_id) = (self.multicall_address, self.chain_id);
         tokio::spawn(async move {
             let _guard = BusyGuard(busy);
-            if full_pass {
-                // A reconfiguration applied outside the updater loop never
-                // reaches `fee_read_candidates` (see `pools_needing_reads`),
-                // so the full pass rescans the registry directly rather than
-                // trusting the tracked set alone.
-                addresses.extend(pools_needing_reads(&registry).await);
-                addresses.sort();
-                addresses.dedup();
-            }
-            match tokio::time::timeout(
-                READ_TIMEOUT,
-                read_fees(&provider, &registry, &addresses, multicall_address, chain_id),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!(
+            // Kept in case the timeout below fires before the full-pass
+            // rescan (if any), inside it, settles on a final address list --
+            // that future is dropped on timeout, taking its own count with it.
+            let queued_count = addresses.len();
+            // The rescan and the read share one timeout: a rescan can only
+            // block on a pool's own lock (never the network), but nothing
+            // should be able to leave the reader `busy` past `READ_TIMEOUT`.
+            let outcome = tokio::time::timeout(READ_TIMEOUT, async move {
+                if full_pass {
+                    // A reconfiguration applied outside the updater loop
+                    // never reaches `fee_read_candidates` (see
+                    // `pools_needing_reads`), so the full pass rescans the
+                    // registry directly rather than trusting the tracked set
+                    // alone.
+                    addresses.extend(pools_needing_reads(&registry).await);
+                    addresses.sort();
+                    addresses.dedup();
+                }
+                let result =
+                    read_fees(&provider, &registry, &addresses, multicall_address, chain_id)
+                        .await;
+                (addresses.len(), result)
+            })
+            .await;
+            match outcome {
+                Ok((_, Ok(()))) => {}
+                Ok((count, Err(e))) => warn!(
                     "[Chain {}] Fee reader: read of {} pool(s) failed: {}",
-                    chain_id,
-                    addresses.len(),
-                    e
+                    chain_id, count, e
                 ),
                 Err(_) => warn!(
                     "[Chain {}] Fee reader: read of {} pool(s) timed out after {}s",
                     chain_id,
-                    addresses.len(),
+                    queued_count,
                     READ_TIMEOUT.as_secs()
                 ),
             }
@@ -552,11 +563,29 @@ mod tests {
         assert!(got.full_pass);
     }
 
+    /// A due full pass on a registry tracking (and queuing) nothing must
+    /// still run: it is the only way a pool a bypassed path reset -- itself
+    /// untracked, so never queued -- is ever found again (`pools_needing_reads`
+    /// runs off the `full_pass` flag this carries, not off a non-empty list).
+    #[test]
+    fn a_due_full_pass_runs_even_with_nothing_tracked_or_queued() {
+        let mut schedule = FeeReadSchedule::default();
+        let got = schedule
+            .next_read([], Vec::new, Instant::now(), false)
+            .unwrap();
+        assert_eq!(got.addresses, Vec::<Address>::new());
+        assert!(got.full_pass);
+    }
+
     #[test]
     fn touched_pools_wait_while_a_read_is_running() {
         let mut schedule = FeeReadSchedule::default();
         let start = Instant::now();
-        schedule.next_read([], Vec::new, start, false);
+        // The first call is a due full pass with nothing tracked or queued --
+        // see `a_due_full_pass_runs_even_with_nothing_tracked_or_queued` --
+        // which must return `Some` here too, not be skipped as a no-op.
+        let first = schedule.next_read([], Vec::new, start, false).unwrap();
+        assert!(first.full_pass);
         assert!(schedule.next_read([C], Vec::new, start, true).is_none());
         let got = schedule.next_read([], Vec::new, start, false).unwrap();
         assert_eq!(got.addresses, vec![C]);
