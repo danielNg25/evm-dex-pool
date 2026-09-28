@@ -93,8 +93,24 @@ sol! {
 // Avalanche against every fee change in run 6's failing replay blocks (6/6),
 // e.g. 0x71bd7525 at block 96081609: FeeAdjustment(800, 5500), topic0
 // 0x0cba8718...df24. See `fee_adjustment_topic_matches_deployed_contract`.
+//
+// Their `Mint` is Uniswap V3's with the NFT position `index` added, so its
+// topic0 (0xd78218c0...) is not the Uniswap V3 Mint's and was never fetched:
+// run 8 applied every Ramses Burn (unchanged signature) and no Ramses Mint.
+// Verified on Avalanche 0xf01449c0 at block 96213057. See
+// `ramses_mint_topic_matches_deployed_contract`.
 sol! {
     interface IRamsesCLPool {
         event FeeAdjustment(uint24 oldFee, uint24 newFee);
+        event Mint(
+            address sender,
+            address indexed owner,
+            uint256 index,
+            int24 indexed tickLower,
+            int24 indexed tickUpper,
+            uint128 amount,
+            uint256 amount0,
+            uint256 amount1
+        );
     }
 }

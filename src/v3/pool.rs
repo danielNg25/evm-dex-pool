@@ -257,12 +257,62 @@ impl UniswapV3Pool {
         compressed >> 8
     }
 
+    /// Helper for applying mint events: Uniswap V3's, and Ramses V3's, which
+    /// adds a position `index` but moves liquidity the same way.
+    fn apply_mint_event(&mut self, tick_lower: i32, tick_upper: i32, amount: u128) -> Result<()> {
+        if tick_lower >= tick_upper {
+            return Err(anyhow!(
+                "Invalid tick range: tick_lower {} >= tick_upper {}",
+                tick_lower,
+                tick_upper
+            ));
+        }
+
+        // Update tick_lower
+        if let Some(tick) = self.ticks.get_mut(&tick_lower) {
+            tick.liquidity_net = tick.liquidity_net.saturating_add(amount as i128);
+            tick.liquidity_gross = tick.liquidity_gross.saturating_add(amount);
+        } else {
+            self.update_tick(tick_lower, amount as i128, amount)?;
+        }
+
+        // Update tick_upper
+        if let Some(tick) = self.ticks.get_mut(&tick_upper) {
+            tick.liquidity_net = tick.liquidity_net.saturating_sub(amount as i128);
+            tick.liquidity_gross = tick.liquidity_gross.saturating_add(amount);
+        } else {
+            self.update_tick(tick_upper, -(amount as i128), amount)?;
+        }
+
+        // Update pool liquidity if current tick is in range [tick_lower, tick_upper)
+        if self.tick >= tick_lower && self.tick < tick_upper {
+            self.liquidity = self.liquidity.saturating_add(amount);
+        }
+
+        Ok(())
+    }
+
     /// Helper for applying burn events (R6 refactoring: dedup V3 burn handling)
     fn apply_burn_event(&mut self, tick_lower: i32, tick_upper: i32, amount: u128) -> Result<()> {
         if tick_lower >= tick_upper {
             return Err(anyhow!(
                 "Invalid tick range: tick_lower {} >= tick_upper {}",
                 tick_lower,
+                tick_upper
+            ));
+        }
+
+        // Check both ends before touching either: failing on the upper tick
+        // after the lower one was already debited left the map half-burned.
+        if !self.ticks.contains_key(&tick_lower) {
+            return Err(anyhow!(
+                "Burn attempted on uninitialized tick_lower: {}",
+                tick_lower
+            ));
+        }
+        if !self.ticks.contains_key(&tick_upper) {
+            return Err(anyhow!(
+                "Burn attempted on uninitialized tick_upper: {}",
                 tick_upper
             ));
         }
@@ -441,41 +491,23 @@ impl EventApplicable for UniswapV3Pool {
                     "Applying V3Mint event to pool {}: tick_lower={}, tick_upper={}, amount={}",
                     self.address, mint_data.tickLower, mint_data.tickUpper, mint_data.amount
                 );
-
-                let amount_u128 = mint_data.amount;
-                let tick_lower_i32 = mint_data.tickLower.as_i32();
-                let tick_upper_i32 = mint_data.tickUpper.as_i32();
-
-                if tick_lower_i32 >= tick_upper_i32 {
-                    return Err(anyhow!(
-                        "Invalid tick range: tick_lower {} >= tick_upper {}",
-                        tick_lower_i32,
-                        tick_upper_i32
-                    ));
-                }
-
-                // Update tick_lower
-                if let Some(tick) = self.ticks.get_mut(&tick_lower_i32) {
-                    tick.liquidity_net = tick.liquidity_net.saturating_add(amount_u128 as i128);
-                    tick.liquidity_gross = tick.liquidity_gross.saturating_add(amount_u128);
-                } else {
-                    self.update_tick(tick_lower_i32, amount_u128 as i128, amount_u128)?;
-                }
-
-                // Update tick_upper
-                if let Some(tick) = self.ticks.get_mut(&tick_upper_i32) {
-                    tick.liquidity_net = tick.liquidity_net.saturating_sub(amount_u128 as i128);
-                    tick.liquidity_gross = tick.liquidity_gross.saturating_add(amount_u128);
-                } else {
-                    self.update_tick(tick_upper_i32, -(amount_u128 as i128), amount_u128)?;
-                }
-
-                // Update pool liquidity if current tick is in range [tick_lower, tick_upper)
-                if self.tick >= tick_lower_i32 && self.tick < tick_upper_i32 {
-                    self.liquidity = self.liquidity.saturating_add(amount_u128);
-                }
-
-                Ok(())
+                self.apply_mint_event(
+                    mint_data.tickLower.as_i32(),
+                    mint_data.tickUpper.as_i32(),
+                    mint_data.amount,
+                )
+            }
+            Some(&IRamsesCLPool::Mint::SIGNATURE_HASH) => {
+                let mint_data: IRamsesCLPool::Mint = log.log_decode()?.inner.data;
+                debug!(
+                    "Applying RamsesMint event to pool {}: tick_lower={}, tick_upper={}, amount={}",
+                    self.address, mint_data.tickLower, mint_data.tickUpper, mint_data.amount
+                );
+                self.apply_mint_event(
+                    mint_data.tickLower.as_i32(),
+                    mint_data.tickUpper.as_i32(),
+                    mint_data.amount,
+                )
             }
             // R6: Deduplicated burn event handling
             Some(&IUniswapV3Pool::Burn::SIGNATURE_HASH) => {
@@ -526,6 +558,8 @@ impl TopicList for UniswapV3Pool {
             // itself a reason to search for a cycle, so it is deliberately absent
             // from `profitable_topics`.
             IRamsesCLPool::FeeAdjustment::SIGNATURE_HASH,
+            // Ramses V3 Mint (with position index): state, not a trigger.
+            IRamsesCLPool::Mint::SIGNATURE_HASH,
         ]
     }
 
@@ -682,6 +716,99 @@ mod tests {
         assert!(
             !UniswapV3Pool::profitable_topics().contains(&topic),
             "must not trigger a search"
+        );
+    }
+
+    /// topic0 of Ramses V3's
+    /// `Mint(address,address,uint256,int24,int24,uint128,uint256,uint256)`:
+    /// Uniswap V3's Mint with the NFT position `index` added, so its hash differs.
+    const RAMSES_MINT_TOPIC: alloy::primitives::B256 =
+        b256!("0xd78218c0d304e8893cb3200abe394bbc8d5b7804d9c51f236df9fdcf481d02d3");
+
+    fn uint_word(v: u128) -> [u8; 32] {
+        U256::from(v).to_be_bytes::<32>()
+    }
+
+    /// A signed 32-byte word, sign-extended the way the ABI encodes int24.
+    fn int_word(v: i64) -> alloy::primitives::B256 {
+        let mut word = if v < 0 { [0xffu8; 32] } else { [0u8; 32] };
+        word[24..].copy_from_slice(&v.to_be_bytes());
+        alloy::primitives::B256::from(word)
+    }
+
+    /// The real Ramses V3 Mint on 0xf01449c0 at block 96,213,057 (tx 0xcc5a889f…):
+    /// owner and both ticks are indexed; sender, index, amount, amount0 and
+    /// amount1 are data. Raw bytes as eth_getLogs returned them, so this proves
+    /// the binding decodes what the chain emits.
+    fn real_ramses_mint_log() -> Log {
+        let owner = address!("0x0b4478e810d48b5882d4019d435a2f864bab4f39");
+        let owner_word = alloy::primitives::B256::left_padding_from(owner.as_slice());
+        let mut data = Vec::with_capacity(5 * 32);
+        data.extend_from_slice(owner_word.as_slice()); // sender
+        data.extend_from_slice(&uint_word(605_859)); // index
+        data.extend_from_slice(&uint_word(1_166_100_850_557_528_561)); // amount
+        data.extend_from_slice(&uint_word(40_491_282_879_675_690_316)); // amount0
+        data.extend_from_slice(&uint_word(1_477_611_480)); // amount1
+        Log {
+            inner: alloy::primitives::Log {
+                address: address!("0xf01449c0ba930b6e2caca3def3ccbd7a3e589534"),
+                data: LogData::new_unchecked(
+                    vec![RAMSES_MINT_TOPIC, owner_word, int_word(-252_550), int_word(-252_540)],
+                    data.into(),
+                ),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ramses_mint_topic_matches_deployed_contract() {
+        assert_eq!(IRamsesCLPool::Mint::SIGNATURE_HASH, RAMSES_MINT_TOPIC);
+    }
+
+    /// Run 8 applied every Ramses Burn but no Ramses Mint -- the topic was not
+    /// even fetched -- so positions minted after startup were missing and their
+    /// burns ate into live ticks: 588 "Burn attempted on uninitialized tick"
+    /// errors in 12 h, and a live tick missing next to the price in three
+    /// replayed opportunities (bulk_031#3/#4, bulk_040#55).
+    #[test]
+    fn ramses_mint_adds_the_position() {
+        let mut pool = pool_with_type(V3PoolType::RamsesCL); // at tick 0
+        let liquidity_before = pool.liquidity;
+
+        pool.apply_log(&real_ramses_mint_log()).unwrap();
+
+        let amount = 1_166_100_850_557_528_561u128;
+        let lower = pool.ticks.get(&-252_550).expect("lower tick added");
+        let upper = pool.ticks.get(&-252_540).expect("upper tick added");
+        assert_eq!((lower.liquidity_net, lower.liquidity_gross), (amount as i128, amount));
+        assert_eq!((upper.liquidity_net, upper.liquidity_gross), (-(amount as i128), amount));
+        assert_eq!(pool.liquidity, liquidity_before, "the range lies below tick 0");
+    }
+
+    #[test]
+    fn ramses_mint_is_fetched_but_does_not_trigger_a_search() {
+        let topic = IRamsesCLPool::Mint::SIGNATURE_HASH;
+        assert!(UniswapV3Pool::topics().contains(&topic), "must be fetched");
+        assert!(
+            !UniswapV3Pool::profitable_topics().contains(&topic),
+            "must not trigger a search"
+        );
+    }
+
+    /// A burn on a range whose upper tick the pool does not hold used to debit
+    /// the lower tick before failing, leaving the map half-burned.
+    #[test]
+    fn a_burn_on_an_unknown_tick_changes_nothing() {
+        let mut pool = pool_with_type(V3PoolType::RamsesCL); // ticks at -60 and 60
+        let before = pool.ticks.get(&-60).cloned().unwrap();
+
+        assert!(pool.apply_burn_event(-60, 120, 1_000).is_err());
+
+        let after = pool.ticks.get(&-60).unwrap();
+        assert_eq!(
+            (after.liquidity_net, after.liquidity_gross),
+            (before.liquidity_net, before.liquidity_gross)
         );
     }
 }

@@ -29,6 +29,13 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   tracks `AlgebraV3` alone, since the Algebra fee plugin still emits nothing
   the collector consumes.
 
+- **Ramses V3 `Mint` is applied.** Ramses-family pools emit Uniswap V3's
+  `Mint` with an NFT position `index` added (topic `0xd78218c0…`), which was
+  never fetched while their unchanged `Burn` was applied. Run 8 logged 588
+  "Burn attempted on uninitialized tick" errors across four pools in 12 hours,
+  and three replayed opportunities priced a pool whose live tick the map had
+  lost. A `Burn` now checks both ticks before changing either.
+
 ### Notes
 
 - `FeeAdjustment` is deliberately absent from `profitable_topics()`. A fee
