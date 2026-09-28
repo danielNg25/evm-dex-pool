@@ -2,32 +2,39 @@ use crate::PoolRegistry;
 use crate::PoolType;
 use crate::Topic;
 use alloy::eips::BlockNumberOrTag;
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use anyhow::Result;
 use async_trait::async_trait;
 use log::{debug, error, info};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::event_processor::fetch_events_with_retry;
-use super::{enrich_log_timestamps, fetch_events, EventQueue};
+use super::{enrich_log_timestamps_where, fetch_events, EventQueue};
 
-/// Enrich `events` with block timestamps, but only when the registry holds
-/// at least one LB pool — no other pool type has time-dependent state, so a
-/// deployment without them pays nothing for this extra RPC round trip.
+/// Enrich the LB pools' logs in `events` with block timestamps, taking any
+/// time already `known` first. Only LB pools read a log's block time (the
+/// variable-fee clock), so every other pool's logs are left alone: a header
+/// fetched for a block holding none of them was a round trip for nothing, and
+/// Sentio, which zeroes every log's timestamp, made that every block.
 pub(crate) async fn enrich_if_lb_pools_present<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     pool_registry: &PoolRegistry,
     events: &mut [Log],
+    known: &HashMap<u64, u64>,
 ) -> Result<()> {
-    if !pool_registry
+    let lb: HashSet<Address> = pool_registry
         .get_addresses_by_type(PoolType::TraderJoeLB)
-        .is_empty()
-    {
-        enrich_log_timestamps(provider, events).await?;
+        .into_iter()
+        .collect();
+    if lb.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    enrich_log_timestamps_where(provider, events, &|log: &Log| lb.contains(&log.address()), known)
+        .await
 }
 
 /// Position of a log in chain order: `(block number, transaction index, log index)`.
@@ -223,7 +230,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         batch_end
                     );
 
-                    enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events)
+                    enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &HashMap::new())
                         .await?;
 
                     // Advance phase
@@ -268,7 +275,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         events.len()
                     );
 
-                    enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events)
+                    enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &HashMap::new())
                         .await?;
 
                     // Reset to poll for next iteration
@@ -297,6 +304,8 @@ pub struct LatestBlockSource<P: Provider + Send + Sync + 'static> {
     wait_time_ms: u64,
     /// Internal state: remaining confirmed batches to process
     batches: Vec<(u64, u64, bool)>, // (from, to, is_latest_single_block)
+    /// Block times the poll has seen, for the LB timestamp enrichment.
+    known_block_times: HashMap<u64, u64>,
     chain_id: u64,
 }
 
@@ -316,6 +325,7 @@ impl<P: Provider + Send + Sync + 'static> LatestBlockSource<P> {
             max_blocks_per_batch,
             wait_time_ms,
             batches: Vec::new(),
+            known_block_times: HashMap::new(),
             chain_id,
         }
     }
@@ -345,7 +355,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
                 )
                 .await?;
 
-                enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events)
+                enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &self.known_block_times)
                     .await?;
 
                 let mode = if is_latest_single {
@@ -381,8 +391,12 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
             );
             tokio::time::sleep(Duration::from_millis(self.wait_time_ms)).await;
 
-            debug!("[Chain {}] Calling get_block_number...", self.chain_id);
-            let latest_block = get_block_number_with_retry(&self.provider, self.chain_id).await;
+            debug!("[Chain {}] Calling get_latest_header...", self.chain_id);
+            let (latest_block, latest_time) =
+                get_latest_header_with_retry(&self.provider, self.chain_id).await;
+            self.known_block_times.insert(latest_block, latest_time);
+            self.known_block_times
+                .retain(|&n, _| n + KNOWN_BLOCK_TIMES_KEPT > latest_block);
             let last_processed = self.pool_registry.get_last_processed_block();
             let next_block = last_processed + 1;
             debug!(
@@ -539,6 +553,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                         &self.provider,
                         &self.pool_registry,
                         &mut fetched_events,
+                        &HashMap::new(),
                     )
                     .await?;
 
@@ -608,7 +623,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
         }
 
         // Apply the initial websocket events that were buffered
-        enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events).await?;
+        enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &HashMap::new()).await?;
         let max_ws_block = events.iter().filter_map(|e| e.block_number).max();
         for event in events {
             if let Some(pool) = self.pool_registry.get_pool(&event.address()) {
@@ -651,7 +666,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 events.len()
             );
 
-            enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events).await?;
+            enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &HashMap::new()).await?;
 
             let max_block = events.iter().filter_map(|e| e.block_number).max();
 
@@ -703,6 +718,59 @@ async fn get_block_number_with_retry<P: Provider + Send + Sync>(
                     backoff.as_millis()
                 );
             }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = std::cmp::min(backoff * 2, max_backoff);
+    }
+}
+
+/// Block times kept from the poll.
+const KNOWN_BLOCK_TIMES_KEPT: u64 = 64;
+
+/// The latest block's number and timestamp. Polling the header instead of the
+/// bare number costs the same round trip and hands the LB enrichment the time
+/// of the block it is about to fetch, so a steady-state single-block batch
+/// needs no header fetch of its own.
+async fn get_latest_header_with_retry<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    chain_id: u64,
+) -> (u64, u64) {
+    let mut backoff = Duration::from_millis(50);
+    let max_backoff = Duration::from_millis(500);
+    let rpc_timeout = Duration::from_secs(30);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        if attempt > 1 {
+            debug!("[Chain {}] get_latest_header attempt {}", chain_id, attempt);
+        }
+        match tokio::time::timeout(
+            rpc_timeout,
+            provider.get_block_by_number(BlockNumberOrTag::Latest),
+        )
+        .await
+        {
+            Ok(Ok(Some(block))) => return (block.header.number, block.header.timestamp),
+            Ok(Ok(None)) => error!(
+                "[Chain {}] Latest block not returned (attempt {}), retrying in {}ms",
+                chain_id,
+                attempt,
+                backoff.as_millis()
+            ),
+            Ok(Err(e)) => error!(
+                "[Chain {}] Error fetching latest block (attempt {}), retrying in {}ms: {}",
+                chain_id,
+                attempt,
+                backoff.as_millis(),
+                e
+            ),
+            Err(_) => error!(
+                "[Chain {}] Timeout fetching latest block (attempt {}, {}s), retrying in {}ms",
+                chain_id,
+                attempt,
+                rpc_timeout.as_secs(),
+                backoff.as_millis()
+            ),
         }
         tokio::time::sleep(backoff).await;
         backoff = std::cmp::min(backoff * 2, max_backoff);

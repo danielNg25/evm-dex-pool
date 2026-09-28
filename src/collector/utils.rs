@@ -43,16 +43,35 @@ fn lacks_block_timestamp(log: &Log) -> bool {
     log.block_timestamp.is_none_or(|t| t == 0)
 }
 
-/// Distinct block numbers among logs that still lack a timestamp.
+/// Distinct block numbers among the logs `wanted` selects that still lack a
+/// timestamp and whose block time is not already `known`.
 ///
 /// Deduplicated so one header fetch serves every log in that block.
-fn blocks_needing_timestamps(logs: &[Log]) -> Vec<u64> {
+fn blocks_needing_timestamps(
+    logs: &[Log],
+    wanted: &dyn Fn(&Log) -> bool,
+    known: &HashMap<u64, u64>,
+) -> Vec<u64> {
     logs.iter()
-        .filter(|l| lacks_block_timestamp(l))
+        .filter(|l| wanted(l) && lacks_block_timestamp(l))
         .filter_map(|l| l.block_number)
+        .filter(|n| !known.contains_key(n))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
+}
+
+/// Fill `block_timestamp` on the `wanted` logs that lack one, from `times`
+/// (block number -> timestamp). A log whose block is not in `times` keeps
+/// what the RPC sent, so callers keep whatever fallback they already have.
+fn fill_block_timestamps(logs: &mut [Log], wanted: &dyn Fn(&Log) -> bool, times: &HashMap<u64, u64>) {
+    for log in logs.iter_mut() {
+        if wanted(log) && lacks_block_timestamp(log) {
+            if let Some(time) = log.block_number.and_then(|n| times.get(&n)) {
+                log.block_timestamp = Some(*time);
+            }
+        }
+    }
 }
 
 /// Populate `block_timestamp` on logs whose RPC response omitted it.
@@ -64,36 +83,50 @@ fn blocks_needing_timestamps(logs: &[Log]) -> Vec<u64> {
 /// reproduce the contract's volatility decay, and wall clock is not a
 /// substitute: it makes event-replayed state diverge from freshly-fetched
 /// state permanently.
-///
-/// Fetches one header per distinct block, concurrently. Logs whose block
-/// header cannot be read keep what the RPC sent, so callers keep whatever
-/// fallback they already have rather than getting a wrong timestamp.
 pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     logs: &mut [Log],
 ) -> Result<()> {
-    let wanted = blocks_needing_timestamps(logs);
-    if wanted.is_empty() {
-        return Ok(());
-    }
+    enrich_log_timestamps_where(provider, logs, &|_| true, &HashMap::new()).await
+}
 
+/// [`enrich_log_timestamps`] for the logs `wanted` selects, taking any block
+/// time already `known` (e.g. from the block poll) before fetching a header.
+pub async fn enrich_log_timestamps_where<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    logs: &mut [Log],
+    wanted: &(dyn Fn(&Log) -> bool + Sync),
+    known: &HashMap<u64, u64>,
+) -> Result<()> {
+    let to_fetch = blocks_needing_timestamps(logs, wanted, known);
+    let mut times = known.clone();
+    if !to_fetch.is_empty() {
+        times.extend(fetch_block_timestamps(provider, &to_fetch).await);
+    }
+    fill_block_timestamps(logs, wanted, &times);
+    Ok(())
+}
+
+/// One header per block, concurrently, each retried. Blocks whose header
+/// cannot be read are absent from the result, and warned about.
+async fn fetch_block_timestamps<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    blocks: &[u64],
+) -> HashMap<u64, u64> {
     // Each distinct block gets its own future so the fan-out across blocks
     // stays concurrent (via `join_all` below); the retry loop inside each
     // future only serialises attempts for that one block.
-    let futures = wanted.iter().map(|&n| {
+    let futures = blocks.iter().map(|&n| {
         let provider = provider.clone();
         async move {
             let mut last_reason = String::new();
             for attempt in 1..=HEADER_FETCH_ATTEMPTS {
                 match provider.get_block_by_number(BlockNumberOrTag::Number(n)).await {
                     Ok(Some(block)) => return (n, Ok(block.header.timestamp)),
-                    // The RPC call succeeded but had nothing to return for
-                    // this number (e.g. reorg'd away, or not yet visible to
-                    // this node). Can be transient, so it's retried too.
+                    // The call succeeded but had nothing for this number (e.g.
+                    // reorg'd away, or not yet visible to this node): retried.
                     Ok(None) => last_reason = "no block returned".to_string(),
-                    // The RPC call itself failed (timeout, rate limit,
-                    // transport error, etc). Distinct from the above: this is
-                    // a request that never got an answer at all.
+                    // The call itself failed (timeout, rate limit, transport).
                     Err(e) => last_reason = e.to_string(),
                 }
                 if attempt < HEADER_FETCH_ATTEMPTS {
@@ -116,11 +149,8 @@ pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(
     }
 
     // A block whose header could not be read leaves every log in it on the
-    // caller's fallback (wall clock, for `LBPool::apply_log`). That fallback
-    // now feeds `update_references`'s `dt` calculation directly, so silent
-    // degradation here can zero out `volatility_reference` mid-replay. Loud
-    // by design: this is exactly the failure mode the timestamp-enrichment
-    // path exists to prevent.
+    // caller's fallback (wall clock, for `LBPool::apply_log`), which feeds
+    // `update_references`'s `dt` directly. Loud by design.
     if !failures.is_empty() {
         const MAX_REASONS_SHOWN: usize = 5;
         let reasons = failures
@@ -141,18 +171,10 @@ pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(
              logs in unresolved blocks keep their wall-clock fallback timestamp; \
              failures: [{reasons}]{more}",
             fetched.len(),
-            wanted.len()
+            blocks.len()
         );
     }
-
-    for log in logs.iter_mut() {
-        if lacks_block_timestamp(log) {
-            if let Some(n) = log.block_number {
-                log.block_timestamp = fetched.get(&n).copied();
-            }
-        }
-    }
-    Ok(())
+    fetched
 }
 
 #[cfg(test)]
@@ -172,6 +194,12 @@ mod tests {
         }
     }
 
+    fn log_from_at(address: Address, block: u64) -> Log {
+        let mut log = log_at(block);
+        log.inner.address = address;
+        log
+    }
+
     /// A log that already carries a timestamp must be left alone, and one
     /// without a block number cannot be enriched — neither should panic.
     #[test]
@@ -179,14 +207,14 @@ mod tests {
         let mut logs = vec![log_at(100), log_at(100), log_at(101)];
         logs[0].block_timestamp = Some(1_700_000_000);
 
-        let need: Vec<u64> = blocks_needing_timestamps(&logs);
+        let need: Vec<u64> = blocks_needing_timestamps(&logs, &|_| true, &HashMap::new());
         // Block 100 still needs it (logs[1]), 101 needs it, and the set is
         // deduplicated so one header fetch serves both logs at block 100.
         assert_eq!(need, vec![100, 101]);
 
         let mut none_needed = vec![log_at(7)];
         none_needed[0].block_timestamp = Some(42);
-        assert!(blocks_needing_timestamps(&none_needed).is_empty());
+        assert!(blocks_needing_timestamps(&none_needed, &|_| true, &HashMap::new()).is_empty());
     }
 
     /// Sentio's Avalanche endpoint sends `"blockTimestamp": "0x0"` on every
@@ -196,7 +224,24 @@ mod tests {
     fn a_zero_timestamp_counts_as_missing() {
         let mut logs = vec![log_at(100)];
         logs[0].block_timestamp = Some(0);
-        assert_eq!(blocks_needing_timestamps(&logs), vec![100]);
+        assert_eq!(blocks_needing_timestamps(&logs, &|_| true, &HashMap::new()), vec![100]);
+    }
+
+    /// Only the logs a caller wants (the LB pools') need a header.
+    #[test]
+    fn only_wanted_logs_need_a_header() {
+        let lb = Address::repeat_byte(0x1b);
+        let logs = vec![log_from_at(lb, 100), log_at(101)];
+        let wanted = |log: &Log| log.address() == lb;
+        assert_eq!(blocks_needing_timestamps(&logs, &wanted, &HashMap::new()), vec![100]);
+    }
+
+    /// A block time the poll already saw needs no header.
+    #[test]
+    fn a_known_block_time_needs_no_header() {
+        let logs = vec![log_at(100)];
+        let known = HashMap::from([(100u64, 1_790_000_000u64)]);
+        assert!(blocks_needing_timestamps(&logs, &|_| true, &known).is_empty());
     }
 
     /// Exercises `enrich_log_timestamps` against a real `Provider` backed by
@@ -340,6 +385,38 @@ mod tests {
             assert!(result.is_ok());
             assert_eq!(logs[0].block_timestamp, None);
             assert!(asserter.read_q().is_empty());
+        }
+
+        /// Known block times fill logs without a request: the mock has
+        /// nothing queued, so any request would fail and leave the log unset.
+        #[tokio::test]
+        async fn a_known_block_time_fills_the_log_without_a_request() {
+            let asserter = Asserter::new();
+            let provider = Arc::new(ProviderBuilder::new().connect_mocked_client(asserter.clone()));
+            let known = HashMap::from([(100u64, 1_790_000_000u64)]);
+
+            let mut logs = vec![log_at(100)];
+            enrich_log_timestamps_where(&provider, &mut logs, &|_| true, &known)
+                .await
+                .unwrap();
+
+            assert_eq!(logs[0].block_timestamp, Some(1_790_000_000));
+        }
+
+        /// A log the caller does not want is left alone even when its header
+        /// is available.
+        #[tokio::test]
+        async fn an_unwanted_log_is_left_alone() {
+            let asserter = Asserter::new();
+            let provider = Arc::new(ProviderBuilder::new().connect_mocked_client(asserter.clone()));
+            asserter.push_success(&block_with_timestamp(1_700_000_000));
+
+            let mut logs = vec![log_at(100)];
+            enrich_log_timestamps_where(&provider, &mut logs, &|_| false, &HashMap::new())
+                .await
+                .unwrap();
+
+            assert_eq!(logs[0].block_timestamp, None);
         }
     }
 }

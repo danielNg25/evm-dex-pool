@@ -6,6 +6,15 @@ All notable changes to `evm-dex-pool` will be documented in this file.
 
 ### Changed
 
+- **Block headers are fetched only for blocks with LB logs.** Timestamp
+  enrichment used to fetch a header for every block whose logs lacked a
+  timestamp once any LB pool was registered -- on Sentio, which zeroes every
+  log's timestamp, one extra round trip per block, before the batch was
+  dispatched. Only LB pools use it, so only their logs are enriched now. The
+  latest-block poller reads the latest header instead of the block number
+  (same round trip), and the enrichment takes that time first, so a
+  steady-state single-block batch fetches no header at all.
+
 - **LB `CompositionFees` moves the variable-fee clock.** A v2.1+ mint into
   the active bin that pays a composition fee also runs
   `updateVolatilityParameters`, moving the references, the accumulator and

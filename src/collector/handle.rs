@@ -1,6 +1,6 @@
 use crate::collector::block_source::enrich_if_lb_pools_present;
 use crate::collector::config::PoolFetchConfig;
-use crate::collector::enrich_log_timestamps;
+use crate::collector::enrich_log_timestamps_where;
 use crate::collector::event_processor::{fetch_events_with_retry, PendingEvent};
 use crate::collector::event_queue::EventQueue;
 use crate::collector::metrics::CollectorMetrics;
@@ -661,9 +661,21 @@ async fn apply_catchup_events_in_memory<P: Provider + Send + Sync>(
     .await?;
 
     // Same rule as the block sources: LB pools date their volatility decay
-    // from each log's block time, which the RPC may not have sent.
-    if pools.iter().any(|p| p.pool_type() == PoolType::TraderJoeLB) {
-        enrich_log_timestamps(provider, &mut events).await?;
+    // from each log's block time, which the RPC may not have sent. Only their
+    // logs are enriched; no other pool reads a log's block time.
+    let lb: HashSet<Address> = pools
+        .iter()
+        .filter(|p| p.pool_type() == PoolType::TraderJoeLB)
+        .map(|p| p.address())
+        .collect();
+    if !lb.is_empty() {
+        enrich_log_timestamps_where(
+            provider,
+            &mut events,
+            &|log: &Log| lb.contains(&log.address()),
+            &HashMap::new(),
+        )
+        .await?;
     }
 
     info!(
@@ -723,7 +735,7 @@ async fn catchup_registry_to_block<P: Provider + Send + Sync>(
     )
     .await?;
 
-    enrich_if_lb_pools_present(provider, pool_registry, &mut events).await?;
+    enrich_if_lb_pools_present(provider, pool_registry, &mut events, &HashMap::new()).await?;
 
     info!(
         "[Chain {}] catchup_registry_to_block: applying {} events over blocks {}..={}",
