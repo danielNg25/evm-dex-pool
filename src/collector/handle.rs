@@ -1,4 +1,6 @@
+use crate::collector::block_source::enrich_if_lb_pools_present;
 use crate::collector::config::PoolFetchConfig;
+use crate::collector::enrich_log_timestamps;
 use crate::collector::event_processor::{fetch_events_with_retry, PendingEvent};
 use crate::collector::event_queue::EventQueue;
 use crate::collector::metrics::CollectorMetrics;
@@ -648,7 +650,7 @@ async fn apply_catchup_events_in_memory<P: Provider + Send + Sync>(
     let addresses: Vec<Address> = pools.iter().map(|p| p.address()).collect();
     let addr_set: HashSet<Address> = addresses.iter().copied().collect();
 
-    let events: Vec<Log> = fetch_events_with_retry(
+    let mut events: Vec<Log> = fetch_events_with_retry(
         provider,
         addresses,
         topics,
@@ -657,6 +659,12 @@ async fn apply_catchup_events_in_memory<P: Provider + Send + Sync>(
         chain_id,
     )
     .await?;
+
+    // Same rule as the block sources: LB pools date their volatility decay
+    // from each log's block time, which the RPC may not have sent.
+    if pools.iter().any(|p| p.pool_type() == PoolType::TraderJoeLB) {
+        enrich_log_timestamps(provider, &mut events).await?;
+    }
 
     info!(
         "[Chain {}] apply_catchup_events_in_memory: {} events over {} pools",
@@ -705,7 +713,7 @@ async fn catchup_registry_to_block<P: Provider + Send + Sync>(
     let addresses = pool_registry.get_all_addresses();
     let topics = pool_registry.get_topics();
 
-    let events: Vec<Log> = fetch_events_with_retry(
+    let mut events: Vec<Log> = fetch_events_with_retry(
         provider,
         addresses,
         topics,
@@ -714,6 +722,8 @@ async fn catchup_registry_to_block<P: Provider + Send + Sync>(
         chain_id,
     )
     .await?;
+
+    enrich_if_lb_pools_present(provider, pool_registry, &mut events).await?;
 
     info!(
         "[Chain {}] catchup_registry_to_block: applying {} events over blocks {}..={}",
@@ -752,5 +762,97 @@ fn register_pools_and_topics(registry: &Arc<PoolRegistry>, pools: Vec<Box<dyn Po
     for pool_type in new_pool_types {
         registry.add_topics(pool_type.topics());
         registry.add_profitable_topics(pool_type.profitable_topics());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::ILBPair;
+    use crate::LBPool;
+    use alloy::primitives::B256;
+    use alloy::providers::mock::Asserter;
+    use alloy::providers::ProviderBuilder;
+    use alloy::rpc::types::{Block, Header as RpcHeader};
+    use alloy::sol_types::SolEvent;
+    use std::collections::BTreeMap;
+
+    /// A pool added at runtime is caught up over blocks the collector already
+    /// passed, from a plain `eth_getLogs` that carries no usable block time
+    /// (here the 0x0 Sentio sends). The LB pool must still be dated from the
+    /// block header, exactly as the block sources date it.
+    #[tokio::test]
+    async fn in_memory_catchup_dates_lb_events_from_the_block_header() {
+        let pair: Address = "0x864d4e5Ee7318e97483DB7EB0912E09F161516EA"
+            .parse()
+            .unwrap();
+        let lb = LBPool::new(
+            pair,
+            Address::ZERO,
+            Address::ZERO,
+            10,
+            8_363_335,
+            BTreeMap::new(),
+            5_000,
+            30,
+            600,
+            5_000,
+            40_000,
+            1_000,
+            350_000,
+            0,
+            0,
+            8_363_335,
+            1_790_408_000,
+        );
+        let swap = ILBPair::Swap {
+            sender: Address::ZERO,
+            to: Address::ZERO,
+            id: 8_363_335u32.try_into().unwrap(),
+            amountsIn: B256::ZERO,
+            amountsOut: B256::ZERO,
+            volatilityAccumulator: 9_703u32.try_into().unwrap(),
+            totalFees: B256::ZERO,
+            protocolFees: B256::ZERO,
+        };
+        let log = Log {
+            inner: alloy::primitives::Log {
+                address: pair,
+                data: swap.encode_log_data(),
+            },
+            block_number: Some(96_179_457),
+            block_timestamp: Some(0),
+            transaction_index: Some(0),
+            log_index: Some(0),
+            ..Default::default()
+        };
+        let header: Block = Block::empty(RpcHeader::new(alloy::consensus::Header {
+            timestamp: 1_790_408_097,
+            ..Default::default()
+        }));
+
+        let asserter = Asserter::new();
+        let provider = Arc::new(ProviderBuilder::new().connect_mocked_client(asserter.clone()));
+        asserter.push_success(&vec![log]); // eth_getLogs
+        asserter.push_success(&header); // eth_getBlockByNumber
+
+        let mut pools: Vec<Box<dyn PoolInterface>> = vec![Box::new(lb)];
+        apply_catchup_events_in_memory(
+            &provider,
+            &mut pools,
+            PoolType::TraderJoeLB.topics(),
+            96_179_457,
+            96_179_457,
+            43_114,
+        )
+        .await
+        .unwrap();
+
+        let lb = pools[0].as_any().downcast_ref::<LBPool>().unwrap();
+        assert_eq!(
+            lb.volatility_accumulator, 9_703,
+            "the swap must have been applied"
+        );
+        assert_eq!(lb.time_of_last_update, 1_790_408_097);
     }
 }

@@ -33,12 +33,22 @@ pub async fn fetch_events<P: Provider + Send + Sync>(
     Ok(events)
 }
 
+/// Whether a log still needs its block timestamp filled in.
+///
+/// `None` is the usual case. `Some(0)` is the other: Sentio's Avalanche
+/// endpoint sends `"blockTimestamp": "0x0"` on every log rather than omitting
+/// the field. No block holding a pool event was mined at time zero, so the
+/// two say the same thing — the RPC did not tell us.
+fn lacks_block_timestamp(log: &Log) -> bool {
+    log.block_timestamp.is_none_or(|t| t == 0)
+}
+
 /// Distinct block numbers among logs that still lack a timestamp.
 ///
 /// Deduplicated so one header fetch serves every log in that block.
 fn blocks_needing_timestamps(logs: &[Log]) -> Vec<u64> {
     logs.iter()
-        .filter(|l| l.block_timestamp.is_none())
+        .filter(|l| lacks_block_timestamp(l))
         .filter_map(|l| l.block_number)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -49,12 +59,14 @@ fn blocks_needing_timestamps(logs: &[Log]) -> Vec<u64> {
 ///
 /// `blockTimestamp` is not part of a standard `eth_getLogs` response and many
 /// endpoints — Avalanche's among them — never send it, so logs arrive with
-/// `block_timestamp: None`. LB pools need chain time to reproduce the
-/// contract's volatility decay, and wall clock is not a substitute: it makes
-/// event-replayed state diverge from freshly-fetched state permanently.
+/// `block_timestamp: None`; others send a placeholder zero, which counts as
+/// missing too (see [`lacks_block_timestamp`]). LB pools need chain time to
+/// reproduce the contract's volatility decay, and wall clock is not a
+/// substitute: it makes event-replayed state diverge from freshly-fetched
+/// state permanently.
 ///
 /// Fetches one header per distinct block, concurrently. Logs whose block
-/// header cannot be read are left with `None`, so callers keep whatever
+/// header cannot be read keep what the RPC sent, so callers keep whatever
 /// fallback they already have rather than getting a wrong timestamp.
 pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(
     provider: &Arc<P>,
@@ -134,7 +146,7 @@ pub async fn enrich_log_timestamps<P: Provider + Send + Sync>(
     }
 
     for log in logs.iter_mut() {
-        if log.block_timestamp.is_none() {
+        if lacks_block_timestamp(log) {
             if let Some(n) = log.block_number {
                 log.block_timestamp = fetched.get(&n).copied();
             }
@@ -177,6 +189,16 @@ mod tests {
         assert!(blocks_needing_timestamps(&none_needed).is_empty());
     }
 
+    /// Sentio's Avalanche endpoint sends `"blockTimestamp": "0x0"` on every
+    /// log instead of omitting the field; alloy reads that as `Some(0)`. It
+    /// carries no more information than `None` and must be enriched the same.
+    #[test]
+    fn a_zero_timestamp_counts_as_missing() {
+        let mut logs = vec![log_at(100)];
+        logs[0].block_timestamp = Some(0);
+        assert_eq!(blocks_needing_timestamps(&logs), vec![100]);
+    }
+
     /// Exercises `enrich_log_timestamps` against a real `Provider` backed by
     /// alloy's built-in mock transport (`alloy::providers::mock::Asserter`),
     /// so the RPC-error and no-block branches run as actual code paths
@@ -208,6 +230,20 @@ mod tests {
             enrich_log_timestamps(&provider, &mut logs).await.unwrap();
 
             assert_eq!(logs[0].block_timestamp, Some(1_700_000_000));
+        }
+
+        /// A log the RPC stamped with a zero timestamp gets the header's.
+        #[tokio::test]
+        async fn replaces_a_zero_timestamp_with_the_header_time() {
+            let asserter = Asserter::new();
+            let provider = Arc::new(ProviderBuilder::new().connect_mocked_client(asserter.clone()));
+            asserter.push_success(&block_with_timestamp(1_790_408_097));
+
+            let mut logs = vec![log_at(96_179_457)];
+            logs[0].block_timestamp = Some(0);
+            enrich_log_timestamps(&provider, &mut logs).await.unwrap();
+
+            assert_eq!(logs[0].block_timestamp, Some(1_790_408_097));
         }
 
         /// Failure mode 1: the RPC call itself errors out, on every attempt.

@@ -65,7 +65,9 @@ fn normalise_reported_fee(raw: U256) -> U256 {
 ///
 /// For the constant-product-with-fee curve
 ///
-///     out = (ain * (1-f) * r1) / (r0 + ain * (1-f))
+/// ```text
+/// out = (ain * (1-f) * r1) / (r0 + ain * (1-f))
+/// ```
 ///
 /// let x = ain*(1-f). Then out*(r0 + x) = x*r1, so x = out*r0 / (r1 - out) and
 /// f = 1 - x/ain. That inverts the whole curve, slippage included -- it is not

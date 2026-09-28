@@ -372,10 +372,15 @@ impl LBPool {
     }
 
     /// Chain time for an event, falling back to wall clock only when the log
-    /// carries no block timestamp (some RPCs omit it on pending logs).
+    /// carries no usable block timestamp: some RPCs omit it on pending logs,
+    /// and Sentio's Avalanche endpoint sends 0x0 on every log. Zero counts as
+    /// absent — taken literally it dates the last update to 1970, so every
+    /// quote decays the volatility reference to nothing and drops the
+    /// variable fee.
     fn log_timestamp(event: &Log) -> u64 {
         event
             .block_timestamp
+            .filter(|&t| t != 0)
             .unwrap_or_else(|| chrono::Utc::now().timestamp() as u64)
     }
 }
@@ -949,7 +954,7 @@ impl fmt::Display for LBPool {
 mod tests {
     use super::*;
     use crate::contracts::ILBPair;
-    use alloy::primitives::{Address, B256};
+    use alloy::primitives::{address, Address, B256};
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolEvent;
 
@@ -1018,6 +1023,73 @@ mod tests {
             pool.time_of_last_update.abs_diff(now) < 60,
             "expected a wall-clock fallback near now, got {}",
             pool.time_of_last_update
+        );
+    }
+
+    /// Sentio's Avalanche endpoint sends `"blockTimestamp": "0x0"` on every
+    /// log rather than omitting the field, and alloy reads that as `Some(0)`.
+    /// Taken at face value it dates the swap to 1970, so every later quote
+    /// sees a `dt` of decades, decays the volatility reference to zero and
+    /// drops the variable fee. No swap is ever mined at time zero.
+    #[test]
+    fn apply_log_treats_a_zero_timestamp_as_missing() {
+        let mut pool = pool_with_time(1_700_000_000);
+        pool.apply_log(&swap_log(Some(0))).unwrap();
+        let now = chrono::Utc::now().timestamp() as u64;
+        assert!(
+            pool.time_of_last_update.abs_diff(now) < 60,
+            "a zero block timestamp must fall back like a missing one, got {}",
+            pool.time_of_last_update
+        );
+    }
+
+    /// Pinned to Avalanche pair 0x864d…16ea (WAVAX/USDC, binStep 10) at block
+    /// 96,179,488, t=1790408131. Its last swap was at t=1790408097, so dt=34
+    /// crosses filterPeriod=30 and the volatility reference decays 9703 ->
+    /// 4851: a variable fee of ~0.0094 bps over the 5 bps base, and the pair's
+    /// own `getSwapOut(147978, false)` returns 13817106909502910 with fee 75.
+    ///
+    /// Dated to t=0 instead — what a `blockTimestamp` of 0x0 produced — the
+    /// reference decays to zero, the fee rounds to 74, and the quote comes out
+    /// 93,420,058,481 wei high: the shortfall five fork-replayed opportunities
+    /// through this pair hit, identical to the wei.
+    #[test]
+    fn last_update_time_decides_the_variable_fee_on_a_real_quote() {
+        const BLOCK_TIME: u64 = 1_790_408_131;
+        let pool = |time_of_last_update| {
+            let mut p = LBPool::new(
+                address!("864d4e5Ee7318e97483DB7EB0912E09F161516EA"),
+                address!("B31f66AA3C1e785363F0875A1B74E27b85FD66c7"), // WAVAX
+                address!("B97EF9Ef8734C71904D8002F8b6Bc66Dd9c48a6E"), // USDC
+                10,
+                8_363_335,
+                BTreeMap::new(),
+                5_000,
+                30,
+                600,
+                5_000,
+                40_000,
+                1_000,
+                350_000,
+                9_703,
+                9_703,
+                8_363_335,
+                time_of_last_update,
+            );
+            p.update_bin(8_363_335, 590_394_461_209_612_672, 2_012_225_041);
+            p
+        };
+        let quote = |p: LBPool| p.simulate_swap_out_at(147_978, false, BLOCK_TIME).unwrap();
+
+        assert_eq!(
+            quote(pool(1_790_408_097)),
+            (0, 13_817_106_909_502_910, 75),
+            "with the real last-update time the model must match the pair's own quote"
+        );
+        assert_eq!(
+            quote(pool(0)),
+            (0, 13_817_200_329_561_391, 74),
+            "dated to epoch 0 the variable fee vanishes: this is the mispricing the fix removes"
         );
     }
 

@@ -16,7 +16,7 @@ use super::{enrich_log_timestamps, fetch_events, EventQueue};
 /// Enrich `events` with block timestamps, but only when the registry holds
 /// at least one LB pool — no other pool type has time-dependent state, so a
 /// deployment without them pays nothing for this extra RPC round trip.
-async fn enrich_if_lb_pools_present<P: Provider + Send + Sync>(
+pub(crate) async fn enrich_if_lb_pools_present<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     pool_registry: &PoolRegistry,
     events: &mut [Log],
