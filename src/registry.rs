@@ -44,7 +44,7 @@ impl PoolRegistry {
     pub fn add_dynamic_fee_address(&self, address: Address) {
         if self.dynamic_fee_addresses.insert(address, ()).is_none() {
             info!(
-                "[Chain {}] Tracking dynamic-fee pool {} for periodic fee refetch ({} total)",
+                "[Chain {}] Tracking dynamic-fee pool {} for the fee reader ({} total)",
                 self.network_id,
                 address,
                 self.dynamic_fee_addresses.len()

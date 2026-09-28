@@ -1337,6 +1337,7 @@ mod tests {
             IAlgebraIntegralPool::Fee::SIGNATURE_HASH,
             IAlgebraIntegralPool::PluginConfig::SIGNATURE_HASH,
             IAlgebraIntegralPool::Plugin::SIGNATURE_HASH,
+            IAlgebraIntegralPool::SwapFee::SIGNATURE_HASH,
         ] {
             assert!(UniswapV3Pool::topics().contains(&topic), "must be fetched");
             assert!(!UniswapV3Pool::profitable_topics().contains(&topic));
