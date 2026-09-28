@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::{collections::BTreeMap, fmt};
 
-use super::{v3_swap, Tick, TickMap};
+use super::{v3_swap, Tick, TickMap, TickSearch};
 
 /// The Q64.96 precision used by Uniswap V3
 pub const Q96_U128: u128 = 1 << 96;
@@ -142,6 +142,20 @@ impl UniswapV3Pool {
         Ok(sqrt_price * sqrt_price)
     }
 
+    /// How this pool's swap loop finds where a step ends. See [`TickSearch`].
+    pub fn tick_search(&self) -> TickSearch {
+        match self.pool_type {
+            V3PoolType::UniswapV3 | V3PoolType::PancakeV3 | V3PoolType::RamsesCL => {
+                TickSearch::WordBounded {
+                    tick_spacing: self.tick_spacing,
+                }
+            }
+            V3PoolType::AlgebraV3
+            | V3PoolType::AlgebraTwoSideFee
+            | V3PoolType::AlgebraPoolFeeInState => TickSearch::NextInitialized,
+        }
+    }
+
     /// Calculate the amount of token1 for a given amount of token0
     fn calculate_zero_for_one(&self, amount: U256, is_exact_input: bool) -> Result<U256> {
         let amount_specified = if is_exact_input {
@@ -155,6 +169,7 @@ impl UniswapV3Pool {
             self.tick,
             self.liquidity,
             &self.ticks,
+            self.tick_search(),
             true,
             amount_specified,
             None,
@@ -181,6 +196,7 @@ impl UniswapV3Pool {
             self.tick,
             self.liquidity,
             &self.ticks,
+            self.tick_search(),
             false,
             amount_specified,
             None,
@@ -810,5 +826,86 @@ mod tests {
             (after.liquidity_net, after.liquidity_gross),
             (before.liquidity_net, before.liquidity_gross)
         );
+    }
+
+    /// Pangolin V3 PNG/USDt 0xd3e0…5c32 (fee 10, spacing 1). No initialized
+    /// tick lies within six words either side at these blocks, so the pool's
+    /// liquidity is modelled as one full-range position.
+    fn pangolin_png_usdt(pool_type: V3PoolType, sqrt_price_x96: u128, tick: i32) -> UniswapV3Pool {
+        const LIQUIDITY: u128 = 40_771_086_622_940_920;
+        let mut pool = UniswapV3Pool::new(
+            address!("0xd3e0B1D5a7f225498f2c1E88e1377c54A7925c32"),
+            TOKEN0, // PNG
+            TOKEN1, // USDt
+            U24::from(10u32),
+            1,
+            U160::from(sqrt_price_x96),
+            tick,
+            LIQUIDITY,
+            Address::ZERO,
+            pool_type,
+        );
+        for (index, liquidity_net) in [
+            (-887_272i32, LIQUIDITY as i128),
+            (887_272, -(LIQUIDITY as i128)),
+        ] {
+            pool.ticks.insert(
+                index,
+                Tick {
+                    index,
+                    liquidity_net,
+                    liquidity_gross: LIQUIDITY,
+                },
+            );
+        }
+        pool
+    }
+
+    /// Block 96,207,105 (run 8 fixture bulk_011#147): 8,172,733 USDt in, 19
+    /// ticks below the end of its bitmap word. On chain the swap ends a step at
+    /// tick -310785 and carries on; the pool paid 256,578,681,201,515,781,113 PNG.
+    /// Skipping the edge quoted 256,578,691,550,243,836,051.
+    #[test]
+    fn uniswap_v3_stops_at_word_edges_one_for_zero() {
+        let pool = pangolin_png_usdt(
+            V3PoolType::UniswapV3,
+            14_132_105_716_635_770_162_996,
+            -310_804,
+        );
+        let out = pool
+            .calculate_exact_input(&TOKEN1, U256::from(8_172_733u64))
+            .unwrap();
+        assert_eq!(out, U256::from(256_578_681_201_515_781_113u128));
+    }
+
+    /// Block 96,191,846 (fixture bulk_001#349): 215,837,973,359,182,878,854 PNG
+    /// in, 6 ticks above the start of its word (tick -310528). The pool paid
+    /// 7,056,618 USDt; skipping the edge quoted 7,056,619.
+    #[test]
+    fn uniswap_v3_stops_at_word_edges_zero_for_one() {
+        let pool = pangolin_png_usdt(
+            V3PoolType::UniswapV3,
+            14_332_568_801_641_688_341_923,
+            -310_522,
+        );
+        let out = pool
+            .calculate_exact_input(&TOKEN0, U256::from(215_837_973_359_182_878_854u128))
+            .unwrap();
+        assert_eq!(out, U256::from(7_056_618u64));
+    }
+
+    /// Algebra Integral walks a linked list of initialized ticks and never
+    /// stops at a word edge; its quote must not change.
+    #[test]
+    fn algebra_steps_straight_to_the_next_initialized_tick() {
+        let pool = pangolin_png_usdt(
+            V3PoolType::AlgebraV3,
+            14_132_105_716_635_770_162_996,
+            -310_804,
+        );
+        let out = pool
+            .calculate_exact_input(&TOKEN1, U256::from(8_172_733u64))
+            .unwrap();
+        assert_eq!(out, U256::from(256_578_691_550_243_836_051u128));
     }
 }

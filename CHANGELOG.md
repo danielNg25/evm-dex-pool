@@ -36,6 +36,16 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   and three replayed opportunities priced a pool whose live tick the map had
   lost. A `Burn` now checks both ticks before changing either.
 
+- **Uniswap-V3-style pools stop at bitmap word edges.** `UniswapV3`,
+  `PancakeV3` and `RamsesCL` quotes now end a step at every 256-tick word
+  edge, as `TickBitmap.nextInitializedTickWithinOneWord` does on chain; each
+  step rounds its input and fee up, and skipping the edge overstated outputs
+  by one to two input units (49 of run 8's 99 non-exact replays, reproduced
+  exactly both ways). Algebra pools are unchanged: Integral never stops at a
+  word edge. `TickDataProvider::next_initialized_tick_within_one_word` is now
+  `next_initialized_tick(tick, lte, TickSearch)`, and `v3_swap` takes a
+  `TickSearch`.
+
 ### Notes
 
 - `FeeAdjustment` is deliberately absent from `profitable_topics()`. A fee

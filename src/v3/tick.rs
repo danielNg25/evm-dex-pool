@@ -20,6 +20,22 @@ pub struct Tick {
 
 pub type TickMap = BTreeMap<i32, Tick>;
 
+/// Where a swap step may end, besides the target price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickSearch {
+    /// Uniswap V3's `TickBitmap.nextInitializedTickWithinOneWord`: the next
+    /// initialized tick, but never past the end of the current 256-tick word
+    /// (ticks counted in units of `tick_spacing`). Uniswap V3 and its forks
+    /// (PancakeV3, Ramses CL) end a step at every word edge, and each step
+    /// rounds its input and fee up, so skipping the edge overstated the output
+    /// by one to two input units -- 49 of run 8's 99 non-exact replays, up to
+    /// 3.6% of a cycle's profit where one unit is a satoshi.
+    WordBounded { tick_spacing: i32 },
+    /// The next initialized tick wherever it is. Algebra Integral walks a
+    /// linked list of initialized ticks and never stops at a word edge.
+    NextInitialized,
+}
+
 pub trait TickDataProvider {
     /// Return information corresponding to a specific tick
     ///
@@ -30,15 +46,15 @@ pub trait TickDataProvider {
     /// returns: Result<&Tick>
     fn get_tick(&self, tick: i32) -> Result<&Tick>;
 
-    /// Return the next tick that is initialized within a single word
-    ///
-    /// ## Arguments
-    ///
-    /// * `tick`: The current tick
-    /// * `lte`: Whether the next tick should be lte the current tick
-    ///
-    /// returns: Result<(i32, bool)>
-    fn next_initialized_tick_within_one_word(&self, tick: i32, lte: bool) -> Result<(i32, bool)>;
+    /// Where the next swap step ends: `(tick, initialized)`. `lte` searches
+    /// downward (zeroForOne) and includes `tick` itself, as on chain; `search`
+    /// says whether a bitmap word edge ends the step too.
+    fn next_initialized_tick(
+        &self,
+        tick: i32,
+        lte: bool,
+        search: TickSearch,
+    ) -> Result<(i32, bool)>;
 }
 
 /// Provides information about ticks
@@ -55,29 +71,51 @@ impl TickDataProvider for TickMap {
             .ok_or_else(|| anyhow::anyhow!("Tick not found"))
     }
 
-    /// Return the next tick that is initialized within a single word
-    ///
-    /// ## Arguments
-    ///
-    /// * `tick`: The current tick
-    /// * `lte`: Whether the next tick should be lte the current tick
-    /// * `tick_spacing`: The tick spacing of the pool
-    ///
-    /// returns: Result<(i32, bool)>
-    fn next_initialized_tick_within_one_word(&self, tick: i32, lte: bool) -> Result<(i32, bool)> {
-        if lte {
-            // Find the greatest tick less than or equal to the current tick
-            if let Some((&next_tick, _)) = self.range(..=tick).next_back() {
-                Ok((next_tick, true))
-            } else {
-                Ok((tick, false))
+    fn next_initialized_tick(
+        &self,
+        tick: i32,
+        lte: bool,
+        search: TickSearch,
+    ) -> Result<(i32, bool)> {
+        match search {
+            TickSearch::NextInitialized => {
+                if lte {
+                    Ok(self
+                        .range(..=tick)
+                        .next_back()
+                        .map_or((tick, false), |(&t, _)| (t, true)))
+                } else {
+                    Ok(self
+                        .range(tick + 1..)
+                        .next()
+                        .map_or((tick, false), |(&t, _)| (t, true)))
+                }
             }
-        } else {
-            // Find the smallest tick greater than the current tick
-            if let Some((&next_tick, _)) = self.range(tick + 1..).next() {
-                Ok((next_tick, true))
-            } else {
-                Ok((tick, false))
+            TickSearch::WordBounded { tick_spacing } => {
+                if tick_spacing <= 0 {
+                    return Err(anyhow::anyhow!(
+                        "tick_spacing must be positive, got {tick_spacing}"
+                    ));
+                }
+                // Compress to units of tick_spacing, rounding toward negative
+                // infinity like TickBitmap; a word is 256 compressed ticks.
+                let compressed = tick.div_euclid(tick_spacing);
+                if lte {
+                    let word_start = (compressed >> 8) << 8;
+                    let (lo, hi) = (word_start * tick_spacing, compressed * tick_spacing);
+                    Ok(self
+                        .range(lo..=hi)
+                        .next_back()
+                        .map_or((lo, false), |(&t, _)| (t, true)))
+                } else {
+                    let next = compressed + 1;
+                    let word_end = ((next >> 8) << 8) + 255;
+                    let (lo, hi) = (next * tick_spacing, word_end * tick_spacing);
+                    Ok(self
+                        .range(lo..=hi)
+                        .next()
+                        .map_or((hi, false), |(&t, _)| (t, true)))
+                }
             }
         }
     }
@@ -146,5 +184,69 @@ impl TickIndex for i32 {
     #[inline]
     fn to_i24(self) -> I24 {
         I24::try_from(self).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(ticks: &[i32]) -> TickMap {
+        ticks
+            .iter()
+            .map(|&index| {
+                (
+                    index,
+                    Tick {
+                        index,
+                        liquidity_net: 1,
+                        liquidity_gross: 1,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    // With tick_spacing 60 a word holds compressed ticks 256*w ..= 256*w + 255:
+    // word 0 is ticks 0 ..= 15300, word 1 is 15360 ..= 30660, word -1 is
+    // -15360 ..= -60.
+
+    #[test]
+    fn word_bounded_upward_stops_at_the_word_end() {
+        let m = map(&[-600, 600, 30_000]);
+        let w = TickSearch::WordBounded { tick_spacing: 60 };
+        assert_eq!(m.next_initialized_tick(0, false, w).unwrap(), (600, true));
+        assert_eq!(
+            m.next_initialized_tick(600, false, w).unwrap(),
+            (15_300, false)
+        );
+        assert_eq!(
+            m.next_initialized_tick(15_300, false, w).unwrap(),
+            (30_000, true)
+        );
+    }
+
+    #[test]
+    fn word_bounded_downward_includes_the_current_tick_and_stops_at_the_word_start() {
+        let m = map(&[-600, 600]);
+        let w = TickSearch::WordBounded { tick_spacing: 60 };
+        assert_eq!(m.next_initialized_tick(600, true, w).unwrap(), (600, true));
+        assert_eq!(m.next_initialized_tick(599, true, w).unwrap(), (0, false));
+        assert_eq!(m.next_initialized_tick(-1, true, w).unwrap(), (-600, true));
+        assert_eq!(
+            m.next_initialized_tick(-601, true, w).unwrap(),
+            (-15_360, false)
+        );
+    }
+
+    #[test]
+    fn next_initialized_ignores_word_edges() {
+        let m = map(&[-600, 30_000]);
+        let s = TickSearch::NextInitialized;
+        assert_eq!(
+            m.next_initialized_tick(0, false, s).unwrap(),
+            (30_000, true)
+        );
+        assert_eq!(m.next_initialized_tick(0, true, s).unwrap(), (-600, true));
     }
 }

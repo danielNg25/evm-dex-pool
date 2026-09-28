@@ -7,7 +7,7 @@ use crate::v3::{
 };
 
 use super::{
-    add_delta, get_sqrt_ratio_at_tick, TickDataProvider, TickIndex, TickMap, TickMath,
+    add_delta, get_sqrt_ratio_at_tick, TickDataProvider, TickIndex, TickMap, TickMath, TickSearch,
     MAX_SQRT_RATIO, MAX_TICK_I32, MIN_SQRT_RATIO, ONE,
 };
 
@@ -149,6 +149,7 @@ pub fn v3_swap(
     tick_current: i32,
     liquidity: u128,
     tick_data_provider: &TickMap,
+    tick_search: TickSearch,
     zero_for_one: bool,
     amount_specified: I256,
     sqrt_price_limit_x96: Option<U160>,
@@ -193,8 +194,11 @@ pub fn v3_swap(
             ..Default::default()
         };
 
-        (step.tick_next, step.initialized) = tick_data_provider
-            .next_initialized_tick_within_one_word(state.tick_current, zero_for_one)?;
+        (step.tick_next, step.initialized) = tick_data_provider.next_initialized_tick(
+            state.tick_current,
+            zero_for_one,
+            tick_search,
+        )?;
         step.tick_next = step.tick_next.clamp(MIN_TICK_I32, MAX_TICK_I32);
         step.sqrt_price_next_x96 = get_sqrt_ratio_at_tick(step.tick_next.to_i24())?;
 
@@ -229,8 +233,15 @@ pub fn v3_swap(
             );
         }
 
-        // Detect no-progress: if neither price nor remaining changed, we're stuck
-        if step.amount_in.is_zero() && step.amount_out.is_zero() && step.fee_amount.is_zero() {
+        // A zero step is legitimate when the price already sits on the step's
+        // target: a zeroForOne search includes the current tick, so a price
+        // exactly on a word edge or an initialized tick first steps to itself
+        // and crosses. Only a zero step that did not reach its target is stuck.
+        if step.amount_in.is_zero()
+            && step.amount_out.is_zero()
+            && step.fee_amount.is_zero()
+            && state.sqrt_price_x96 != step.sqrt_price_next_x96
+        {
             return Err(anyhow!(
                 "v3_swap: no progress (zero amounts, liquidity={}, tick={})",
                 state.liquidity,
