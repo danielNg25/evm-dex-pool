@@ -33,8 +33,13 @@ pub(crate) async fn enrich_if_lb_pools_present<P: Provider + Send + Sync>(
     if lb.is_empty() {
         return Ok(());
     }
-    enrich_log_timestamps_where(provider, events, &|log: &Log| lb.contains(&log.address()), known)
-        .await
+    enrich_log_timestamps_where(
+        provider,
+        events,
+        &|log: &Log| lb.contains(&log.address()),
+        known,
+    )
+    .await
 }
 
 /// Position of a log in chain order: `(block number, transaction index, log index)`.
@@ -230,8 +235,13 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         batch_end
                     );
 
-                    enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &HashMap::new())
-                        .await?;
+                    enrich_if_lb_pools_present(
+                        &self.provider,
+                        &self.pool_registry,
+                        &mut events,
+                        &HashMap::new(),
+                    )
+                    .await?;
 
                     // Advance phase
                     let next_block = batch_end + 1;
@@ -275,8 +285,13 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for PendingBlockSource<P> 
                         events.len()
                     );
 
-                    enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &HashMap::new())
-                        .await?;
+                    enrich_if_lb_pools_present(
+                        &self.provider,
+                        &self.pool_registry,
+                        &mut events,
+                        &HashMap::new(),
+                    )
+                    .await?;
 
                     // Reset to poll for next iteration
                     self.phase = PendingPhase::PollBlockNumber;
@@ -355,8 +370,13 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
                 )
                 .await?;
 
-                enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &self.known_block_times)
-                    .await?;
+                enrich_if_lb_pools_present(
+                    &self.provider,
+                    &self.pool_registry,
+                    &mut events,
+                    &self.known_block_times,
+                )
+                .await?;
 
                 let mode = if is_latest_single {
                     ProcessingMode::ConfirmedWithSwaps
@@ -623,7 +643,13 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
         }
 
         // Apply the initial websocket events that were buffered
-        enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &HashMap::new()).await?;
+        enrich_if_lb_pools_present(
+            &self.provider,
+            &self.pool_registry,
+            &mut events,
+            &HashMap::new(),
+        )
+        .await?;
         let max_ws_block = events.iter().filter_map(|e| e.block_number).max();
         for event in events {
             if let Some(pool) = self.pool_registry.get_pool(&event.address()) {
@@ -666,7 +692,13 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 events.len()
             );
 
-            enrich_if_lb_pools_present(&self.provider, &self.pool_registry, &mut events, &HashMap::new()).await?;
+            enrich_if_lb_pools_present(
+                &self.provider,
+                &self.pool_registry,
+                &mut events,
+                &HashMap::new(),
+            )
+            .await?;
 
             let max_block = events.iter().filter_map(|e| e.block_number).max();
 
@@ -683,12 +715,16 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Get block number from provider with exponential backoff retry.
-/// Includes a 30-second timeout per attempt to handle stale RPC connections.
-async fn get_block_number_with_retry<P: Provider + Send + Sync>(
-    provider: &Arc<P>,
-    chain_id: u64,
-) -> u64 {
+/// Retry an RPC read until it answers: a 30-second timeout per attempt to
+/// handle stale RPC connections, and exponential backoff from 50 ms to 500 ms
+/// between attempts. `what` names the read in the logs. An answer with nothing
+/// in it (`Ok(None)`) is retried like an error.
+async fn rpc_with_retry<T, E, F, Fut>(chain_id: u64, what: &str, mut read: F) -> T
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Option<T>, E>>,
+{
     let mut backoff = Duration::from_millis(50);
     let max_backoff = Duration::from_millis(500);
     let rpc_timeout = Duration::from_secs(30);
@@ -696,32 +732,48 @@ async fn get_block_number_with_retry<P: Provider + Send + Sync>(
     loop {
         attempt += 1;
         if attempt > 1 {
-            debug!("[Chain {}] get_block_number attempt {}", chain_id, attempt);
+            debug!("[Chain {}] {} attempt {}", chain_id, what, attempt);
         }
-        match tokio::time::timeout(rpc_timeout, provider.get_block_number()).await {
-            Ok(Ok(block)) => return block,
-            Ok(Err(e)) => {
-                error!(
-                    "[Chain {}] Error fetching block number (attempt {}), retrying in {}ms: {}",
-                    chain_id,
-                    attempt,
-                    backoff.as_millis(),
-                    e
-                );
-            }
-            Err(_) => {
-                error!(
-                    "[Chain {}] Timeout fetching block number (attempt {}, {}s), retrying in {}ms",
-                    chain_id,
-                    attempt,
-                    rpc_timeout.as_secs(),
-                    backoff.as_millis()
-                );
-            }
+        match tokio::time::timeout(rpc_timeout, read()).await {
+            Ok(Ok(Some(value))) => return value,
+            Ok(Ok(None)) => error!(
+                "[Chain {}] No result {} (attempt {}), retrying in {}ms",
+                chain_id,
+                what,
+                attempt,
+                backoff.as_millis()
+            ),
+            Ok(Err(e)) => error!(
+                "[Chain {}] Error {} (attempt {}), retrying in {}ms: {}",
+                chain_id,
+                what,
+                attempt,
+                backoff.as_millis(),
+                e
+            ),
+            Err(_) => error!(
+                "[Chain {}] Timeout {} (attempt {}, {}s), retrying in {}ms",
+                chain_id,
+                what,
+                attempt,
+                rpc_timeout.as_secs(),
+                backoff.as_millis()
+            ),
         }
         tokio::time::sleep(backoff).await;
         backoff = std::cmp::min(backoff * 2, max_backoff);
     }
+}
+
+/// Get block number from provider with exponential backoff retry.
+async fn get_block_number_with_retry<P: Provider + Send + Sync>(
+    provider: &Arc<P>,
+    chain_id: u64,
+) -> u64 {
+    rpc_with_retry(chain_id, "fetching block number", || async move {
+        provider.get_block_number().await.map(Some)
+    })
+    .await
 }
 
 /// Block times kept from the poll.
@@ -735,46 +787,13 @@ async fn get_latest_header_with_retry<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     chain_id: u64,
 ) -> (u64, u64) {
-    let mut backoff = Duration::from_millis(50);
-    let max_backoff = Duration::from_millis(500);
-    let rpc_timeout = Duration::from_secs(30);
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        if attempt > 1 {
-            debug!("[Chain {}] get_latest_header attempt {}", chain_id, attempt);
-        }
-        match tokio::time::timeout(
-            rpc_timeout,
-            provider.get_block_by_number(BlockNumberOrTag::Latest),
-        )
-        .await
-        {
-            Ok(Ok(Some(block))) => return (block.header.number, block.header.timestamp),
-            Ok(Ok(None)) => error!(
-                "[Chain {}] Latest block not returned (attempt {}), retrying in {}ms",
-                chain_id,
-                attempt,
-                backoff.as_millis()
-            ),
-            Ok(Err(e)) => error!(
-                "[Chain {}] Error fetching latest block (attempt {}), retrying in {}ms: {}",
-                chain_id,
-                attempt,
-                backoff.as_millis(),
-                e
-            ),
-            Err(_) => error!(
-                "[Chain {}] Timeout fetching latest block (attempt {}, {}s), retrying in {}ms",
-                chain_id,
-                attempt,
-                rpc_timeout.as_secs(),
-                backoff.as_millis()
-            ),
-        }
-        tokio::time::sleep(backoff).await;
-        backoff = std::cmp::min(backoff * 2, max_backoff);
-    }
+    rpc_with_retry(chain_id, "fetching latest block", || async move {
+        provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map(|block| block.map(|b| (b.header.number, b.header.timestamp)))
+    })
+    .await
 }
 
 // ---------------------------------------------------------------------------
