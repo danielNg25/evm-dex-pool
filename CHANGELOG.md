@@ -48,6 +48,15 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   reverted on 0x0021368B, which swaps at `currentFee()` = 75 while `fee()`
   reads 50.
 
+- **A pool whose swaps keep paying more than its fee stops quoting.**
+  Algebra Integral's `SwapFee(sender, overrideFee, pluginFee)` reports each
+  swap's real fee. While 3 of a pool's last 10 swaps paid more than the fee
+  held, `calculate_exact_input`/`calculate_exact_output` return an error,
+  which consumers treat as "skip". This catches plugin-priced pools on any
+  chain -- on Flare, SparkDEX's FTSO-PMM pools charge the arbitrage direction
+  up to the full mispricing while `fee()` reads the floor. Swaps paying less
+  (a backrunner at 1 ppm, discounts) never count.
+
 - **Ramses V3 `Mint` is applied.** Ramses-family pools emit Uniswap V3's
   `Mint` with an NFT position `index` added (topic `0xd78218c0…`), which was
   never fetched while their unchanged `Burn` was applied. Run 8 logged 588

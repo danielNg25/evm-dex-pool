@@ -10,13 +10,23 @@ use anyhow::{anyhow, Result};
 use log::{debug, info, trace, warn};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    fmt,
+};
 
 use super::{v3_swap, Tick, TickMap, TickSearch};
 
 /// The Q64.96 precision used by Uniswap V3
 pub const Q96_U128: u128 = 1 << 96;
 pub const FEE_DENOMINATOR: u32 = 1000000;
+
+/// How many of a pool's recent swaps the fee check keeps, and how many of them
+/// may have paid more than the fee held before the pool stops quoting. On
+/// Flare the oracle-fee pools miss on most user swaps; the adaptive-fee pools,
+/// read one block ahead, missed 1 in 391.
+const SWAP_FEE_WINDOW: usize = 10;
+const SWAP_FEE_MISSES_TO_STOP: usize = 3;
 
 /// Enum representing the type of V3 pool
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -111,6 +121,10 @@ pub struct UniswapV3Pool {
     /// See [`FeeSource`]. Runtime-only: skipped by serde, and so by bincode.
     #[serde(skip)]
     pub fee_source: FeeSource,
+    /// Whether each of the last `SWAP_FEE_WINDOW` swaps paid more than the
+    /// fee held (from Algebra's `SwapFee`). Runtime-only.
+    #[serde(skip)]
+    pub swap_fee_misses: VecDeque<bool>,
 }
 
 impl UniswapV3Pool {
@@ -143,6 +157,7 @@ impl UniswapV3Pool {
             created_at: current_time,
             factory,
             fee_source: FeeSource::Unknown,
+            swap_fee_misses: VecDeque::new(),
         }
     }
 
@@ -160,6 +175,32 @@ impl UniswapV3Pool {
                 matches!(self.pool_type, V3PoolType::AlgebraV3 | V3PoolType::RamsesCL)
             }
             FeeSource::Events => false,
+        }
+    }
+
+    /// True while too many recent swaps paid more than the fee held: the fee
+    /// the bot would price with is not what the pool charges, so it must not
+    /// quote. The simulator treats a quote error as "skip this cycle".
+    pub fn fee_unpredictable(&self) -> bool {
+        self.swap_fee_misses.iter().filter(|&&missed| missed).count() >= SWAP_FEE_MISSES_TO_STOP
+    }
+
+    fn record_swap_fee(&mut self, missed: bool) {
+        let was_stopped = self.fee_unpredictable();
+        self.swap_fee_misses.push_back(missed);
+        if self.swap_fee_misses.len() > SWAP_FEE_WINDOW {
+            self.swap_fee_misses.pop_front();
+        }
+        match (was_stopped, self.fee_unpredictable()) {
+            (false, true) => warn!(
+                "Pool {}: {} of its last {} swaps paid more than the fee held ({}); not quoting it until that clears",
+                self.address,
+                self.swap_fee_misses.iter().filter(|&&m| m).count(),
+                self.swap_fee_misses.len(),
+                self.fee
+            ),
+            (true, false) => info!("Pool {}: swap fees match again; quoting resumed", self.address),
+            _ => {}
         }
     }
 
@@ -292,6 +333,12 @@ impl UniswapV3Pool {
 
     /// Calculate the amount out for a swap with the exact formula
     pub fn calculate_exact_input(&self, token_in: &Address, amount_in: U256) -> Result<U256> {
+        if self.fee_unpredictable() {
+            return Err(anyhow!(
+                "pool {}: recent swaps paid more than its fee; not quoting",
+                self.address
+            ));
+        }
         let result;
         if token_in == &self.token0 {
             result = self.calculate_zero_for_one(amount_in, true)?;
@@ -305,6 +352,12 @@ impl UniswapV3Pool {
 
     /// Calculate the amount out for a swap with the exact formula
     pub fn calculate_exact_output(&self, token_out: &Address, amount_in: U256) -> Result<U256> {
+        if self.fee_unpredictable() {
+            return Err(anyhow!(
+                "pool {}: recent swaps paid more than its fee; not quoting",
+                self.address
+            ));
+        }
         if token_out == &self.token0 {
             self.calculate_one_for_zero(amount_in, false)
         } else if token_out == &self.token1 {
@@ -647,6 +700,18 @@ impl EventApplicable for UniswapV3Pool {
                 self.fee_source = FeeSource::Unknown;
                 Ok(())
             }
+            // Algebra Integral reports what each swap paid. Paying MORE than the
+            // fee held means this pool's output would be overstated; paying less
+            // (a DEX's own backrunner at 1 ppm, a discount) is harmless.
+            Some(&IAlgebraIntegralPool::SwapFee::SIGNATURE_HASH) => {
+                let ev: IAlgebraIntegralPool::SwapFee = log.log_decode()?.inner.data;
+                let held = self.fee.to::<u32>();
+                let override_fee = ev.overrideFee.to::<u32>();
+                let base = if override_fee != 0 { override_fee } else { held };
+                let paid = base + ev.pluginFee.to::<u32>();
+                self.record_swap_fee(paid > held);
+                Ok(())
+            }
             _ => {
                 trace!("Ignoring non-V3 event for V3 pool");
                 Ok(())
@@ -674,6 +739,7 @@ impl TopicList for UniswapV3Pool {
             IAlgebraIntegralPool::Fee::SIGNATURE_HASH,
             IAlgebraIntegralPool::PluginConfig::SIGNATURE_HASH,
             IAlgebraIntegralPool::Plugin::SIGNATURE_HASH,
+            IAlgebraIntegralPool::SwapFee::SIGNATURE_HASH,
         ]
     }
 
@@ -1089,6 +1155,7 @@ mod tests {
         pool.fee_source = FeeSource::ReadFee;
         let json = serde_json::to_value(&pool).unwrap();
         assert!(json.get("fee_source").is_none());
+        assert!(json.get("swap_fee_misses").is_none());
         let restored: UniswapV3Pool = serde_json::from_value(json).unwrap();
         assert_eq!(restored.fee_source, FeeSource::Unknown);
     }
@@ -1105,6 +1172,28 @@ mod tests {
             inner: alloy::primitives::Log {
                 address: address!("0x0000000000000000000000000000000000000001"),
                 data: LogData::new_unchecked(vec![topic], word.to_vec().into()),
+            },
+            ..Default::default()
+        }
+    }
+
+    const SWAP_FEE_TOPIC: alloy::primitives::B256 =
+        b256!("0x9443903d84c9719611bd4bba871daaf18a3950d00d5d78b1a2fa701f76df54ff");
+
+    fn swap_fee_log(override_fee: u32, plugin_fee: u32) -> Log {
+        let sender = address!("0x0000000000000000000000000000000000000009");
+        let mut data = uint_word(override_fee as u128).to_vec();
+        data.extend_from_slice(&uint_word(plugin_fee as u128));
+        Log {
+            inner: alloy::primitives::Log {
+                address: address!("0x0000000000000000000000000000000000000001"),
+                data: LogData::new_unchecked(
+                    vec![
+                        SWAP_FEE_TOPIC,
+                        alloy::primitives::B256::left_padding_from(sender.as_slice()),
+                    ],
+                    data.into(),
+                ),
             },
             ..Default::default()
         }
@@ -1150,6 +1239,67 @@ mod tests {
             pool.apply_log(&one_word_log(topic, uint_word(215))).unwrap();
             assert_eq!(pool.fee_source, FeeSource::Unknown);
         }
+    }
+
+    #[test]
+    fn swap_fee_topic_matches_deployed_contract() {
+        assert_eq!(IAlgebraIntegralPool::SwapFee::SIGNATURE_HASH, SWAP_FEE_TOPIC);
+    }
+
+    /// Flare 0x1922… (SparkDEX FTSO-PMM): `fee()` reads the 1000 floor while
+    /// swaps in the arbitrage direction paid up to 7400.
+    #[test]
+    fn a_pool_whose_swaps_keep_paying_more_stops_quoting() {
+        let mut pool = pool_with_type(V3PoolType::AlgebraV3);
+        pool.set_fee(U24::from(1000u32));
+        for paid in [2600u32, 1, 4600, 2400] {
+            pool.apply_log(&swap_fee_log(paid, 0)).unwrap();
+        }
+        assert!(pool.fee_unpredictable());
+        assert!(pool
+            .calculate_exact_input(&TOKEN0, U256::from(1_000_000u64))
+            .is_err());
+    }
+
+    /// A DEX's own backrunner at 1 ppm, discounts, and swaps at the pool fee
+    /// paid no more than the fee held: never a miss.
+    #[test]
+    fn swaps_paying_the_fee_or_less_do_not_count() {
+        let mut pool = pool_with_type(V3PoolType::AlgebraV3);
+        pool.set_fee(U24::from(100u32));
+        for (override_fee, plugin_fee) in [(1u32, 0u32), (100, 0), (0, 0), (60, 0), (1, 0)] {
+            pool.apply_log(&swap_fee_log(override_fee, plugin_fee)).unwrap();
+        }
+        assert!(!pool.fee_unpredictable());
+        assert!(pool
+            .calculate_exact_input(&TOKEN0, U256::from(1_000_000u64))
+            .is_ok());
+    }
+
+    /// A plugin fee is charged on top of the pool fee.
+    #[test]
+    fn a_plugin_fee_on_top_counts_as_paying_more() {
+        let mut pool = pool_with_type(V3PoolType::AlgebraV3);
+        pool.set_fee(U24::from(100u32));
+        for _ in 0..3 {
+            pool.apply_log(&swap_fee_log(0, 50)).unwrap();
+        }
+        assert!(pool.fee_unpredictable());
+    }
+
+    /// Quoting resumes once the misses age out of the window.
+    #[test]
+    fn quoting_resumes_when_misses_age_out() {
+        let mut pool = pool_with_type(V3PoolType::AlgebraV3);
+        pool.set_fee(U24::from(1000u32));
+        for _ in 0..3 {
+            pool.apply_log(&swap_fee_log(2000, 0)).unwrap();
+        }
+        assert!(pool.fee_unpredictable());
+        for _ in 0..8 {
+            pool.apply_log(&swap_fee_log(1000, 0)).unwrap();
+        }
+        assert!(!pool.fee_unpredictable(), "2 misses left in the last 10 swaps");
     }
 
     #[test]
