@@ -573,7 +573,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                         &self.provider,
                         &self.pool_registry,
                         &mut fetched_events,
-                        &HashMap::new(),
+                        &self.event_queue.known_block_times(),
                     )
                     .await?;
 
@@ -647,7 +647,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             &self.provider,
             &self.pool_registry,
             &mut events,
-            &HashMap::new(),
+            &self.event_queue.known_block_times(),
         )
         .await?;
         let max_ws_block = events.iter().filter_map(|e| e.block_number).max();
@@ -692,11 +692,14 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 events.len()
             );
 
+            // The listeners' `newHeads` subscriptions have usually recorded
+            // these blocks' times already; a block that is not there yet (its
+            // logs beat its header, or a reconnect gap) is fetched as before.
             enrich_if_lb_pools_present(
                 &self.provider,
                 &self.pool_registry,
                 &mut events,
-                &HashMap::new(),
+                &self.event_queue.known_block_times(),
             )
             .await?;
 

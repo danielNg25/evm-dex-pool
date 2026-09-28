@@ -138,6 +138,25 @@ impl WebsocketListener {
             ws_url
         );
 
+        // Block headers on the same connection: a subscribed log carries no
+        // block time, and LB pools date their variable-fee decay from it. With
+        // each header's time recorded as the block arrives, the timestamp
+        // enrichment finds it instead of fetching the header. Without the
+        // subscription the enrichment still fetches, so logs keep flowing.
+        let mut heads = match ws_provider.subscribe_blocks().await {
+            Ok(subscription) => {
+                info!("[Chain {}] Subscribed to new heads at {}", chain_id, ws_url);
+                subscription.into_stream().boxed()
+            }
+            Err(e) => {
+                warn!(
+                    "[Chain {}] New-heads subscription failed at {}; LB log times will be fetched: {}",
+                    chain_id, ws_url, e
+                );
+                futures_util::stream::pending().boxed()
+            }
+        };
+
         // Start pinging and stall detection task
         let provider_clone = ws_provider.clone();
         let is_running = Arc::new(RwLock::new(true));
@@ -189,23 +208,49 @@ impl WebsocketListener {
             *ping_running.write().await = false;
         });
 
-        // Process WebSocket events
+        // Process WebSocket events. Either subscription ending ends the
+        // connection, and the caller reconnects. So does the heartbeat task
+        // giving up (stall or failed pings): it clears `is_running`, which the
+        // check below sees, since a dead socket need not end its stream.
         let mut stream = subscription.into_stream();
-        while let Some(event_log) = stream.next().await {
-            debug!(
-                "[Chain {}] Received log: address={}, topics={:?}",
-                chain_id,
-                event_log.address(),
-                event_log.topics()
-            );
+        let mut heartbeat_check = interval(Duration::from_secs(5));
+        heartbeat_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = heartbeat_check.tick() => {
+                    if !*is_running.read().await {
+                        warn!(
+                            "[Chain {}] Heartbeat gave up on {}; reconnecting",
+                            chain_id, ws_url
+                        );
+                        break;
+                    }
+                }
+                event_log = stream.next() => {
+                    let Some(event_log) = event_log else { break };
+                    debug!(
+                        "[Chain {}] Received log: address={}, topics={:?}",
+                        chain_id,
+                        event_log.address(),
+                        event_log.topics()
+                    );
 
-            // Update last event time
-            *last_event_time.write().await = Instant::now();
+                    // Update last event time
+                    *last_event_time.write().await = Instant::now();
 
-            if let Err(e) = event_sender.send(event_log).await {
-                // Channel closed is expected during shutdown (EventQueue receiver
-                // dropped when the updater exits). Log at debug, not error.
-                debug!("[Chain {}] Failed to send event to queue: {}", chain_id, e);
+                    if let Err(e) = event_sender.send(event_log).await {
+                        // Channel closed is expected during shutdown (EventQueue receiver
+                        // dropped when the updater exits). Log at debug, not error.
+                        debug!("[Chain {}] Failed to send event to queue: {}", chain_id, e);
+                    }
+                }
+                header = heads.next() => {
+                    let Some(header) = header else { break };
+                    event_sender.record_block_time(header.number, header.timestamp);
+                    // A header proves the connection is live, so a quiet pool
+                    // set no longer trips the 180 s stall reconnect.
+                    *last_event_time.write().await = Instant::now();
+                }
             }
         }
 

@@ -3,7 +3,7 @@ use alloy::primitives::{Address, FixedBytes};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use anyhow::Result;
-use log::warn;
+use log::{debug, warn};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,6 +105,13 @@ pub async fn enrich_log_timestamps_where<P: Provider + Send + Sync>(
     let to_fetch = blocks_needing_timestamps(logs, wanted, known);
     let mut times = known.clone();
     if !to_fetch.is_empty() {
+        // Counted in a run's log to see how often no known time covered a
+        // block: near zero with a websocket `newHeads` feed or the poll.
+        debug!(
+            "enrich_log_timestamps: fetching {} block header(s): {:?}",
+            to_fetch.len(),
+            to_fetch
+        );
         times.extend(fetch_block_timestamps(provider, &to_fetch).await);
     }
     fill_block_timestamps(logs, wanted, &times);

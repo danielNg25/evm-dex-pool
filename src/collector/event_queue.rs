@@ -2,10 +2,13 @@ use alloy::primitives::TxHash;
 use alloy::rpc::types::Log;
 use anyhow::{anyhow, Result};
 use log::{debug, info};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
+
+/// Block times kept from the websocket's `newHeads` subscription.
+const BLOCK_TIMES_KEPT: u64 = 64;
 
 // Unique key for a Log event (transaction_hash and log_index)
 #[derive(Debug)]
@@ -20,6 +23,11 @@ pub struct EventSender {
     inner: mpsc::Sender<Log>,
     recent_events: Arc<Mutex<HashMap<(TxHash, u64), Log>>>,
     event_order: Arc<Mutex<VecDeque<(TxHash, u64)>>>,
+    /// Block number -> timestamp, from the listeners' `newHeads`
+    /// subscriptions. A subscribed log carries no block time, and LB pools
+    /// need it for their variable-fee clock; with the header already here, the
+    /// LB timestamp enrichment needs no request of its own.
+    block_times: std::sync::Mutex<BTreeMap<u64, u64>>,
     max_events: usize,
     chain_id: u64,
 }
@@ -32,6 +40,7 @@ impl EventQueue {
             inner: sender,
             recent_events: Arc::new(Mutex::new(HashMap::with_capacity(max_events))),
             event_order: Arc::new(Mutex::new(VecDeque::with_capacity(max_events))),
+            block_times: std::sync::Mutex::new(BTreeMap::new()),
             max_events,
             chain_id,
         });
@@ -124,9 +133,26 @@ impl EventQueue {
             .await
             .contains_key(&(transaction_hash, log_index))
     }
+
+    /// Block times the listeners have seen, for the LB timestamp enrichment.
+    pub fn known_block_times(&self) -> HashMap<u64, u64> {
+        let times = self.sender.block_times.lock().unwrap();
+        times.iter().map(|(&n, &t)| (n, t)).collect()
+    }
 }
 
 impl EventSender {
+    /// Record a block's timestamp from a `newHeads` header, keeping only the
+    /// newest `BLOCK_TIMES_KEPT` blocks.
+    pub fn record_block_time(&self, number: u64, timestamp: u64) {
+        let mut times = self.block_times.lock().unwrap();
+        times.insert(number, timestamp);
+        if let Some(&newest) = times.keys().next_back() {
+            let oldest_kept = (newest + 1).saturating_sub(BLOCK_TIMES_KEPT);
+            *times = times.split_off(&oldest_kept);
+        }
+    }
+
     /// Sends an event, checking for duplicates and updating the recent events HashMap
     pub async fn send(&self, event: Log) -> Result<()> {
         let transaction_hash = event
@@ -185,4 +211,47 @@ pub fn create_event_queue(
     let queue = EventQueue::new(buffer_size, max_events, chain_id);
     let sender = queue.get_sender();
     (queue, sender)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A block time a listener records is what the queue's reader sees.
+    #[test]
+    fn a_recorded_block_time_is_known_to_the_queue() {
+        let (queue, sender) = create_event_queue(8, 8, 43114);
+        sender.record_block_time(100, 1_790_000_000);
+        assert_eq!(
+            queue.known_block_times(),
+            HashMap::from([(100u64, 1_790_000_000u64)])
+        );
+    }
+
+    /// Only the newest `BLOCK_TIMES_KEPT` blocks are kept, and a header for a
+    /// block older than that window is not kept at all.
+    #[test]
+    fn block_times_are_kept_for_the_newest_blocks_only() {
+        let (queue, sender) = create_event_queue(8, 8, 43114);
+        for n in 1..=100u64 {
+            sender.record_block_time(n, 1_790_000_000 + n);
+        }
+        let known = queue.known_block_times();
+        assert_eq!(known.len(), BLOCK_TIMES_KEPT as usize);
+        assert!(!known.contains_key(&(100 - BLOCK_TIMES_KEPT)));
+        assert!(known.contains_key(&(101 - BLOCK_TIMES_KEPT)));
+
+        sender.record_block_time(10, 1_790_000_010);
+        assert!(!queue.known_block_times().contains_key(&10));
+    }
+
+    /// Headers can arrive out of order across listeners; an older block
+    /// inside the window is still kept.
+    #[test]
+    fn an_older_header_inside_the_window_is_kept() {
+        let (queue, sender) = create_event_queue(8, 8, 43114);
+        sender.record_block_time(100, 1_790_000_100);
+        sender.record_block_time(99, 1_790_000_099);
+        assert_eq!(queue.known_block_times().len(), 2);
+    }
 }

@@ -115,6 +115,19 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   the current tick: without this guard that fallback quoted a same-tick step
   forever instead of failing.
 
+- **Websocket mode dates LB logs from a `newHeads` subscription.** A
+  subscribed log carries no block time, so every block with an LB log cost a
+  header fetch before its batch went on. Each listener now also subscribes to
+  new heads on the same connection and records every block's time in the
+  event queue (`EventSender::record_block_time`,
+  `EventQueue::known_block_times`, newest 64 blocks); the websocket source
+  hands those to the enrichment, which fetches only a block whose header has
+  not arrived. A provider that refuses the subscription leaves the fetch path
+  as before. Headers also count as activity for the 180 s stall check, and
+  the listen loop now reconnects when the heartbeat task gives up -- before,
+  "forcing reconnect" only ended the heartbeat, and a dead socket whose
+  stream never ended hung without reconnecting.
+
 ### Notes
 
 - `FeeAdjustment` is deliberately absent from `profitable_topics()`. A fee
