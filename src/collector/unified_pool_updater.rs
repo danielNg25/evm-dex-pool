@@ -160,11 +160,22 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
                     processed_through_block,
                 }) => {
                     let event_count = events.len();
-                    // Taken before `events` is consumed by the processing below.
-                    let fee_candidates = self
-                        .fee_reader
-                        .as_ref()
-                        .map(|_| fee_read_candidates(&events, &self.pool_registry));
+                    // Taken before `events` is consumed by the processing
+                    // below. Not computed for `Pending`: those events only
+                    // touch cloned, speculative pools
+                    // (`process_pending_events`), so nothing in the registry
+                    // could have changed for a reconfiguration or a
+                    // dynamic-fee swap to react to, and queuing it anyway
+                    // would double the read rate under the default
+                    // `use_pending_blocks = true` -- once here, again for the
+                    // confirmed batch covering the same block moments later.
+                    let fee_candidates = if matches!(processing_mode, ProcessingMode::Pending) {
+                        None
+                    } else {
+                        self.fee_reader
+                            .as_ref()
+                            .map(|_| fee_read_candidates(&events, &self.pool_registry))
+                    };
                     debug!(
                         "[Chain {}] UnifiedPoolUpdater: received batch with {} events",
                         chain_id, event_count
@@ -194,18 +205,21 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
                         }
                     }
 
-                    if let (Some(reader), Some(candidates)) =
-                        (self.fee_reader.as_mut(), fee_candidates)
-                    {
-                        reader.after_batch(candidates);
-                    }
-
                     if let Some(block) = processed_through_block {
                         self.pool_registry.set_last_processed_block(block);
                         info!(
                             "[Chain {}] Successfully processed through block {} with {} events",
                             chain_id, block, event_count
                         );
+                    }
+
+                    // After `set_last_processed_block` above, so the read
+                    // (which reads at that block) holds by construction
+                    // rather than by scheduling luck.
+                    if let (Some(reader), Some(candidates)) =
+                        (self.fee_reader.as_mut(), fee_candidates)
+                    {
+                        reader.after_batch(candidates);
                     }
                     debug!(
                         "[Chain {}] UnifiedPoolUpdater: batch processing complete",

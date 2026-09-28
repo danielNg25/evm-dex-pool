@@ -602,6 +602,21 @@ impl EventApplicable for UniswapV3Pool {
             // what run 6's fork replay caught (5 stale-fee failures in 299).
             Some(&IRamsesCLPool::FeeAdjustment::SIGNATURE_HASH) => {
                 let ev: IRamsesCLPool::FeeAdjustment = log.log_decode()?.inner.data;
+                // A pool answering `currentFee()` prices swaps at that, not
+                // `fee()` (Avalanche 0x0021368B: currentFee() = 75, fee() =
+                // 50, both constant over run 8's 12 hours) -- but this event
+                // still fires alongside a real change, and applying `newFee`
+                // here would overwrite the value that actually matters until
+                // the next read. Leave it alone; the pool stays tracked, so
+                // the fee reader re-reads `currentFee()` once this batch's
+                // touch reaches it (this event is itself a touch).
+                if self.fee_source == FeeSource::ReadCurrentFee {
+                    debug!(
+                        "FeeAdjustment on pool {}: swaps pay currentFee(), not fee() -- left alone",
+                        self.address
+                    );
+                    return Ok(());
+                }
                 // `oldFee` should equal what we hold. If it does not, an earlier
                 // adjustment was missed and the pool was mispriced until now --
                 // worth surfacing, since nothing else would.
@@ -885,6 +900,20 @@ mod tests {
         let mut pool = pool_with_type(V3PoolType::RamsesCL); // holds 3000
         pool.apply_log(&real_fee_adjustment_log()).unwrap(); // event says old was 800
         assert_eq!(pool.fee, U24::from(5500u32));
+    }
+
+    /// A pool answering `currentFee()` prices swaps at that, not `fee()` --
+    /// applying this event's `newFee` would overwrite the value that
+    /// actually matters until the fee reader's next read. It must also not
+    /// warn about a mismatched `oldFee`: that field tracks `fee()`, which for
+    /// such a pool disagrees with the held `currentFee()` value routinely.
+    #[test]
+    fn fee_adjustment_leaves_a_current_fee_pool_alone() {
+        let mut pool = pool_with_type(V3PoolType::RamsesCL);
+        pool.fee_source = FeeSource::ReadCurrentFee;
+        pool.set_fee(U24::from(75u32));
+        pool.apply_log(&real_fee_adjustment_log()).unwrap();
+        assert_eq!(pool.fee, U24::from(75u32));
     }
 
     /// A fee change is state, not an opportunity: it must be fetched so it is

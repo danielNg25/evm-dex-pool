@@ -66,6 +66,18 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   spawned, never awaited. `refetch_dynamic_fees` is removed; the
   `refetch_algebra_fee` config flag now switches the reader.
 
+  The 30 s pass also rescans the whole registry for pools reset outside the
+  updater's batch loop -- a catch-up or websocket-bootstrap path applying a
+  `Plugin`/`PluginConfig` log directly never reaches the tracked-address
+  queue otherwise. A queued Algebra pool found still classified `Events` is
+  re-classified rather than skipped, closing a race where an in-flight
+  read's stale write-back could otherwise leave a `DYNAMIC_FEE` pool
+  untracked for good. The read itself is time-limited and clears `busy` on
+  any exit, so a hung RPC call cannot stick the reader idle. Pending
+  batches -- speculative, cloned pools -- no longer queue a read.
+  `FeeAdjustment` now leaves a pool answering `currentFee()` alone rather
+  than overwriting it with `fee()`'s value.
+
 - **Ramses V3 `Mint` is applied.** Ramses-family pools emit Uniswap V3's
   `Mint` with an NFT position `index` added (topic `0xd78218c0…`), which was
   never fetched while their unchanged `Burn` was applied. Run 8 logged 588
