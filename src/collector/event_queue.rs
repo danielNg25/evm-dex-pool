@@ -146,10 +146,15 @@ impl EventSender {
     /// newest `BLOCK_TIMES_KEPT` blocks.
     pub fn record_block_time(&self, number: u64, timestamp: u64) {
         let mut times = self.block_times.lock().unwrap();
+        // A re-announced number (a reorg) overwrites: the newest header wins.
         times.insert(number, timestamp);
-        if let Some(&newest) = times.keys().next_back() {
-            let oldest_kept = (newest + 1).saturating_sub(BLOCK_TIMES_KEPT);
-            *times = times.split_off(&oldest_kept);
+        let newest = *times.keys().next_back().expect("just inserted");
+        let oldest_kept = (newest + 1).saturating_sub(BLOCK_TIMES_KEPT);
+        while times
+            .first_key_value()
+            .is_some_and(|(&n, _)| n < oldest_kept)
+        {
+            times.pop_first();
         }
     }
 
@@ -243,6 +248,15 @@ mod tests {
 
         sender.record_block_time(10, 1_790_000_010);
         assert!(!queue.known_block_times().contains_key(&10));
+    }
+
+    /// A block number announced again (a reorg) takes the newer header's time.
+    #[test]
+    fn a_reannounced_block_takes_the_newer_time() {
+        let (queue, sender) = create_event_queue(8, 8, 43114);
+        sender.record_block_time(100, 1_790_000_100);
+        sender.record_block_time(100, 1_790_000_101);
+        assert_eq!(queue.known_block_times()[&100], 1_790_000_101);
     }
 
     /// Headers can arrive out of order across listeners; an older block

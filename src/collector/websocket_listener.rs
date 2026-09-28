@@ -143,21 +143,30 @@ impl WebsocketListener {
         // each header's time recorded as the block arrives, the timestamp
         // enrichment finds it instead of fetching the header. Without the
         // subscription the enrichment still fetches, so logs keep flowing.
-        let mut heads = match ws_provider.subscribe_blocks().await {
+        let (mut heads, have_heads) = match ws_provider.subscribe_blocks().await {
             Ok(subscription) => {
                 info!("[Chain {}] Subscribed to new heads at {}", chain_id, ws_url);
-                subscription.into_stream().boxed()
+                (subscription.into_stream().boxed(), true)
             }
             Err(e) => {
                 warn!(
                     "[Chain {}] New-heads subscription failed at {}; LB log times will be fetched: {}",
                     chain_id, ws_url, e
                 );
-                futures_util::stream::pending().boxed()
+                (futures_util::stream::pending().boxed(), false)
             }
         };
 
-        // Start pinging and stall detection task
+        // `last_event_time` outlives connections; left stale, the new
+        // heartbeat's first tick would read the previous connection's stall
+        // and tear this one down before anything could arrive.
+        *last_event_time.write().await = Instant::now();
+
+        // Start pinging and stall detection task. The stall check needs a
+        // steady signal: with new heads a live connection hears something
+        // every block, so silence means a dead socket. Without them a quiet
+        // pool set is silent too, and a reconnect loses the logs emitted
+        // while it happens, so only failed pings reconnect then.
         let provider_clone = ws_provider.clone();
         let is_running = Arc::new(RwLock::new(true));
         let ping_running = Arc::clone(&is_running);
@@ -172,7 +181,9 @@ impl WebsocketListener {
             while *ping_running.read().await {
                 interval.tick().await;
 
-                if last_event_time_clone.read().await.elapsed() > Duration::from_secs(180) {
+                if have_heads
+                    && last_event_time_clone.read().await.elapsed() > Duration::from_secs(180)
+                {
                     warn!(
                         "[Chain {}] No events received for 180 seconds at {}; forcing reconnect",
                         chain_id, ws_url_clone
@@ -248,7 +259,9 @@ impl WebsocketListener {
                     let Some(header) = header else { break };
                     event_sender.record_block_time(header.number, header.timestamp);
                     // A header proves the connection is live, so a quiet pool
-                    // set no longer trips the 180 s stall reconnect.
+                    // set no longer trips the 180 s stall reconnect. The
+                    // trade-off: a provider that silently drops only the log
+                    // subscription while heads keep flowing goes unnoticed.
                     *last_event_time.write().await = Instant::now();
                 }
             }

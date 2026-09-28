@@ -123,10 +123,12 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   `EventQueue::known_block_times`, newest 64 blocks); the websocket source
   hands those to the enrichment, which fetches only a block whose header has
   not arrived. A provider that refuses the subscription leaves the fetch path
-  as before. Headers also count as activity for the 180 s stall check, and
-  the listen loop now reconnects when the heartbeat task gives up -- before,
-  "forcing reconnect" only ended the heartbeat, and a dead socket whose
-  stream never ended hung without reconnecting.
+  as before. Headers also count as activity for the 180 s stall check (which
+  runs only while heads arrive; without them failed pings alone reconnect),
+  and the listen loop now reconnects when the heartbeat task gives up --
+  before, "forcing reconnect" only ended the heartbeat, and a dead socket
+  whose stream never ended hung without reconnecting. Known gap, unchanged:
+  logs emitted while a connection is re-established are not backfilled.
 
 ### Notes
 
