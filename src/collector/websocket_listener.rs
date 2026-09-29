@@ -4,11 +4,22 @@ use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Filter;
 use anyhow::{Context, Result};
-use futures_util::stream::StreamExt;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::RwLock;
 use tokio::time::{interval, sleep, Duration, Instant, MissedTickBehavior};
+
+/// Messages the log subscription may buffer before it drops. alloy's default
+/// is 16, and a block carrying more logs for our pools than that arrives as
+/// one burst: run 10 (2026-09-28, Avalanche) silently lost 1.3% of its logs
+/// that way -- 44 of the 49 blocks with 20+ pool logs lost some, 5 of 8798
+/// blocks with under 10 did -- including two Mints whose later Burns then
+/// failed on "uninitialized tick".
+const LOG_CHANNEL_SIZE: usize = 8192;
+
+/// Buffered headers. A dropped header only costs a header fetch later.
+const HEAD_CHANNEL_SIZE: usize = 256;
 
 pub struct WebsocketListener {
     ws_url: String,
@@ -126,8 +137,9 @@ impl WebsocketListener {
             .address(pool_addresses.to_vec())
             .event_signature(topics);
 
-        let subscription = ws_provider
+        let mut subscription = ws_provider
             .subscribe_logs(&filter)
+            .channel_size(LOG_CHANNEL_SIZE)
             .await
             .context("Failed to subscribe to logs")?;
 
@@ -143,19 +155,24 @@ impl WebsocketListener {
         // each header's time recorded as the block arrives, the timestamp
         // enrichment finds it instead of fetching the header. Without the
         // subscription the enrichment still fetches, so logs keep flowing.
-        let (mut heads, have_heads) = match ws_provider.subscribe_blocks().await {
+        let mut heads = match ws_provider
+            .subscribe_blocks()
+            .channel_size(HEAD_CHANNEL_SIZE)
+            .await
+        {
             Ok(subscription) => {
                 info!("[Chain {}] Subscribed to new heads at {}", chain_id, ws_url);
-                (subscription.into_stream().boxed(), true)
+                Some(subscription)
             }
             Err(e) => {
                 warn!(
                     "[Chain {}] New-heads subscription failed at {}; LB log times will be fetched: {}",
                     chain_id, ws_url, e
                 );
-                (futures_util::stream::pending().boxed(), false)
+                None
             }
         };
+        let have_heads = heads.is_some();
 
         // `last_event_time` outlives connections; left stale, the new
         // heartbeat's first tick would read the previous connection's stall
@@ -235,7 +252,8 @@ impl WebsocketListener {
         // connection, and the caller reconnects. So does the heartbeat task
         // giving up (stall or failed pings): it clears `is_running`, which the
         // check below sees, since a dead socket need not end its stream.
-        let mut stream = subscription.into_stream();
+        // `recv()` rather than a stream: the stream adapters skip a lagged
+        // (overflowed) channel silently, and a dropped log must be loud.
         let mut heartbeat_check = interval(Duration::from_secs(5));
         heartbeat_check.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
@@ -249,8 +267,19 @@ impl WebsocketListener {
                         break;
                     }
                 }
-                event_log = stream.next() => {
-                    let Some(event_log) = event_log else { break };
+                event_log = subscription.recv() => {
+                    let event_log = match event_log {
+                        Ok(event_log) => event_log,
+                        Err(RecvError::Lagged(dropped)) => {
+                            error!(
+                                "[Chain {}] Log subscription at {} overflowed and dropped {} log(s); \
+                                 those pools' state may be stale",
+                                chain_id, ws_url, dropped
+                            );
+                            continue;
+                        }
+                        Err(RecvError::Closed) => break,
+                    };
                     debug!(
                         "[Chain {}] Received log: address={}, topics={:?}",
                         chain_id,
@@ -267,8 +296,18 @@ impl WebsocketListener {
                         debug!("[Chain {}] Failed to send event to queue: {}", chain_id, e);
                     }
                 }
-                header = heads.next() => {
-                    let Some(header) = header else { break };
+                header = async {
+                    match heads.as_mut() {
+                        Some(heads) => heads.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let header = match header {
+                        Ok(header) => header,
+                        // A dropped header only means a header fetch later.
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    };
                     event_sender.record_block_time(header.number, header.timestamp);
                     // A header proves the connection is live, so a quiet pool
                     // set no longer trips the 180 s stall reconnect. The

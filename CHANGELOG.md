@@ -130,6 +130,14 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   whose stream never ended hung without reconnecting. Known gap, unchanged:
   logs emitted while a connection is re-established are not backfilled.
 
+- **Websocket subscriptions no longer drop logs silently.** alloy buffers 16
+  subscription messages by default and skips an overflow without a trace; a
+  block carrying more logs for the registered pools than that arrives as one
+  burst, and run 10 (Avalanche, 12 h) lost 1.3% of its logs that way,
+  including two Mints whose Burns then failed on "uninitialized tick". The
+  log subscription now buffers 8192 messages (new heads: 256), and an
+  overflow is logged at `error` with the number of logs dropped.
+
 ### Notes
 
 - `FeeAdjustment` is deliberately absent from `profitable_topics()`. A fee
