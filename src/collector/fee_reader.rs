@@ -51,7 +51,7 @@ use alloy::providers::{MulticallBuilder, Provider};
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use anyhow::Result;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -67,6 +67,15 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of calls bundled into one multicall.
 const CHUNK_SIZE: usize = 250;
+
+/// Attempts at one read, and the pause between them. A read is made at the
+/// block the collector just processed, which the RPC node may not have
+/// accepted yet -- "block not found: not accepted yet" failed 147 of run 11's
+/// 965 reads (Avalanche, websocket mode, 2026-09-29). A node is usually a
+/// moment behind, so the read is repeated at the same block rather than
+/// dropped until the next pass.
+const READ_ATTEMPTS: u32 = 3;
+const READ_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 /// The tracked pools a batch touched, plus any pool whose plugin changed.
 /// A reconfigured pool is tracked from here on even if its fee was
@@ -359,11 +368,29 @@ pub async fn read_fees<P: Provider + Send + Sync>(
     let block = BlockId::Number(BlockNumberOrTag::Number(
         registry.get_last_processed_block(),
     ));
-    let (fees, configs, current_fees) = tokio::try_join!(
-        read_fee_calls(provider, &want_fee, multicall_address, block),
-        read_plugin_configs(provider, &want_config, multicall_address, block),
-        read_current_fees(provider, &want_current_fee, multicall_address, block),
-    )?;
+    let mut attempt = 1;
+    let (fees, configs, current_fees) = loop {
+        match tokio::try_join!(
+            read_fee_calls(provider, &want_fee, multicall_address, block),
+            read_plugin_configs(provider, &want_config, multicall_address, block),
+            read_current_fees(provider, &want_current_fee, multicall_address, block),
+        ) {
+            Ok(read) => break read,
+            Err(e) if attempt < READ_ATTEMPTS => {
+                debug!(
+                    "[Chain {}] Fee reader: read at {} failed (attempt {}), retrying in {}ms: {}",
+                    chain_id,
+                    block,
+                    attempt,
+                    READ_RETRY_DELAY.as_millis(),
+                    e
+                );
+                attempt += 1;
+                tokio::time::sleep(READ_RETRY_DELAY).await;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     let (mut changed, mut classified) = (0usize, 0usize);
     for (i, address) in want_fee.iter().enumerate() {
