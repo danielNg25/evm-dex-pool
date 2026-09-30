@@ -70,6 +70,7 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             UpdaterMode::Websocket {
                 event_queue,
                 block_settle: config.ws_block_settle(),
+                fill_reconnect_gaps: config.fills_reconnect_gaps(),
             },
             cancel_rx,
             config.refetch_algebra_fee,

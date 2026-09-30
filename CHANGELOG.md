@@ -127,8 +127,8 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   runs only while heads arrive; without them failed pings alone reconnect),
   and the listen loop now reconnects when the heartbeat task gives up --
   before, "forcing reconnect" only ended the heartbeat, and a dead socket
-  whose stream never ended hung without reconnecting. Known gap, unchanged:
-  logs emitted while a connection is re-established are not backfilled.
+  whose stream never ended hung without reconnecting. Logs emitted while a
+  connection is re-established: see the reconnect entry below.
 
 - **Websocket subscriptions no longer drop logs silently.** alloy buffers 16
   subscription messages by default and skips an overflow without a trace; a
@@ -158,6 +158,36 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   handed on, since an older block's logs would land on a newer state -- and
   the processed cursor never moves back. Removed (reorged) logs are dropped.
 
+- **A single websocket feed's lost logs are fetched over RPC.** A new
+  subscription starts at the current block, so the logs emitted while a feed
+  reconnected were lost, and with them any Mint, Burn or LB bin change in
+  that window; so were the logs an overflowed subscription dropped. alloy's
+  pubsub service also reconnected and resubscribed by itself, silently: the
+  subscription carried on across the gap. The listener now refuses alloy's
+  reconnect (`ListenerConnect`), so every drop ends the subscription and goes
+  through the listener's own reconnect. After any subscription (the first
+  can start after bootstrap's catch-up ended) or an overflow, just before
+  forwarding the next log, it notes the gap between the last log it
+  forwarded and that one (`Gap`, `EventSender::note_gap`). With exactly one
+  websocket URL (`CollectorConfig::fills_reconnect_gaps`; with several, the
+  other feeds carry it) the websocket source fetches the gap with
+  `eth_getLogs` once the RPC node has passed the block that ended it (an
+  answer for a node's newest block can be short; it waits as long as that
+  takes, warning every 10 s, since a hole is worse than a stall), before
+  anything queued behind it goes on. The gap's logs go on in block order,
+  applied but not priced: the blocks up to the one that ended the gap are
+  over by then. Bootstrap fills the gaps whose closing log it drained and
+  leaves later ones to the source. The range excludes every log the feed
+  delivered, and each fetched log is claimed in the queue's duplicate
+  filter, so nothing lands twice. `UpdaterMode::Websocket` and
+  `WebsocketBlockSource::new` take the flag.
+
+- **A websocket log bootstrap already applied is not applied again.**
+  Bootstrap applies everything before the first queued log (or before the
+  latest block, with an empty queue) straight from RPC. A feed behind the
+  RPC node could still deliver some of it afterwards, applying its Mints,
+  Burns and LB bin changes twice; the source now drops such a log.
+
 ### Notes
 
 - `FeeAdjustment` is deliberately absent from `profitable_topics()`. A fee
@@ -174,6 +204,17 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   the deployed contract, fee applied, recovery from a missed earlier change,
   and fetched-but-not-a-trigger.
 - `registry::tests` now pins that `RamsesCL` is not tracked.
+- `block_source::tests::gap_fill` (mocked RPC): a gap is filled and handed
+  on in block order ahead of an already-settled log that ended it, unpriced
+  and once, with the next block priced; the fill waits for the RPC node to
+  pass the gap; a gap with no start reaches back to bootstrap's floor;
+  bootstrap fills a gap whose end it drained, costs nothing for an empty
+  one, and leaves one whose end it did not drain to `next_batch`; a log
+  below the floor is dropped; with several feeds nothing is fetched. Each
+  was checked to fail with its fix undone (fill after the hand-on, no wait,
+  bootstrap taking every gap, no floor drop, no empty-gap shortcut).
+  `websocket_listener::tests` pin when a gap opens and closes;
+  `event_queue` tests pin gap hand-over and claim/send deduplication.
 
 ## [1.7.1]
 

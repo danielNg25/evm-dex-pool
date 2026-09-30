@@ -48,6 +48,13 @@ impl CollectorConfig {
                 .unwrap_or(DEFAULT_WS_BLOCK_SETTLE_MS),
         )
     }
+
+    /// Websocket mode: whether the logs a feed misses while it reconnects are
+    /// fetched over RPC. Only with a single websocket URL; with several, the
+    /// others carry what one misses.
+    pub fn fills_reconnect_gaps(&self) -> bool {
+        self.websocket_urls.len() == 1
+    }
 }
 
 /// Configuration for batch pool fetching from RPC.

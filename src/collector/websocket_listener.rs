@@ -1,8 +1,11 @@
-use super::event_queue::EventSender;
+use super::block_source::{log_position, LogPosition};
+use super::event_queue::{EventSender, Gap};
 use crate::Topic;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use alloy::rpc::types::Filter;
+use alloy::pubsub::{ConnectionHandle, PubSubConnect};
+use alloy::rpc::types::{Filter, Log};
+use alloy::transports::{TransportErrorKind, TransportResult};
 use anyhow::{Context, Result};
 use log::{debug, error, info, warn};
 use std::sync::Arc;
@@ -20,6 +23,75 @@ const LOG_CHANNEL_SIZE: usize = 8192;
 
 /// Buffered headers. A dropped header only costs a header fetch later.
 const HEAD_CHANNEL_SIZE: usize = 256;
+
+/// Connects like [`WsConnect`] but never reconnects by itself. alloy's own
+/// reconnect resubscribes silently: the subscription carries on as if nothing
+/// happened, and the logs emitted while the socket was down are gone without
+/// a trace. Refused, the connection ends instead, and the listener reconnects
+/// itself and notes the gap.
+#[derive(Clone, Debug)]
+struct ListenerConnect(WsConnect);
+
+impl PubSubConnect for ListenerConnect {
+    fn is_local(&self) -> bool {
+        self.0.is_local()
+    }
+
+    async fn connect(&self) -> TransportResult<ConnectionHandle> {
+        self.0.connect().await
+    }
+
+    async fn try_reconnect(&self) -> TransportResult<ConnectionHandle> {
+        Err(TransportErrorKind::custom_str(
+            "the websocket listener reconnects itself",
+        ))
+    }
+}
+
+/// What a listener's feed has delivered, kept across its connections, and
+/// whether logs have gone missing since.
+#[derive(Default)]
+struct FeedProgress {
+    subscribed_before: bool,
+    last_forwarded: Option<LogPosition>,
+    /// Logs were lost, and the next one forwarded marks where the loss ends.
+    gap_open: bool,
+}
+
+impl FeedProgress {
+    /// A subscription is up. It starts at the current block, so logs before
+    /// it are lost: on a reconnect, those emitted while the feed was down; on
+    /// the first, any after the source's own catch-up ended (a gap the
+    /// source finds empty when that catch-up reached this feed's first log).
+    /// Returns whether this was a resubscription.
+    fn subscribed(&mut self) -> bool {
+        let resubscribed = self.subscribed_before;
+        self.subscribed_before = true;
+        self.gap_open = true;
+        resubscribed
+    }
+
+    /// The subscription overflowed and dropped logs.
+    fn lagged(&mut self) {
+        self.gap_open = true;
+    }
+
+    /// `log` is about to be forwarded: the gap it closes, if one is open.
+    fn forwarding(&mut self, log: &Log) -> Option<Gap> {
+        // A retraction says nothing about where the feed is.
+        if log.removed {
+            return None;
+        }
+        let position = log_position(log)?;
+        let gap = self.gap_open.then_some(Gap {
+            after: self.last_forwarded,
+            before: position,
+        });
+        self.gap_open = false;
+        self.last_forwarded = self.last_forwarded.max(Some(position));
+        gap
+    }
+}
 
 pub struct WebsocketListener {
     ws_url: String,
@@ -68,6 +140,7 @@ impl WebsocketListener {
         let chain_id = self.chain_id;
 
         tokio::spawn(async move {
+            let mut progress = FeedProgress::default();
             while *is_running.read().await {
                 match Self::connect_and_listen(
                     &ws_url,
@@ -76,6 +149,7 @@ impl WebsocketListener {
                     &last_event_time,
                     topics.clone(),
                     chain_id,
+                    &mut progress,
                 )
                 .await
                 {
@@ -122,10 +196,13 @@ impl WebsocketListener {
         last_event_time: &Arc<RwLock<Instant>>,
         topics: Vec<Topic>,
         chain_id: u64,
+        progress: &mut FeedProgress,
     ) -> Result<()> {
-        // Connect to the WebSocket using WsConnect (supports wss:// URLs)
+        // Connect to the WebSocket (supports wss:// URLs). One reconnect
+        // attempt, which `ListenerConnect` refuses, so a drop ends the
+        // service at once and the subscriptions below close.
         let ws_provider = ProviderBuilder::new()
-            .connect_ws(WsConnect::new(ws_url))
+            .connect_pubsub_with(ListenerConnect(WsConnect::new(ws_url).with_max_retries(1)))
             .await
             .context("Failed to connect to WebSocket")?;
 
@@ -149,6 +226,13 @@ impl WebsocketListener {
             pool_addresses.len(),
             ws_url
         );
+
+        if progress.subscribed() {
+            info!(
+                "[Chain {}] Resubscribed at {}; the logs missed after {:?} end at the next to arrive",
+                chain_id, ws_url, progress.last_forwarded
+            );
+        }
 
         // Block headers on the same connection: a subscribed log carries no
         // block time, and LB pools date their variable-fee decay from it. With
@@ -276,6 +360,7 @@ impl WebsocketListener {
                                  those pools' state may be stale",
                                 chain_id, ws_url, dropped
                             );
+                            progress.lagged();
                             continue;
                         }
                         Err(RecvError::Closed) => break,
@@ -289,6 +374,16 @@ impl WebsocketListener {
 
                     // Update last event time
                     *last_event_time.write().await = Instant::now();
+
+                    // Noted before the log goes on, so the source sees the
+                    // gap no later than the log that ends it.
+                    if let Some(gap) = progress.forwarding(&event_log) {
+                        debug!(
+                            "[Chain {}] Logs lost at {} after {:?}, before {:?}",
+                            chain_id, ws_url, gap.after, gap.before
+                        );
+                        event_sender.note_gap(gap);
+                    }
 
                     if let Err(e) = event_sender.send(event_log).await {
                         // Channel closed is expected during shutdown (EventQueue receiver
@@ -325,5 +420,105 @@ impl WebsocketListener {
             chain_id, ws_url
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log_at(block: u64, tx_index: u64, log_index: u64) -> Log {
+        Log {
+            block_number: Some(block),
+            transaction_index: Some(tx_index),
+            log_index: Some(log_index),
+            ..Default::default()
+        }
+    }
+
+    /// Every subscription opens a gap, which the next log forwarded closes:
+    /// the gap ends before it. The first has no start.
+    #[test]
+    fn a_subscription_opens_a_gap_the_next_log_closes() {
+        let mut progress = FeedProgress::default();
+        assert!(!progress.subscribed());
+        assert_eq!(
+            progress.forwarding(&log_at(100, 0, 0)),
+            Some(Gap {
+                after: None,
+                before: (100, 0, 0)
+            })
+        );
+        assert_eq!(progress.forwarding(&log_at(100, 2, 1)), None);
+
+        assert!(progress.subscribed());
+        assert_eq!(
+            progress.forwarding(&log_at(103, 1, 0)),
+            Some(Gap {
+                after: Some((100, 2, 1)),
+                before: (103, 1, 0)
+            })
+        );
+        assert_eq!(progress.forwarding(&log_at(103, 2, 0)), None);
+    }
+
+    /// A feed that had forwarded nothing leaves the gap's start open.
+    #[test]
+    fn a_gap_before_any_log_has_no_start() {
+        let mut progress = FeedProgress::default();
+        progress.subscribed();
+        progress.subscribed();
+        assert_eq!(
+            progress.forwarding(&log_at(103, 0, 0)),
+            Some(Gap {
+                after: None,
+                before: (103, 0, 0)
+            })
+        );
+    }
+
+    /// An overflowed subscription is a gap like a reconnect.
+    #[test]
+    fn an_overflow_opens_a_gap() {
+        let mut progress = FeedProgress::default();
+        progress.subscribed();
+        progress.forwarding(&log_at(100, 0, 0));
+        progress.lagged();
+        assert_eq!(
+            progress.forwarding(&log_at(101, 4, 0)),
+            Some(Gap {
+                after: Some((100, 0, 0)),
+                before: (101, 4, 0)
+            })
+        );
+    }
+
+    /// A retraction, or a log without a chain position, neither closes a gap
+    /// nor moves the feed's place.
+    #[test]
+    fn a_removed_or_unplaced_log_leaves_the_gap_open() {
+        let mut progress = FeedProgress::default();
+        progress.subscribed();
+        progress.forwarding(&log_at(100, 0, 0));
+        progress.subscribed();
+
+        let removed = Log {
+            removed: true,
+            ..log_at(102, 0, 0)
+        };
+        assert_eq!(progress.forwarding(&removed), None);
+        let unplaced = Log {
+            log_index: None,
+            ..log_at(102, 1, 0)
+        };
+        assert_eq!(progress.forwarding(&unplaced), None);
+
+        assert_eq!(
+            progress.forwarding(&log_at(102, 3, 0)),
+            Some(Gap {
+                after: Some((100, 0, 0)),
+                before: (102, 3, 0)
+            })
+        );
     }
 }

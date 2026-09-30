@@ -399,6 +399,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
                     UpdaterMode::Websocket {
                         event_queue: new_event_queue,
                         block_settle: self.collector_config.ws_block_settle(),
+                        fill_reconnect_gaps: self.collector_config.fills_reconnect_gaps(),
                     },
                     fetch_block,
                 );
@@ -418,6 +419,7 @@ impl<P: Provider + Send + Sync + Clone + 'static> CollectorHandle<P> {
             UpdaterMode::Websocket {
                 event_queue: new_event_queue,
                 block_settle: self.collector_config.ws_block_settle(),
+                fill_reconnect_gaps: self.collector_config.fills_reconnect_gaps(),
             },
             fetch_block,
         );

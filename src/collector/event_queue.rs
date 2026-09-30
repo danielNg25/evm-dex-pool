@@ -7,8 +7,23 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 
+use super::block_source::LogPosition;
+
 /// Block times kept from the websocket's `newHeads` subscription.
 const BLOCK_TIMES_KEPT: u64 = 64;
+
+/// Chain positions a websocket feed lost -- to a reconnect, whose new
+/// subscription starts at the current block, or to an overflowed
+/// subscription: every log after `after` and before `before`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gap {
+    /// The last log the feed forwarded before the loss; `None` if it had
+    /// forwarded none, in which case the gap reaches back to wherever the
+    /// source's own catch-up ended.
+    pub after: Option<LogPosition>,
+    /// The first log the feed forwarded after the loss.
+    pub before: LogPosition,
+}
 
 // Unique key for a Log event (transaction_hash and log_index)
 #[derive(Debug)]
@@ -28,6 +43,8 @@ pub struct EventSender {
     /// need it for their variable-fee clock; with the header already here, the
     /// LB timestamp enrichment needs no request of its own.
     block_times: std::sync::Mutex<BTreeMap<u64, u64>>,
+    /// Gaps the listeners noted and the source has not taken yet.
+    gaps: std::sync::Mutex<Vec<Gap>>,
     max_events: usize,
     chain_id: u64,
 }
@@ -41,6 +58,7 @@ impl EventQueue {
             recent_events: Arc::new(Mutex::new(HashMap::with_capacity(max_events))),
             event_order: Arc::new(Mutex::new(VecDeque::with_capacity(max_events))),
             block_times: std::sync::Mutex::new(BTreeMap::new()),
+            gaps: std::sync::Mutex::new(Vec::new()),
             max_events,
             chain_id,
         });
@@ -139,6 +157,18 @@ impl EventQueue {
         let times = self.sender.block_times.lock().unwrap();
         times.iter().map(|(&n, &t)| (n, t)).collect()
     }
+
+    /// The gaps the listeners noted since the last call.
+    pub(crate) fn take_gaps(&self) -> Vec<Gap> {
+        std::mem::take(&mut *self.sender.gaps.lock().unwrap())
+    }
+
+    /// Record `log` as delivered by a path other than the listeners, such as
+    /// the reconnect gap fill. `false` if a listener sent it already; after
+    /// `true`, a listener sending it is skipped as a duplicate.
+    pub(crate) async fn claim(&self, log: &Log) -> Result<bool> {
+        self.sender.record(log).await
+    }
 }
 
 impl EventSender {
@@ -158,8 +188,28 @@ impl EventSender {
         }
     }
 
+    /// A listener lost logs. Called before it forwards `gap.before`, so
+    /// whoever drains the queue sees the gap no later than that log.
+    pub fn note_gap(&self, gap: Gap) {
+        self.gaps.lock().unwrap().push(gap);
+    }
+
     /// Sends an event, checking for duplicates and updating the recent events HashMap
     pub async fn send(&self, event: Log) -> Result<()> {
+        if !self.record(&event).await? {
+            return Ok(());
+        }
+
+        // Send to mpsc channel
+        self.inner
+            .send(event)
+            .await
+            .map_err(|e| anyhow!("Failed to send event: {}", e))?;
+        Ok(())
+    }
+
+    /// Enter `event` in the recent events; `false` if it is there already.
+    async fn record(&self, event: &Log) -> Result<bool> {
         let transaction_hash = event
             .transaction_hash
             .ok_or_else(|| anyhow!("Log missing transaction hash"))?;
@@ -178,7 +228,7 @@ impl EventSender {
                     "[Chain {}] Skipped duplicate event: tx={}, log_index={}",
                     self.chain_id, transaction_hash, log_index
                 );
-                return Ok(());
+                return Ok(false);
             }
 
             if recent_events.len() >= self.max_events {
@@ -198,13 +248,7 @@ impl EventSender {
                 self.chain_id, transaction_hash, log_index
             );
         } // Release locks before sending to reduce contention
-
-        // Send to mpsc channel
-        self.inner
-            .send(event)
-            .await
-            .map_err(|e| anyhow!("Failed to send event: {}", e))?;
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -267,5 +311,51 @@ mod tests {
         sender.record_block_time(100, 1_790_000_100);
         sender.record_block_time(99, 1_790_000_099);
         assert_eq!(queue.known_block_times().len(), 2);
+    }
+
+    fn log_with_hash(block: u64, log_index: u64) -> Log {
+        Log {
+            block_number: Some(block),
+            transaction_index: Some(0),
+            transaction_hash: Some(TxHash::with_last_byte(block as u8)),
+            log_index: Some(log_index),
+            ..Default::default()
+        }
+    }
+
+    /// Every gap noted before the source looks is handed over, in order, and
+    /// taking them clears them.
+    #[test]
+    fn noted_gaps_are_taken_once_each() {
+        let (queue, sender) = create_event_queue(8, 8, 43114);
+        assert!(queue.take_gaps().is_empty());
+
+        let first = Gap {
+            after: Some((100, 3, 7)),
+            before: (103, 0, 0),
+        };
+        let second = Gap {
+            after: Some((103, 0, 0)),
+            before: (103, 9, 2),
+        };
+        sender.note_gap(first);
+        sender.note_gap(second);
+        assert_eq!(queue.take_gaps(), vec![first, second]);
+        assert!(queue.take_gaps().is_empty());
+    }
+
+    /// A log claimed by the gap fill is not sent again by a listener, and one
+    /// a listener sent cannot be claimed.
+    #[tokio::test]
+    async fn a_claimed_log_and_a_sent_log_are_each_delivered_once() {
+        let (queue, sender) = create_event_queue(8, 8, 43114);
+
+        assert!(queue.claim(&log_with_hash(100, 0)).await.unwrap());
+        sender.send(log_with_hash(100, 0)).await.unwrap();
+        assert!(queue.get_all_available_events().await.is_empty());
+
+        sender.send(log_with_hash(101, 0)).await.unwrap();
+        assert!(!queue.claim(&log_with_hash(101, 0)).await.unwrap());
+        assert_eq!(queue.get_all_available_events().await.len(), 1);
     }
 }

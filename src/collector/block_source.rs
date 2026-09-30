@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::event_processor::fetch_events_with_retry;
+use super::event_queue::Gap;
 use super::{enrich_log_timestamps_where, fetch_events, EventQueue};
 
 /// Enrich the LB pools' logs in `events` with block timestamps, taking any
@@ -45,14 +46,14 @@ pub(crate) async fn enrich_if_lb_pools_present<P: Provider + Send + Sync>(
 /// Position of a log in chain order: `(block number, transaction index, log index)`.
 ///
 /// Ordered so that Rust's lexicographic tuple comparison *is* chain order.
-type LogPosition = (u64, u64, u64);
+pub(crate) type LogPosition = (u64, u64, u64);
 
 /// Chain-order position of `log`, or `None` when any of the three coordinates
 /// is missing.
 ///
 /// Every log returned by `eth_getLogs` over a numbered block range is mined and
 /// carries all three; `None` means a malformed or non-conforming RPC response.
-fn log_position(log: &Log) -> Option<LogPosition> {
+pub(crate) fn log_position(log: &Log) -> Option<LogPosition> {
     Some((log.block_number?, log.transaction_index?, log.log_index?))
 }
 
@@ -562,7 +563,19 @@ pub struct WebsocketBlockSource<P: Provider + Send + Sync + 'static> {
     chain_id: u64,
     block_settle: Duration,
     settler: BlockSettler,
+    /// See `CollectorConfig::fills_reconnect_gaps`.
+    fill_reconnect_gaps: bool,
+    /// Bootstrap applied every log before this position straight from RPC,
+    /// so a gap fill must not take them again.
+    fill_floor: LogPosition,
+    /// Blocks up to here were over before a gap fill fetched them: applied,
+    /// never priced.
+    apply_only_through: u64,
 }
+
+/// How often a gap fill still waiting for the RPC node to pass the gap says
+/// so.
+const GAP_FILL_WAIT_WARN_EVERY: Duration = Duration::from_secs(10);
 
 impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
     pub fn new(
@@ -572,6 +585,7 @@ impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
         topics: Arc<Vec<Topic>>,
         max_blocks_per_batch: u64,
         block_settle: Duration,
+        fill_reconnect_gaps: bool,
     ) -> Self {
         let chain_id = pool_registry.get_network_id();
         Self {
@@ -583,7 +597,112 @@ impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
             chain_id,
             block_settle,
             settler: BlockSettler::new(block_settle, 0),
+            fill_reconnect_gaps,
+            fill_floor: (0, 0, 0),
+            apply_only_through: 0,
         }
+    }
+
+    /// Fetch over RPC the logs a feed lost: every log after `gap.after` and
+    /// before `gap.before` that bootstrap has not applied. The feed delivered
+    /// none of them, so nothing here duplicates a log in hand; each is still
+    /// claimed in the queue, so a copy the feed sends after all is skipped.
+    async fn fetch_gap(&self, gap: Gap) -> Result<Vec<Log>> {
+        // Nothing lies between (a first subscription's gap, whose first log
+        // bootstrap took as its boundary): no wait, no fetch.
+        if gap.before <= self.fill_floor || gap.after.is_some_and(|after| gap.before <= after) {
+            return Ok(Vec::new());
+        }
+        let from = gap
+            .after
+            .map_or(self.fill_floor.0, |(block, _, _)| block)
+            .max(self.fill_floor.0);
+        let to = gap.before.0;
+        self.wait_until_rpc_passes(to).await;
+
+        let mut missed = Vec::new();
+        for (start, end) in catchup_batches(from.saturating_sub(1), self.max_blocks_per_batch, to) {
+            let fetched = fetch_events_with_retry(
+                &self.provider,
+                self.pool_registry.get_all_addresses(),
+                self.topics.to_vec(),
+                BlockNumberOrTag::Number(start),
+                BlockNumberOrTag::Number(end),
+                self.chain_id,
+            )
+            .await?;
+            for log in fetched {
+                let Some(position) = log_position(&log) else {
+                    continue;
+                };
+                let in_gap = gap.after.is_none_or(|after| position > after)
+                    && position < gap.before
+                    && position >= self.fill_floor;
+                if log.removed || !in_gap {
+                    continue;
+                }
+                match self.event_queue.claim(&log).await {
+                    Ok(true) => missed.push(log),
+                    Ok(false) => {}
+                    Err(e) => error!(
+                        "[Chain {}] Skipping gap log at {:?} for pool {}: {}",
+                        self.chain_id,
+                        position,
+                        log.address(),
+                        e
+                    ),
+                }
+            }
+        }
+        warn!(
+            "[Chain {}] Websocket feed lost logs after {:?}, before {:?}; fetched {} over RPC",
+            self.chain_id,
+            gap.after,
+            gap.before,
+            missed.len()
+        );
+        Ok(missed)
+    }
+
+    /// Wait for the RPC node's head to pass `block`. The websocket node can
+    /// be ahead of it, and an `eth_getLogs` for a node's newest block, or one
+    /// past its head, can answer short (4 of 84 blocks, 2026-09-30); once a
+    /// later block exists, `block` is whole. No deadline: fetching early
+    /// would leave a hole in pool state, which is worse than the wait, and the
+    /// other RPC reads here retry without end too.
+    async fn wait_until_rpc_passes(&self, block: u64) {
+        let started = Instant::now();
+        let mut next_warn = started + GAP_FILL_WAIT_WARN_EVERY;
+        loop {
+            let head = get_block_number_with_retry(&self.provider, self.chain_id).await;
+            if head > block {
+                return;
+            }
+            if Instant::now() >= next_warn {
+                warn!(
+                    "[Chain {}] Gap fill still waiting for the RPC head ({}) to pass block {} after {:?}",
+                    self.chain_id,
+                    head,
+                    block,
+                    started.elapsed()
+                );
+                next_warn += GAP_FILL_WAIT_WARN_EVERY;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Fill a gap the feed noted after bootstrap: its logs join the settler
+    /// like any arrival, so they go on in block order, ahead of the block
+    /// that ended the gap and together with that block's other logs.
+    async fn fill_gap(&mut self, gap: Gap) -> Result<()> {
+        let missed = self.fetch_gap(gap).await?;
+        self.settler.add(missed, Instant::now());
+        // The fetch waited for a block after the one that ended the gap, so
+        // that block and every one before it are over: pricing them now would
+        // chase opportunities already gone.
+        self.apply_only_through = self.apply_only_through.max(gap.before.0);
+        Ok(())
     }
 }
 
@@ -617,6 +736,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             .min()
             .unwrap_or((latest_block, 0, 0));
         let (first_event_block, first_event_index, first_event_log_index) = first_queued_position;
+        self.fill_floor = first_queued_position;
         info!(
             "[Chain {}] First event block: {}; tx index: {}; log index: {}",
             self.chain_id, first_event_block, first_event_index, first_event_log_index
@@ -739,6 +859,35 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             batch_index += 1;
         }
 
+        // A feed that lost logs while the queue filled (a reconnect or an
+        // overflow during the pool fetch before this) left a gap among the
+        // queued logs. Fill it, and apply everything in chain order, so the
+        // gap's Swaps and Syncs do not land on top of later ones.
+        //
+        // Only a gap whose closing log was drained above is filled here: the
+        // logs before it were queued ahead of it, so they are in hand too. A
+        // gap noted since then may have logs before it still queued; applied
+        // now, they would land after the gap's later blocks, so it is left
+        // for `next_batch`, which takes both in block order.
+        let gaps = self.event_queue.take_gaps();
+        if self.fill_reconnect_gaps && !gaps.is_empty() {
+            let drained: HashSet<LogPosition> = events.iter().filter_map(log_position).collect();
+            let sender = self.event_queue.get_sender();
+            let mut filled = false;
+            for gap in gaps {
+                if drained.contains(&gap.before) {
+                    events.extend(self.fetch_gap(gap).await?);
+                    filled = true;
+                } else {
+                    sender.note_gap(gap);
+                }
+            }
+            if filled {
+                events
+                    .sort_by_key(|log| log_position(log).unwrap_or((u64::MAX, u64::MAX, u64::MAX)));
+            }
+        }
+
         // Apply the initial websocket events that were buffered
         enrich_if_lb_pools_present(
             &self.provider,
@@ -779,9 +928,23 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
 
     async fn next_batch(&mut self) -> Result<EventBatch> {
         loop {
-            let arrived = self.event_queue.get_all_available_events().await;
+            let mut arrived = self.event_queue.get_all_available_events().await;
+            // Bootstrap applied everything before the floor straight from
+            // RPC; a feed behind the RPC node can still deliver some of it,
+            // and Mints, Burns and LB bin changes must not land twice.
+            let floor = self.fill_floor;
+            arrived.retain(|log| log_position(log).is_none_or(|position| position >= floor));
             if !arrived.is_empty() {
                 self.settler.add(arrived, Instant::now());
+            }
+
+            // A feed notes a gap before forwarding the log that ends it, so
+            // the gap is in view no later than that log, and filled before
+            // anything below can go on.
+            for gap in self.event_queue.take_gaps() {
+                if self.fill_reconnect_gaps {
+                    self.fill_gap(gap).await?;
+                }
             }
 
             // One whole block per batch, once it is complete (see
@@ -820,8 +983,11 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 // Logs of a block older than one already handed on land on a
                 // newer state (Swap and Sync set it outright), so they are
                 // applied but never priced; a late chunk of the newest block
-                // is still in chain order and is priced as usual.
-                let processing_mode = if settled.block < settled.processed_through {
+                // is still in chain order and is priced as usual. So are the
+                // blocks a gap fill fetched after they were over.
+                let processing_mode = if settled.block < settled.processed_through
+                    || settled.block <= self.apply_only_through
+                {
                     ProcessingMode::ApplyOnly
                 } else {
                     ProcessingMode::ConfirmedWithSwaps
@@ -1219,5 +1385,314 @@ mod tests {
             catchup_batches(u64::MAX - 2, u64::MAX, u64::MAX),
             vec![(u64::MAX - 1, u64::MAX)]
         );
+    }
+
+    // -- websocket gap fill -----------------------------------------------------
+
+    mod gap_fill {
+        use super::*;
+        use alloy::primitives::{B256, U256, U64};
+        use alloy::providers::mock::Asserter;
+        use alloy::providers::{ProviderBuilder, RootProvider};
+
+        /// A log with a transaction hash, as the queue's duplicate check needs.
+        fn mined(block: u64, tx_index: u64, log_index: u64) -> Log {
+            Log {
+                transaction_hash: Some(B256::from(U256::from(block * 1_000 + tx_index))),
+                ..log_at(block, tx_index, log_index)
+            }
+        }
+
+        fn positions(logs: &[Log]) -> Vec<LogPosition> {
+            logs.iter().filter_map(log_position).collect()
+        }
+
+        fn provider(asserter: &Asserter) -> Arc<RootProvider> {
+            Arc::new(ProviderBuilder::default().connect_mocked_client(asserter.clone()))
+        }
+
+        fn new_source(
+            asserter: &Asserter,
+            fill_reconnect_gaps: bool,
+        ) -> WebsocketBlockSource<RootProvider> {
+            WebsocketBlockSource::new(
+                provider(asserter),
+                EventQueue::new(64, 64, 43114),
+                Arc::new(PoolRegistry::new(43114)),
+                Arc::new(Vec::new()),
+                10,
+                ms(1),
+                fill_reconnect_gaps,
+            )
+        }
+
+        /// A source past bootstrap: `released_through` handed on, and
+        /// bootstrap's RPC catch-up applied everything before `floor`.
+        fn source(
+            asserter: &Asserter,
+            fill_reconnect_gaps: bool,
+            released_through: u64,
+            floor: LogPosition,
+        ) -> WebsocketBlockSource<RootProvider> {
+            let mut source = new_source(asserter, fill_reconnect_gaps);
+            source.settler = BlockSettler::new(ms(1), released_through);
+            source.fill_floor = floor;
+            source
+        }
+
+        async fn next(source: &mut WebsocketBlockSource<RootProvider>) -> EventBatch {
+            tokio::time::timeout(Duration::from_secs(5), source.next_batch())
+                .await
+                .expect("next_batch must not wait on an RPC it has no answer for")
+                .unwrap()
+        }
+
+        /// The feed forwarded (100,0,0), dropped, and came back with
+        /// (103,0,0), which has already settled by the time the source looks.
+        /// The rest of 100, then 101 and 102, still go on first; 103 goes on
+        /// without the (103,1,1) RPC also returned, which is the feed's to
+        /// deliver. All of them unpriced, since the fill waited for 104; 104
+        /// is priced. Nothing fetched arrives twice.
+        #[tokio::test]
+        async fn a_gap_is_filled_in_order_ahead_of_the_log_that_ended_it() {
+            let asserter = Asserter::new();
+            let mut source = source(&asserter, true, 100, (90, 0, 0));
+            let sender = source.event_queue.get_sender();
+            // Delivered before the drop, and handed on already.
+            assert!(source.event_queue.claim(&mined(100, 0, 0)).await.unwrap());
+            // The listener notes the gap, then forwards the log that ended it,
+            // which is filed and quiet for longer than the settle window.
+            sender.note_gap(Gap {
+                after: Some((100, 0, 0)),
+                before: (103, 0, 0),
+            });
+            assert!(source.event_queue.claim(&mined(103, 0, 0)).await.unwrap());
+            source
+                .settler
+                .add(vec![mined(103, 0, 0)], Instant::now() - ms(10));
+
+            asserter.push_success(&U64::from(104)); // eth_blockNumber: past 103
+            asserter.push_success(&vec![
+                mined(100, 0, 0),
+                mined(100, 1, 1),
+                mined(101, 0, 0),
+                mined(102, 5, 0),
+                mined(103, 0, 0),
+                mined(103, 1, 1),
+            ]); // eth_getLogs 100..=103
+
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(100, 1, 1)]);
+            assert!(matches!(batch.processing_mode, ProcessingMode::ApplyOnly));
+            assert_eq!(batch.processed_through_block, Some(100));
+
+            for (block, position) in [(101, (101, 0, 0)), (102, (102, 5, 0))] {
+                let batch = next(&mut source).await;
+                assert_eq!(positions(&batch.events), vec![position]);
+                assert!(matches!(batch.processing_mode, ProcessingMode::ApplyOnly));
+                assert_eq!(batch.processed_through_block, Some(block));
+            }
+
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(103, 0, 0)]);
+            assert!(matches!(batch.processing_mode, ProcessingMode::ApplyOnly));
+            assert_eq!(batch.processed_through_block, Some(103));
+
+            sender.send(mined(101, 0, 0)).await.unwrap();
+            assert!(source
+                .event_queue
+                .get_all_available_events()
+                .await
+                .is_empty());
+
+            sender.send(mined(104, 0, 0)).await.unwrap();
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(104, 0, 0)]);
+            assert!(matches!(
+                batch.processing_mode,
+                ProcessingMode::ConfirmedWithSwaps
+            ));
+        }
+
+        /// The RPC node is behind the websocket's: the fill waits until it
+        /// has passed the block that ended the gap. Fetched before, the answer
+        /// for that block could be short, or not there at all.
+        #[tokio::test]
+        async fn the_fill_waits_for_the_rpc_node_to_pass_the_gap() {
+            let asserter = Asserter::new();
+            let mut source = source(&asserter, true, 100, (90, 0, 0));
+            let sender = source.event_queue.get_sender();
+            sender.note_gap(Gap {
+                after: Some((100, 0, 0)),
+                before: (103, 0, 0),
+            });
+            sender.send(mined(103, 0, 0)).await.unwrap();
+
+            // Answers go out in call order. A fetch made at once would take
+            // the short answer; waiting, the fill reads the head, skips that
+            // answer as an unreadable head (retried), reads a head past 103,
+            // and only then fetches.
+            asserter.push_success(&U64::from(102));
+            asserter.push_success(&vec![mined(103, 0, 0)]);
+            asserter.push_success(&U64::from(104));
+            asserter.push_success(&vec![mined(101, 0, 0), mined(103, 0, 0)]);
+
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(101, 0, 0)]);
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(103, 0, 0)]);
+        }
+
+        /// A feed that had forwarded nothing: the gap reaches back to where
+        /// bootstrap's catch-up stopped, here short of block 100, whose logs
+        /// an empty-queue bootstrap leaves to the feed.
+        #[tokio::test]
+        async fn a_gap_with_no_start_reaches_back_to_the_bootstrap_floor() {
+            let asserter = Asserter::new();
+            let mut source = source(&asserter, true, 100, (100, 0, 0));
+            let sender = source.event_queue.get_sender();
+            sender.note_gap(Gap {
+                after: None,
+                before: (102, 0, 0),
+            });
+            sender.send(mined(102, 0, 0)).await.unwrap();
+
+            asserter.push_success(&U64::from(103));
+            asserter.push_success(&vec![mined(100, 0, 0), mined(101, 3, 0), mined(102, 0, 0)]);
+
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(100, 0, 0)]);
+            assert!(matches!(batch.processing_mode, ProcessingMode::ApplyOnly));
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(101, 3, 0)]);
+            assert!(matches!(batch.processing_mode, ProcessingMode::ApplyOnly));
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(102, 0, 0)]);
+            assert!(matches!(batch.processing_mode, ProcessingMode::ApplyOnly));
+        }
+
+        /// A gap among the logs queued before bootstrap (a reconnect during
+        /// `add_pools`' pool fetch) is filled there, and the log bootstrap's
+        /// own catch-up applied is not taken again. The first subscription's
+        /// gap ends at the first queued log, bootstrap's own boundary, so it
+        /// is empty and costs no request.
+        #[tokio::test]
+        async fn a_gap_noted_before_bootstrap_is_filled_by_it() {
+            let asserter = Asserter::new();
+            let mut source = new_source(&asserter, true);
+            source.pool_registry.set_last_processed_block(99);
+            let sender = source.event_queue.get_sender();
+            sender.note_gap(Gap {
+                after: None,
+                before: (100, 1, 0),
+            });
+            sender.send(mined(100, 1, 0)).await.unwrap();
+            sender.note_gap(Gap {
+                after: Some((100, 1, 0)),
+                before: (102, 0, 0),
+            });
+            sender.send(mined(102, 0, 0)).await.unwrap();
+
+            asserter.push_success(&U64::from(102)); // latest block
+            asserter.push_success(&vec![mined(100, 0, 0), mined(100, 1, 0)]); // catch-up 100..=100
+            asserter.push_success(&U64::from(103)); // the fill's head
+            asserter.push_success(&vec![
+                mined(100, 0, 0),
+                mined(100, 1, 0),
+                mined(101, 0, 0),
+                mined(102, 0, 0),
+            ]); // the gap, 100..=102
+
+            tokio::time::timeout(Duration::from_secs(5), source.bootstrap())
+                .await
+                .expect("bootstrap must not wait on an RPC it has no answer for")
+                .unwrap();
+
+            assert!(source.event_queue.take_gaps().is_empty());
+            // Fetched by the fill and recorded, so the feed's copy is skipped.
+            assert!(!source.event_queue.claim(&mined(101, 0, 0)).await.unwrap());
+            // Applied by bootstrap's catch-up, before the queue's first log:
+            // the fill left it alone.
+            assert!(source.event_queue.claim(&mined(100, 0, 0)).await.unwrap());
+            assert_eq!(source.settler.released_through, 102);
+        }
+
+        /// A gap noted after bootstrap drained the queue can have logs before
+        /// it still queued. Bootstrap leaves it, and `next_batch` takes those
+        /// logs and the gap together, in block order.
+        #[tokio::test]
+        async fn a_gap_whose_end_bootstrap_did_not_drain_is_left_to_next_batch() {
+            let asserter = Asserter::new();
+            let mut source = new_source(&asserter, true);
+            source.pool_registry.set_last_processed_block(99);
+            let sender = source.event_queue.get_sender();
+            sender.send(mined(100, 1, 0)).await.unwrap();
+            // Noted before its logs reached the queue, as if during bootstrap.
+            sender.note_gap(Gap {
+                after: Some((102, 3, 0)),
+                before: (105, 0, 0),
+            });
+
+            asserter.push_success(&U64::from(100)); // latest block
+            asserter.push_success(&vec![mined(100, 1, 0)]); // catch-up 100..=100
+            tokio::time::timeout(Duration::from_secs(5), source.bootstrap())
+                .await
+                .expect("bootstrap must not fetch the gap")
+                .unwrap();
+
+            for log in [mined(101, 0, 0), mined(102, 3, 0), mined(105, 0, 0)] {
+                sender.send(log).await.unwrap();
+            }
+            asserter.push_success(&U64::from(106));
+            asserter.push_success(&vec![
+                mined(102, 3, 0),
+                mined(103, 0, 0),
+                mined(104, 1, 0),
+                mined(105, 0, 0),
+            ]); // eth_getLogs 102..=105
+
+            let mut blocks = Vec::new();
+            for _ in 0..5 {
+                let batch = next(&mut source).await;
+                blocks.extend(batch.events.iter().filter_map(|log| log.block_number));
+            }
+            assert_eq!(blocks, vec![101, 102, 103, 104, 105]);
+        }
+
+        /// A log bootstrap applied from RPC, delivered late by a feed behind
+        /// the RPC node, is dropped rather than applied again.
+        #[tokio::test]
+        async fn a_log_below_the_bootstrap_floor_is_dropped() {
+            let asserter = Asserter::new();
+            let mut source = source(&asserter, true, 100, (100, 2, 0));
+            let sender = source.event_queue.get_sender();
+            sender.send(mined(100, 1, 0)).await.unwrap();
+            sender.send(mined(101, 0, 0)).await.unwrap();
+
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(101, 0, 0)]);
+        }
+
+        /// With several feeds the others carry the gap: nothing is fetched,
+        /// and the noted gap is dropped rather than left for later.
+        #[tokio::test]
+        async fn with_several_feeds_a_gap_is_left_to_the_others() {
+            let asserter = Asserter::new();
+            let mut source = source(&asserter, false, 100, (90, 0, 0));
+            let sender = source.event_queue.get_sender();
+            sender.note_gap(Gap {
+                after: Some((100, 0, 0)),
+                before: (103, 0, 0),
+            });
+            sender.send(mined(103, 0, 0)).await.unwrap();
+
+            let batch = next(&mut source).await;
+            assert_eq!(positions(&batch.events), vec![(103, 0, 0)]);
+            assert!(matches!(
+                batch.processing_mode,
+                ProcessingMode::ConfirmedWithSwaps
+            ));
+            assert!(source.event_queue.take_gaps().is_empty());
+        }
     }
 }

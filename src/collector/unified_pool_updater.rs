@@ -26,6 +26,8 @@ pub enum UpdaterMode {
         event_queue: EventQueue,
         /// See `CollectorConfig::ws_block_settle_ms`.
         block_settle: std::time::Duration,
+        /// See `CollectorConfig::fills_reconnect_gaps`.
+        fill_reconnect_gaps: bool,
     },
 }
 
@@ -103,6 +105,7 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
             UpdaterMode::Websocket {
                 event_queue,
                 block_settle,
+                fill_reconnect_gaps,
             } => Box::new(WebsocketBlockSource::new(
                 Arc::clone(&provider),
                 event_queue,
@@ -110,6 +113,7 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
                 Arc::clone(&topics),
                 max_blocks_per_batch,
                 block_settle,
+                fill_reconnect_gaps,
             )),
         };
 
