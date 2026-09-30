@@ -469,8 +469,9 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
 /// in 4 of 84 blocks). A block handed on at its first chunk is priced on half
 /// a block: run 11 split 17% of blocks that way, and their opportunities
 /// replayed 80.7% exact against 99.3% for whole blocks. With several websocket
-/// feeds the first copy of a log wins, so the fastest feed's gap is the one
-/// this must exceed.
+/// feeds what counts is the gap between the first copy of each chunk, which
+/// the feed that delivered chunk 1 first bounds; a chunk that still comes
+/// after the window is applied late (and logged), never lost.
 pub const WS_BLOCK_SETTLE: Duration = Duration::from_millis(75);
 
 /// A block the websocket source is ready to hand on.
@@ -505,7 +506,9 @@ impl BlockSettler {
     }
 
     fn add(&mut self, logs: Vec<Log>, now: Instant) {
-        for log in logs {
+        // A reorg's retraction of a log: the pools apply state-setting events
+        // outright, so replaying a removed one would only corrupt them.
+        for log in logs.into_iter().filter(|log| !log.removed) {
             // A mined log always carries its block; one that does not is
             // filed with the last block handed on, so it goes out as a late
             // batch rather than being lost.
@@ -526,7 +529,16 @@ impl BlockSettler {
         if !later_block_started && now.duration_since(*last_arrival) < self.settle {
             return None;
         }
-        let (logs, _) = self.pending.remove(&block)?;
+        let (mut logs, _) = self.pending.remove(&block)?;
+        // Arrival order is chain order only while every feed is ordered and
+        // loses nothing; a whole block in hand can be put back in chain
+        // order, which matters because Swap and Sync set state outright.
+        logs.sort_by_key(|log| {
+            (
+                log.transaction_index.unwrap_or(u64::MAX),
+                log.log_index.unwrap_or(u64::MAX),
+            )
+        });
         let late = block <= self.released_through;
         self.released_through = self.released_through.max(block);
         Some(Settled {
@@ -807,9 +819,18 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
                 )
                 .await?;
 
+                // Logs of a block older than one already handed on land on a
+                // newer state (Swap and Sync set it outright), so they are
+                // applied but never priced; a late chunk of the newest block
+                // is still in chain order and is priced as usual.
+                let processing_mode = if settled.block < settled.processed_through {
+                    ProcessingMode::ApplyOnly
+                } else {
+                    ProcessingMode::ConfirmedWithSwaps
+                };
                 return Ok(EventBatch {
                     events,
-                    processing_mode: ProcessingMode::ConfirmedWithSwaps,
+                    processing_mode,
                     processed_through_block: Some(settled.processed_through),
                 });
             }
@@ -999,6 +1020,68 @@ mod tests {
         let older = s.take_ready(t + ms(375)).unwrap();
         assert!(older.late);
         assert_eq!((older.block, older.processed_through), (100, 101));
+    }
+
+    /// The cursor goes only to the block handed on, never to a newer block
+    /// still held: the fee reader and add_pools read at it.
+    #[test]
+    fn the_cursor_stops_at_the_block_handed_on() {
+        let t = Instant::now();
+        let mut s = BlockSettler::new(ms(75), 99);
+        s.add(vec![log_at(100, 0, 0), log_at(101, 0, 0)], t);
+        let first = s.take_ready(t).unwrap();
+        assert_eq!((first.block, first.processed_through), (100, 100));
+    }
+
+    /// A late log for an older block, arriving while a newer block settles,
+    /// goes out at once (a later block has started) and leaves the newer
+    /// block's timer alone.
+    #[test]
+    fn a_late_older_log_goes_out_without_touching_the_settling_block() {
+        let t = Instant::now();
+        let mut s = BlockSettler::new(ms(75), 99);
+        s.add(vec![log_at(100, 0, 0)], t);
+        assert_eq!(s.take_ready(t + ms(75)).unwrap().block, 100);
+        s.add(vec![log_at(101, 0, 0)], t + ms(1000));
+        s.add(vec![log_at(100, 3, 1)], t + ms(1030));
+        let late = s.take_ready(t + ms(1030)).unwrap();
+        assert!(late.late);
+        assert_eq!((late.block, late.processed_through), (100, 100));
+        assert!(
+            s.take_ready(t + ms(1074)).is_none(),
+            "101 settles 75 ms after its own log"
+        );
+        assert_eq!(s.take_ready(t + ms(1075)).unwrap().block, 101);
+    }
+
+    /// A settled block goes out in chain order whatever order its logs came.
+    #[test]
+    fn a_settled_block_is_in_chain_order() {
+        let t = Instant::now();
+        let mut s = BlockSettler::new(ms(75), 99);
+        s.add(
+            vec![log_at(100, 9, 5), log_at(100, 2, 1), log_at(100, 9, 4)],
+            t,
+        );
+        let order: Vec<(u64, u64)> = s
+            .take_ready(t + ms(75))
+            .unwrap()
+            .logs
+            .iter()
+            .map(|l| (l.transaction_index.unwrap(), l.log_index.unwrap()))
+            .collect();
+        assert_eq!(order, vec![(2, 1), (9, 4), (9, 5)]);
+    }
+
+    /// A reorg's removed log is never applied.
+    #[test]
+    fn a_removed_log_is_dropped() {
+        let t = Instant::now();
+        let mut s = BlockSettler::new(ms(75), 99);
+        let mut removed = log_at(100, 1, 1);
+        removed.removed = true;
+        s.add(vec![log_at(100, 0, 0), removed], t);
+        assert_eq!(s.take_ready(t + ms(75)).unwrap().logs.len(), 1);
     }
 
     /// Logs for a block bootstrap already applied count as late.

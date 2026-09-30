@@ -375,7 +375,15 @@ pub async fn read_fees<P: Provider + Send + Sync>(
             read_plugin_configs(provider, &want_config, multicall_address, block),
             read_current_fees(provider, &want_current_fee, multicall_address, block),
         ) {
-            Ok(read) => break read,
+            Ok(read) => {
+                if attempt > 1 {
+                    info!(
+                        "[Chain {}] Fee reader: read at {} succeeded on attempt {}",
+                        chain_id, block, attempt
+                    );
+                }
+                break read;
+            }
             Err(e) if attempt < READ_ATTEMPTS => {
                 debug!(
                     "[Chain {}] Fee reader: read at {} failed (attempt {}), retrying in {}ms: {}",
