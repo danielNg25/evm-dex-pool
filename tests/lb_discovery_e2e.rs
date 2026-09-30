@@ -980,6 +980,7 @@ async fn test_lb_discovery_e2e_polling() -> Result<()> {
             websocket_urls: vec![],
             wait_time: 2_000,
             refetch_algebra_fee: false,
+            ws_block_settle_ms: None,
         },
         Arc::clone(&live),
         None,

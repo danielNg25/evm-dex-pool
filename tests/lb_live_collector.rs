@@ -313,6 +313,7 @@ async fn live_collector_converges(use_websocket: bool, label: &str) -> Result<()
             },
             wait_time: 2_000,
             refetch_algebra_fee: false,
+            ws_block_settle_ms: None,
         },
         Arc::clone(&live),
         None,

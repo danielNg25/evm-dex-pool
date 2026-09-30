@@ -19,8 +19,14 @@ use super::EventQueue;
 /// Updater mode configuration.
 pub enum UpdaterMode {
     PendingBlock,
-    LatestBlock { wait_time_ms: u64 },
-    Websocket { event_queue: EventQueue },
+    LatestBlock {
+        wait_time_ms: u64,
+    },
+    Websocket {
+        event_queue: EventQueue,
+        /// See `CollectorConfig::ws_block_settle_ms`.
+        block_settle: std::time::Duration,
+    },
 }
 
 /// Unified pool updater that composes a BlockSource with an EventProcessor.
@@ -94,12 +100,16 @@ impl<P: Provider + Send + Sync + 'static> UnifiedPoolUpdater<P> {
                 max_blocks_per_batch,
                 wait_time_ms,
             )),
-            UpdaterMode::Websocket { event_queue } => Box::new(WebsocketBlockSource::new(
+            UpdaterMode::Websocket {
+                event_queue,
+                block_settle,
+            } => Box::new(WebsocketBlockSource::new(
                 Arc::clone(&provider),
                 event_queue,
                 Arc::clone(&pool_registry),
                 Arc::clone(&topics),
                 max_blocks_per_batch,
+                block_settle,
             )),
         };
 

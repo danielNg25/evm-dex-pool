@@ -67,7 +67,10 @@ pub async fn start_collector<P: Provider + Send + Sync + Clone + 'static>(
             swap_event_tx.clone(),
             config.start_block,
             config.max_blocks_per_batch,
-            UpdaterMode::Websocket { event_queue },
+            UpdaterMode::Websocket {
+                event_queue,
+                block_settle: config.ws_block_settle(),
+            },
             cancel_rx,
             config.refetch_algebra_fee,
             algebra_refetch_provider.as_ref().map(Arc::clone),

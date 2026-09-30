@@ -461,19 +461,6 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
 // WebsocketBlockSource — bootstraps via RPC, then streams from EventQueue
 // ---------------------------------------------------------------------------
 
-/// How long a block's logs must be quiet before the websocket source hands the
-/// block on. An Avalanche node publishes a busy block's logs in stages: in a
-/// 5-minute probe (2026-09-30) the second chunk followed the first after
-/// 41-67 ms through publicnode and ~190 ms through api.avax.network, and an
-/// HTTP `eth_getLogs` for the block was no authority either (it answered short
-/// in 4 of 84 blocks). A block handed on at its first chunk is priced on half
-/// a block: run 11 split 17% of blocks that way, and their opportunities
-/// replayed 80.7% exact against 99.3% for whole blocks. With several websocket
-/// feeds what counts is the gap between the first copy of each chunk, which
-/// the feed that delivered chunk 1 first bounds; a chunk that still comes
-/// after the window is applied late (and logged), never lost.
-pub const WS_BLOCK_SETTLE: Duration = Duration::from_millis(75);
-
 /// A block the websocket source is ready to hand on.
 #[derive(Debug)]
 struct Settled {
@@ -488,6 +475,14 @@ struct Settled {
 /// Holds websocket logs per block until the block is complete: nothing new for
 /// it for `settle`, or a later block has started -- a feed delivers all of a
 /// block's chunks before the next block's first.
+///
+/// A block handed on part-way is priced on half a block: run 11 cut 17% of
+/// blocks (mostly mid-burst, logs under ~1 ms apart) and their opportunities
+/// replayed 80.7% exact against 99.3% for whole blocks. An endpoint can also
+/// publish a busy block in stages further apart; `settle` is set per chain
+/// for that (see `CollectorConfig::ws_block_settle_ms`). An HTTP `eth_getLogs`
+/// for the block is no authority either: it answered short in 4 of 84 blocks
+/// (2026-09-30).
 #[derive(Debug)]
 struct BlockSettler {
     settle: Duration,
@@ -565,6 +560,7 @@ pub struct WebsocketBlockSource<P: Provider + Send + Sync + 'static> {
     topics: Arc<Vec<Topic>>,
     max_blocks_per_batch: u64,
     chain_id: u64,
+    block_settle: Duration,
     settler: BlockSettler,
 }
 
@@ -575,6 +571,7 @@ impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
         pool_registry: Arc<PoolRegistry>,
         topics: Arc<Vec<Topic>>,
         max_blocks_per_batch: u64,
+        block_settle: Duration,
     ) -> Self {
         let chain_id = pool_registry.get_network_id();
         Self {
@@ -584,7 +581,8 @@ impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
             topics,
             max_blocks_per_batch,
             chain_id,
-            settler: BlockSettler::new(WS_BLOCK_SETTLE, 0),
+            block_settle,
+            settler: BlockSettler::new(block_settle, 0),
         }
     }
 }
@@ -770,7 +768,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
         let bootstrap_block = max_ws_block.unwrap_or(first_event_block);
         self.pool_registry.set_last_processed_block(bootstrap_block);
         // Logs still arriving for a block bootstrap already applied are late.
-        self.settler = BlockSettler::new(WS_BLOCK_SETTLE, bootstrap_block);
+        self.settler = BlockSettler::new(self.block_settle, bootstrap_block);
         info!(
             "[Chain {}] Bootstrap complete, set last_processed_block to {}",
             self.chain_id, bootstrap_block
@@ -787,7 +785,7 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
             }
 
             // One whole block per batch, once it is complete (see
-            // `WS_BLOCK_SETTLE`), so every swap in it is priced on the
+            // `block_settle`), so every swap in it is priced on the
             // block's final state.
             if let Some(settled) = self.settler.take_ready(Instant::now()) {
                 if settled.late {

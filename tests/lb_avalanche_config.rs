@@ -644,6 +644,7 @@ async fn test_lb_avalanche_config_collector() -> Result<()> {
             websocket_urls: vec![],
             wait_time: 2_000,
             refetch_algebra_fee: false,
+            ws_block_settle_ms: None,
         },
         Arc::clone(&live),
         None,

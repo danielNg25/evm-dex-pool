@@ -1,5 +1,12 @@
 use alloy::primitives::Address;
 use std::collections::HashMap;
+use std::time::Duration;
+
+/// [`CollectorConfig::ws_block_settle_ms`] when unset: enough to take in a
+/// block whose logs arrive as one burst (under ~1 ms apart), which the
+/// websocket source used to cut mid-burst -- most of run 11's 17% split
+/// blocks (Avalanche, 2026-09-29).
+pub const DEFAULT_WS_BLOCK_SETTLE_MS: u64 = 10;
 
 /// Configuration for the collector bootstrap.
 ///
@@ -20,6 +27,27 @@ pub struct CollectorConfig {
     /// no such pools. The name predates the reader; it is kept so existing
     /// configs still load.
     pub refetch_algebra_fee: bool,
+    /// Websocket mode: how long a block's logs must be quiet before the block
+    /// is handed on, whole, for pricing (a later block starting hands it on
+    /// at once). `None` = [`DEFAULT_WS_BLOCK_SETTLE_MS`].
+    ///
+    /// Set it per chain and endpoint to just above the endpoint's gap between
+    /// the stages of one block's logs. `api.avax.network` publishes a busy
+    /// block's logs in stages ~190 ms apart (2026-09-30: 187-196 ms, in 3-20%
+    /// of blocks depending on load), so it needs ~210 ms there; a block handed
+    /// on at its first stage is priced on half a block. A log that still
+    /// arrives after its block went on is applied late and logged, never lost.
+    pub ws_block_settle_ms: Option<u64>,
+}
+
+impl CollectorConfig {
+    /// [`Self::ws_block_settle_ms`], or its default.
+    pub fn ws_block_settle(&self) -> Duration {
+        Duration::from_millis(
+            self.ws_block_settle_ms
+                .unwrap_or(DEFAULT_WS_BLOCK_SETTLE_MS),
+        )
+    }
 }
 
 /// Configuration for batch pool fetching from RPC.

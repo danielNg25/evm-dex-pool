@@ -278,6 +278,7 @@ async fn test_add_pools_http() -> Result<()> {
             websocket_urls: vec![],
             wait_time: 2_000, // poll every 2 s
             refetch_algebra_fee: false,
+            ws_block_settle_ms: None,
         },
         Arc::clone(&registry),
         None,
@@ -401,6 +402,7 @@ async fn test_add_pools_ws() -> Result<()> {
             websocket_urls: WS_RPCS.iter().map(|s| s.to_string()).collect(),
             wait_time: 0,
             refetch_algebra_fee: false,
+            ws_block_settle_ms: None,
         },
         Arc::clone(&registry),
         None,

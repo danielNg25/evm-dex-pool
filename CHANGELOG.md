@@ -144,14 +144,16 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   reads). It now retries at the same block, up to 3 attempts 50 ms apart, and
   logs a read rescued that way at `info`.
 
-- **The websocket source hands on whole blocks.** An Avalanche node publishes
-  a busy block's logs in stages (a second chunk 41-67 ms after the first
-  through publicnode, ~190 ms through api.avax.network), and the source used
-  to hand on whatever had arrived, so 17% of run 11's blocks were priced on
-  half a block (80.7% exact on replay, against 99.3% for whole blocks). A
-  block now goes on, one per batch, once nothing new has arrived for it for
-  `WS_BLOCK_SETTLE` (75 ms) or a later block has started, sorted into chain
-  order. A log that still comes after its block went on is applied as its own
+- **The websocket source hands on whole blocks.** It used to hand on whatever
+  had arrived, often mid-burst, so 17% of run 11's blocks were priced on half
+  a block (80.7% exact on replay, against 99.3% for whole blocks); an
+  endpoint can also publish a busy block in stages (api.avax.network: ~190 ms
+  apart). A block now goes on, one per batch, once nothing new has arrived
+  for it for the new `CollectorConfig::ws_block_settle_ms` (default
+  `DEFAULT_WS_BLOCK_SETTLE_MS`, 10 ms; set per chain above the endpoint's
+  stage gap, ~210 ms on api.avax.network) or a later block has started,
+  sorted into chain order. `UpdaterMode::Websocket` and
+  `WebsocketBlockSource::new` take the window. A log that still comes after its block went on is applied as its own
   batch and logged at `warn` -- priced only if it belongs to the newest block
   handed on, since an older block's logs would land on a newer state -- and
   the processed cursor never moves back. Removed (reorged) logs are dropped.
