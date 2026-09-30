@@ -138,6 +138,16 @@ All notable changes to `evm-dex-pool` will be documented in this file.
   log subscription now buffers 8192 messages (new heads: 256), and an
   overflow is logged at `error` with the number of logs dropped.
 
+- **The websocket source hands on whole blocks.** An Avalanche node publishes
+  a busy block's logs in stages (a second chunk 41-67 ms after the first
+  through publicnode, ~190 ms through api.avax.network), and the source used
+  to hand on whatever had arrived, so 17% of run 11's blocks were priced on
+  half a block (80.7% exact on replay, against 99.3% for whole blocks). A
+  block now goes on, one per batch, once nothing new has arrived for it for
+  `WS_BLOCK_SETTLE` (75 ms) or a later block has started; a log that still
+  comes after its block went on is applied as its own batch and logged at
+  `warn`, and the processed cursor never moves back.
+
 ### Notes
 
 - `FeeAdjustment` is deliberately absent from `profitable_topics()`. A fee

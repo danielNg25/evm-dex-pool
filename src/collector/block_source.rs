@@ -7,10 +7,10 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use anyhow::Result;
 use async_trait::async_trait;
-use log::{debug, error, info};
-use std::collections::{HashMap, HashSet};
+use log::{debug, error, info, warn};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::event_processor::fetch_events_with_retry;
 use super::{enrich_log_timestamps_where, fetch_events, EventQueue};
@@ -461,6 +461,91 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for LatestBlockSource<P> {
 // WebsocketBlockSource — bootstraps via RPC, then streams from EventQueue
 // ---------------------------------------------------------------------------
 
+/// How long a block's logs must be quiet before the websocket source hands the
+/// block on. An Avalanche node publishes a busy block's logs in stages: in a
+/// 5-minute probe (2026-09-30) the second chunk followed the first after
+/// 41-67 ms through publicnode and ~190 ms through api.avax.network, and an
+/// HTTP `eth_getLogs` for the block was no authority either (it answered short
+/// in 4 of 84 blocks). A block handed on at its first chunk is priced on half
+/// a block: run 11 split 17% of blocks that way, and their opportunities
+/// replayed 80.7% exact against 99.3% for whole blocks. With several websocket
+/// feeds the first copy of a log wins, so the fastest feed's gap is the one
+/// this must exceed.
+pub const WS_BLOCK_SETTLE: Duration = Duration::from_millis(75);
+
+/// A block the websocket source is ready to hand on.
+#[derive(Debug)]
+struct Settled {
+    block: u64,
+    logs: Vec<Log>,
+    /// The block was handed on before, and these logs came after.
+    late: bool,
+    /// Never below a block already handed on.
+    processed_through: u64,
+}
+
+/// Holds websocket logs per block until the block is complete: nothing new for
+/// it for `settle`, or a later block has started -- a feed delivers all of a
+/// block's chunks before the next block's first.
+#[derive(Debug)]
+struct BlockSettler {
+    settle: Duration,
+    /// Logs per block, with the arrival time of the block's latest log.
+    pending: BTreeMap<u64, (Vec<Log>, Instant)>,
+    released_through: u64,
+}
+
+impl BlockSettler {
+    fn new(settle: Duration, released_through: u64) -> Self {
+        Self {
+            settle,
+            pending: BTreeMap::new(),
+            released_through,
+        }
+    }
+
+    fn add(&mut self, logs: Vec<Log>, now: Instant) {
+        for log in logs {
+            // A mined log always carries its block; one that does not is
+            // filed with the last block handed on, so it goes out as a late
+            // batch rather than being lost.
+            let block = log.block_number.unwrap_or(self.released_through);
+            let entry = self
+                .pending
+                .entry(block)
+                .or_insert_with(|| (Vec::new(), now));
+            entry.0.push(log);
+            entry.1 = now;
+        }
+    }
+
+    /// The oldest pending block, if it is complete.
+    fn take_ready(&mut self, now: Instant) -> Option<Settled> {
+        let (&block, (_, last_arrival)) = self.pending.iter().next()?;
+        let later_block_started = self.pending.len() > 1;
+        if !later_block_started && now.duration_since(*last_arrival) < self.settle {
+            return None;
+        }
+        let (logs, _) = self.pending.remove(&block)?;
+        let late = block <= self.released_through;
+        self.released_through = self.released_through.max(block);
+        Some(Settled {
+            block,
+            logs,
+            late,
+            processed_through: self.released_through,
+        })
+    }
+
+    /// When the oldest pending block settles, if nothing more arrives for it.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.pending
+            .values()
+            .next()
+            .map(|(_, last_arrival)| *last_arrival + self.settle)
+    }
+}
+
 pub struct WebsocketBlockSource<P: Provider + Send + Sync + 'static> {
     provider: Arc<P>,
     event_queue: EventQueue,
@@ -468,6 +553,7 @@ pub struct WebsocketBlockSource<P: Provider + Send + Sync + 'static> {
     topics: Arc<Vec<Topic>>,
     max_blocks_per_batch: u64,
     chain_id: u64,
+    settler: BlockSettler,
 }
 
 impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
@@ -486,6 +572,7 @@ impl<P: Provider + Send + Sync + 'static> WebsocketBlockSource<P> {
             topics,
             max_blocks_per_batch,
             chain_id,
+            settler: BlockSettler::new(WS_BLOCK_SETTLE, 0),
         }
     }
 }
@@ -670,6 +757,8 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
         // and add_pools may try to fetch at a block where new pools don't exist.
         let bootstrap_block = max_ws_block.unwrap_or(first_event_block);
         self.pool_registry.set_last_processed_block(bootstrap_block);
+        // Logs still arriving for a block bootstrap already applied are late.
+        self.settler = BlockSettler::new(WS_BLOCK_SETTLE, bootstrap_block);
         info!(
             "[Chain {}] Bootstrap complete, set last_processed_block to {}",
             self.chain_id, bootstrap_block
@@ -680,36 +769,61 @@ impl<P: Provider + Send + Sync + 'static> BlockSource for WebsocketBlockSource<P
 
     async fn next_batch(&mut self) -> Result<EventBatch> {
         loop {
-            let mut events = self.event_queue.get_all_available_events().await;
-            if events.is_empty() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
+            let arrived = self.event_queue.get_all_available_events().await;
+            if !arrived.is_empty() {
+                self.settler.add(arrived, Instant::now());
             }
 
-            debug!(
-                "[Chain {}] Processing {} events from EventQueue",
-                self.chain_id,
-                events.len()
-            );
+            // One whole block per batch, once it is complete (see
+            // `WS_BLOCK_SETTLE`), so every swap in it is priced on the
+            // block's final state.
+            if let Some(settled) = self.settler.take_ready(Instant::now()) {
+                if settled.late {
+                    warn!(
+                        "[Chain {}] Websocket: {} log(s) for block {} arrived after the block \
+                         was handed on; applying them now",
+                        self.chain_id,
+                        settled.logs.len(),
+                        settled.block
+                    );
+                }
+                let mut events = settled.logs;
+                debug!(
+                    "[Chain {}] Processing {} events of block {} from EventQueue",
+                    self.chain_id,
+                    events.len(),
+                    settled.block
+                );
 
-            // The listeners' `newHeads` subscriptions have usually recorded
-            // these blocks' times already; a block that is not there yet (its
-            // logs beat its header, or a reconnect gap) is fetched as before.
-            enrich_if_lb_pools_present(
-                &self.provider,
-                &self.pool_registry,
-                &mut events,
-                &self.event_queue.known_block_times(),
-            )
-            .await?;
+                // The listeners' `newHeads` subscriptions have usually recorded
+                // these blocks' times already; a block that is not there yet
+                // (its logs beat its header, or a reconnect gap) is fetched as
+                // before.
+                enrich_if_lb_pools_present(
+                    &self.provider,
+                    &self.pool_registry,
+                    &mut events,
+                    &self.event_queue.known_block_times(),
+                )
+                .await?;
 
-            let max_block = events.iter().filter_map(|e| e.block_number).max();
+                return Ok(EventBatch {
+                    events,
+                    processing_mode: ProcessingMode::ConfirmedWithSwaps,
+                    processed_through_block: Some(settled.processed_through),
+                });
+            }
 
-            return Ok(EventBatch {
-                events,
-                processing_mode: ProcessingMode::ConfirmedWithSwaps,
-                processed_through_block: max_block,
-            });
+            // Check the queue at least every 5 ms, and wake for the pending
+            // block's deadline if that comes sooner.
+            let poll = Duration::from_millis(5);
+            let wait = self
+                .settler
+                .next_deadline()
+                .map(|d| d.saturating_duration_since(Instant::now()).min(poll))
+                .unwrap_or(poll)
+                .max(Duration::from_millis(1));
+            tokio::time::sleep(wait).await;
         }
     }
 }
@@ -820,6 +934,80 @@ mod tests {
             log_index: Some(log_index),
             ..Default::default()
         }
+    }
+
+    // -- websocket block settling ---------------------------------------------
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    /// A block goes on only once nothing new has arrived for it for the settle
+    /// window.
+    #[test]
+    fn a_block_is_held_until_its_logs_go_quiet() {
+        let t = Instant::now();
+        let mut s = BlockSettler::new(ms(75), 99);
+        s.add(vec![log_at(100, 0, 0)], t);
+        assert!(s.take_ready(t + ms(74)).is_none());
+        let settled = s.take_ready(t + ms(75)).unwrap();
+        assert_eq!((settled.block, settled.logs.len()), (100, 1));
+        assert!(!settled.late);
+        assert_eq!(settled.processed_through, 100);
+    }
+
+    /// The node's second chunk of a busy block, arriving inside the window,
+    /// goes out with the first -- the split this exists to prevent.
+    #[test]
+    fn a_second_chunk_inside_the_window_joins_its_block() {
+        let t = Instant::now();
+        let mut s = BlockSettler::new(ms(75), 99);
+        s.add(vec![log_at(100, 0, 0), log_at(100, 1, 1)], t);
+        s.add(vec![log_at(100, 9, 5)], t + ms(50));
+        assert!(s.take_ready(t + ms(100)).is_none(), "quiet since +50 only");
+        assert_eq!(s.take_ready(t + ms(125)).unwrap().logs.len(), 3);
+    }
+
+    /// A feed delivers a block's chunks before the next block's, so a later
+    /// block starting completes the earlier one without waiting.
+    #[test]
+    fn a_later_block_releases_the_earlier_one_at_once() {
+        let t = Instant::now();
+        let mut s = BlockSettler::new(ms(75), 99);
+        s.add(vec![log_at(100, 0, 0)], t);
+        s.add(vec![log_at(101, 0, 0)], t + ms(10));
+        assert_eq!(s.take_ready(t + ms(10)).unwrap().block, 100);
+        assert!(s.take_ready(t + ms(10)).is_none(), "101 is not quiet yet");
+        assert_eq!(s.take_ready(t + ms(85)).unwrap().block, 101);
+    }
+
+    /// A log for a block already handed on is still applied, flagged late, and
+    /// never moves the processed cursor back.
+    #[test]
+    fn a_log_after_its_block_went_on_is_applied_late_and_the_cursor_holds() {
+        let t = Instant::now();
+        let mut s = BlockSettler::new(ms(75), 99);
+        s.add(vec![log_at(101, 0, 0)], t);
+        assert_eq!(s.take_ready(t + ms(75)).unwrap().processed_through, 101);
+
+        s.add(vec![log_at(101, 7, 3)], t + ms(200));
+        let late = s.take_ready(t + ms(275)).unwrap();
+        assert!(late.late);
+        assert_eq!((late.block, late.processed_through), (101, 101));
+
+        s.add(vec![log_at(100, 0, 0)], t + ms(300));
+        let older = s.take_ready(t + ms(375)).unwrap();
+        assert!(older.late);
+        assert_eq!((older.block, older.processed_through), (100, 101));
+    }
+
+    /// Logs for a block bootstrap already applied count as late.
+    #[test]
+    fn a_log_for_the_bootstrap_block_is_late() {
+        let t = Instant::now();
+        let mut s = BlockSettler::new(ms(75), 100);
+        s.add(vec![log_at(100, 4, 2)], t);
+        assert!(s.take_ready(t + ms(75)).unwrap().late);
     }
 
     // -- ordering test ------------------------------------------------------
