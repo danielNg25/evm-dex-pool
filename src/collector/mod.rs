@@ -8,6 +8,7 @@ pub mod handle;
 pub mod metrics;
 pub mod multicall;
 pub mod pool_fetcher;
+pub mod replay;
 pub mod unified_pool_updater;
 pub mod utils;
 pub mod websocket_listener;
@@ -27,6 +28,7 @@ pub use fee_reader::{
 pub use handle::CollectorHandle;
 pub use metrics::CollectorMetrics;
 pub use multicall::resolve_multicall_address;
+pub use replay::fetch_block_logs;
 pub use pool_fetcher::{
     fetch_pool, fetch_pools_into_registry, identify_pool_type, identify_pool_types,
 };

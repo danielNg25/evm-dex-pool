@@ -21,7 +21,7 @@ use super::{enrich_log_timestamps_where, fetch_events, EventQueue};
 /// variable-fee clock), so every other pool's logs are left alone: a header
 /// fetched for a block holding none of them was a round trip for nothing, and
 /// Sentio, which zeroes every log's timestamp, made that every block.
-pub(crate) async fn enrich_if_lb_pools_present<P: Provider + Send + Sync>(
+pub async fn enrich_if_lb_pools_present<P: Provider + Send + Sync>(
     provider: &Arc<P>,
     pool_registry: &PoolRegistry,
     events: &mut [Log],
