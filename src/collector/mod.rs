@@ -28,10 +28,10 @@ pub use fee_reader::{
 pub use handle::CollectorHandle;
 pub use metrics::CollectorMetrics;
 pub use multicall::resolve_multicall_address;
-pub use replay::fetch_block_logs;
 pub use pool_fetcher::{
     fetch_pool, fetch_pools_into_registry, identify_pool_type, identify_pool_types,
 };
+pub use replay::fetch_block_logs;
 pub use unified_pool_updater::{UnifiedPoolUpdater, UpdaterMode};
 pub use utils::*;
 pub use websocket_listener::WebsocketListener;
